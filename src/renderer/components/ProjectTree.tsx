@@ -202,6 +202,7 @@ function useProjectTreeElement({ onOpenSession }: TreeProps) {
         `Opened ${result.created.length} ${sessionLabel}${result.created.length === 1 ? '' : 's'}`
       )
     }
+    if (result.reused.length > 0) parts.push(`linked ${result.reused.length} existing`)
     if (result.skipped.length > 0) parts.push(`skipped ${result.skipped.length}`)
     if (result.failed.length > 0) parts.push(`${result.failed.length} failed`)
     return parts.length > 0
