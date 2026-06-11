@@ -56,6 +56,7 @@ export interface Session {
 
 export interface OpenSessionsSummary {
   created: Session[]
+  reused: Session[]
   skipped: number[]
   failed: { number: number; error: string }[]
 }

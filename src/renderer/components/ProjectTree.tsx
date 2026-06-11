@@ -182,9 +182,15 @@ function useProjectTreeElement({ onOpenSession }: TreeProps) {
         `Opened ${result.created.length} PR session${result.created.length === 1 ? '' : 's'}`
       )
     }
+    if (result.reused.length > 0) parts.push(`linked ${result.reused.length} existing`)
     if (result.skipped.length > 0) parts.push(`skipped ${result.skipped.length}`)
     if (result.failed.length > 0) parts.push(`${result.failed.length} failed`)
     return parts.length > 0 ? parts.join(', ') : 'No PR sessions created'
+  }
+
+  const formatPrSpecErrors = (result: OpenSessionsSummary): string => {
+    const lines = result.failed.map((f) => `#${f.number}: ${f.error}`)
+    return ['No PR sessions opened.', ...lines].join('\n')
   }
 
   const formatOpenAllSummary = (result: OpenSessionsSummary, label: 'PR' | 'issue'): string => {
@@ -196,6 +202,7 @@ function useProjectTreeElement({ onOpenSession }: TreeProps) {
         `Opened ${result.created.length} ${sessionLabel}${result.created.length === 1 ? '' : 's'}`
       )
     }
+    if (result.reused.length > 0) parts.push(`linked ${result.reused.length} existing`)
     if (result.skipped.length > 0) parts.push(`skipped ${result.skipped.length}`)
     if (result.failed.length > 0) parts.push(`${result.failed.length} failed`)
     return parts.length > 0
@@ -414,8 +421,16 @@ function useProjectTreeElement({ onOpenSession }: TreeProps) {
         setUi({ pendingPrPath: null, pendingPrHostId: null, prNumberInput: '' })
         return
       }
+      // Multiple PRs: if nothing was opened or linked, keep the dialog open and
+      // surface the per-PR reasons instead of a fleeting count-only toast.
+      if (result.created.length === 0 && result.reused.length === 0) {
+        setUi({ prError: formatPrSpecErrors(result) })
+        return
+      }
       showToast(formatPrSpecSummary(result))
       setUi({ pendingPrPath: null, pendingPrHostId: null, prNumberInput: '' })
+    } catch (err) {
+      setUi({ prError: describeCreateError(err) })
     } finally {
       setUi({ creating: false })
     }

@@ -1620,6 +1620,24 @@ async function listOpenIssues(
     : listRemoteOpenGhItems(projectPath, hostId, 'issue')
 }
 
+function findSessionByBranch(
+  projectPath: string,
+  hostId: string | null,
+  branch: string
+): Session | undefined {
+  for (const entry of sessions.values()) {
+    const session = entry.session
+    if (
+      session.hostId === hostId &&
+      session.projectPath === projectPath &&
+      session.branch === branch
+    ) {
+      return session
+    }
+  }
+  return undefined
+}
+
 async function createSessionsForNumbers(
   projectPath: string,
   hostId: string | null,
@@ -1635,11 +1653,18 @@ async function createSessionsForNumbers(
     if (number !== undefined) existing.add(number)
   }
 
+  // Snapshot ids that already exist so we can tell a freshly-created session
+  // apart from one that createSession reused (it returns a pre-existing session
+  // when the requested branch is already checked out).
+  const preexistingIds = new Set<string>()
+  for (const entry of sessions.values()) preexistingIds.add(entry.session.id)
+
   const { toCreate, toSkip } = selectNumbersToOpen(
     numbers.map((n) => ({ number: n })),
     existing
   )
   const created: Session[] = []
+  const reused: Session[] = []
   const failed: { number: number; error: string }[] = []
   type CreateSessionResult = { session: Session } | { number: number; error: string }
   const createOne = async (item: { number: number }): Promise<CreateSessionResult> => {
@@ -1672,13 +1697,17 @@ async function createSessionsForNumbers(
 
   for (const result of results) {
     if ('session' in result) {
-      created.push(result.session)
+      if (preexistingIds.has(result.session.id)) {
+        reused.push(result.session)
+      } else {
+        created.push(result.session)
+      }
     } else {
       failed.push(result)
     }
   }
 
-  return { created, skipped: toSkip, failed }
+  return { created, reused, skipped: toSkip, failed }
 }
 
 async function openSessionsForNumberedItems(
@@ -1755,6 +1784,24 @@ export async function createPrSession(
   }
 
   const branch = prInfo.headRefName
+
+  // A branch can only live in one worktree, so if a session already has this
+  // PR's head branch checked out (e.g. opened earlier as an issue session),
+  // reuse it: tag it with the PR number instead of failing on `worktree add`.
+  const existingForBranch = findSessionByBranch(projectPath, hostId, branch)
+  if (existingForBranch) {
+    // `gh pr view <prNumber>` just confirmed this branch belongs to the
+    // requested PR, so overwrite any stale prNumber rather than only filling
+    // an empty one — otherwise the requested PR is reported as linked but the
+    // session keeps a different number and the PR gets offered again.
+    existingForBranch.prNumber = prNumber
+    if (existingForBranch.issueNumber === undefined) {
+      existingForBranch.issueNumber = parseIssueNumber(prInfo.title)
+    }
+    onSessionsChanged()
+    return existingForBranch
+  }
+
   const worktreeName = `pr-${prNumber}`
   const worktreePath = join(projectPath, '.claude', 'worktrees', worktreeName)
 
