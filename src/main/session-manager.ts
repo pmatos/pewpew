@@ -1790,7 +1790,11 @@ export async function createPrSession(
   // reuse it: tag it with the PR number instead of failing on `worktree add`.
   const existingForBranch = findSessionByBranch(projectPath, hostId, branch)
   if (existingForBranch) {
-    if (existingForBranch.prNumber === undefined) existingForBranch.prNumber = prNumber
+    // `gh pr view <prNumber>` just confirmed this branch belongs to the
+    // requested PR, so overwrite any stale prNumber rather than only filling
+    // an empty one — otherwise the requested PR is reported as linked but the
+    // session keeps a different number and the PR gets offered again.
+    existingForBranch.prNumber = prNumber
     if (existingForBranch.issueNumber === undefined) {
       existingForBranch.issueNumber = parseIssueNumber(prInfo.title)
     }
