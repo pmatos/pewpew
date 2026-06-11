@@ -980,6 +980,8 @@ body,
   color: var(--accent-red);
   font-size: 12px;
   padding: 4px 0;
+  white-space: pre-wrap;
+  word-break: break-word;
 }
 
 .detail-pane {

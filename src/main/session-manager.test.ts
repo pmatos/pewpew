@@ -1899,8 +1899,35 @@ describe('createPrSessions', () => {
     const createPrSession = vi.fn()
     const result = await sm.createPrSessions('/proj', [], null, {}, { createPrSession })
     if (typeof result === 'string') throw new Error(result)
-    expect(result).toEqual({ created: [], skipped: [], failed: [] })
+    expect(result).toEqual({ created: [], reused: [], skipped: [], failed: [] })
     expect(createPrSession).not.toHaveBeenCalled()
+  })
+
+  it('classifies a returned pre-existing session as reused, not created', async () => {
+    const sm = await loadSessionManager()
+    const existing = baseLocalSession({
+      id: 's-issue504',
+      projectPath: '/proj',
+      branch: 'vow/issue504',
+      issueNumber: 504,
+    })
+    writeSessionsJson([existing])
+    sm.restoreSessions()
+
+    // Mirrors the real createPrSession reuse path: when the PR's head branch is
+    // already checked out it returns the existing session tagged with the PR.
+    const createPrSession = vi.fn(
+      async (_projectPath: string, prNumber: number, _hostId: string | null) =>
+        ({ ...existing, prNumber }) as Session | string
+    )
+
+    const result = await sm.createPrSessions('/proj', [545], null, {}, { createPrSession })
+    if (typeof result === 'string') throw new Error(result)
+
+    expect(result.created).toEqual([])
+    expect(result.reused.map((s) => s.id)).toEqual(['s-issue504'])
+    expect(result.reused[0].prNumber).toBe(545)
+    expect(result.failed).toEqual([])
   })
 
   it('forwards the selected tool through options to createPrSession', async () => {
