@@ -1835,14 +1835,13 @@ describe('createPrSession fork handling', () => {
     headRepository: { name: 's11' },
   })
 
-  it('falls back to refs/pull/<n>/head for a cross-repository (fork) PR', async () => {
+  it('fetches refs/pull/<n>/head for a fork PR and never touches origin/<branch>', async () => {
     const sm = await loadSessionManager()
     const runGit = vi.fn(async (argv: string[]) => {
       const key = argv.join(' ')
-      // Same-repo fetch fails: a fork PR head is not on origin/<branch>.
-      if (key === 'fetch origin codex/fix-x') throw new Error('couldn’t find remote ref')
-      // The pull ref is fetched into a PR-scoped local branch (pr-335), not the
-      // fork's head branch name (which isn't unique across forks).
+      // A fork PR head is fetched straight from the pull ref into a PR-scoped
+      // local branch (pr-335) — origin/<branch> is never fetched, since the
+      // fork's head branch name could collide with a base-repo branch.
       if (key === 'fetch origin pull/335/head:pr-335') return { stdout: '' }
       if (key === 'worktree add /proj/.claude/worktrees/pr-335 pr-335') return { stdout: '' }
       throw new Error(`unexpected git ${key}`)
@@ -1875,7 +1874,7 @@ describe('createPrSession fork handling', () => {
     expect(result.prIsFork).toBe(true)
     expect(result.prHeadRepo).toBe('contributor/s11')
     // The pull ref was fetched into a PR-scoped local branch, and the worktree
-    // was added from it — never from the non-existent origin/<branch>.
+    // was added from it.
     expect(runGit).toHaveBeenCalledWith(['fetch', 'origin', 'pull/335/head:pr-335'])
     expect(runGit).toHaveBeenCalledWith([
       'worktree',
@@ -1883,6 +1882,9 @@ describe('createPrSession fork handling', () => {
       '/proj/.claude/worktrees/pr-335',
       'pr-335',
     ])
+    // origin/<branch> is never fetched or used for a fork PR — the fork's head
+    // branch name could collide with a base-repo branch of the same name.
+    expect(runGit).not.toHaveBeenCalledWith(['fetch', 'origin', 'codex/fix-x'])
     expect(runGit).not.toHaveBeenCalledWith([
       'worktree',
       'add',
@@ -2005,6 +2007,86 @@ describe('createPrSession fork handling', () => {
       // branch name (which isn't unique across forks).
       const worktreeBranch = git(result.worktreePath, ['rev-parse', '--abbrev-ref', 'HEAD']).trim()
       expect(worktreeBranch).toBe('pr-335')
+    } finally {
+      rmSync(root, { recursive: true, force: true })
+    }
+  })
+
+  gitIt('checks out the fork PR head, not the base branch, on a name collision', async () => {
+    const root = mkdtempSync(join(tmpdir(), 'fork-pr-namecollide-'))
+    try {
+      const source = join(root, 'source')
+      const remote = join(root, 'remote.git')
+      const project = join(root, 'project')
+      mkdirSync(source)
+      git(source, ['init'])
+      git(source, ['config', 'user.email', 'test@example.com'])
+      git(source, ['config', 'user.name', 'Test User'])
+      writeFileSync(join(source, 'file.txt'), 'one\n')
+      git(source, ['add', 'file.txt'])
+      git(source, ['commit', '-m', 'one'])
+      git(source, ['branch', '-M', 'main'])
+
+      // The base repo HAS a branch named "shared" (the fork PR's head branch
+      // name collides with it) pointing at different commits than the PR head.
+      git(source, ['checkout', '-b', 'shared'])
+      writeFileSync(join(source, 'file.txt'), 'BASE shared branch\n')
+      git(source, ['commit', '-am', 'base shared'])
+      const baseSharedTip = git(source, ['rev-parse', 'HEAD']).trim()
+      // The actual fork PR head, on its own branch, with different content.
+      git(source, ['checkout', 'main'])
+      git(source, ['checkout', '-b', 'fork-head'])
+      writeFileSync(join(source, 'file.txt'), 'FORK pr head\n')
+      git(source, ['commit', '-am', 'fork head'])
+      const forkHead = git(source, ['rev-parse', 'HEAD']).trim()
+      git(source, ['checkout', 'main'])
+
+      execFileSync('git', ['clone', '--bare', source, remote], { stdio: 'ignore' })
+      // Keep refs/heads/shared on origin (the collision); expose the fork PR head
+      // only through refs/pull/501/head and drop its branch.
+      execFileSync('git', ['-C', remote, 'update-ref', 'refs/pull/501/head', forkHead], {
+        stdio: 'ignore',
+      })
+      execFileSync('git', ['-C', remote, 'branch', '-D', 'fork-head'], { stdio: 'ignore' })
+      execFileSync('git', ['clone', remote, project], { stdio: 'ignore' })
+      mkdirSync(join(project, '.claude', 'worktrees'), { recursive: true })
+
+      const sm = await loadSessionManager()
+      const result = await sm.createPrSession(
+        project,
+        501,
+        null,
+        {},
+        {
+          // The fork PR's head branch is named "shared" — the same name as the
+          // base-repo branch that exists on origin.
+          prView: async () => ({
+            headRefName: 'shared',
+            state: 'OPEN',
+            title: 'fork pr',
+            isCrossRepository: true,
+            headRepositoryOwner: { login: 'contributor' },
+            headRepository: { name: 'proj' },
+          }),
+          createSessionForWorktree: async (p, worktreePath, label, tool) =>
+            baseLocalSession({
+              id: 'pr-501',
+              projectPath: p,
+              worktreeName: label ?? 'pr-501',
+              worktreePath,
+              branch: 'pr-501',
+              tool: tool ?? 'claude',
+            }),
+        }
+      )
+
+      expect(typeof result).not.toBe('string')
+      if (typeof result === 'string') throw new Error(result)
+      const worktreeTip = git(result.worktreePath, ['rev-parse', 'HEAD']).trim()
+      // The worktree must hold the fork PR head, NOT origin/shared (the base
+      // branch that shares the name).
+      expect(worktreeTip).toBe(forkHead)
+      expect(worktreeTip).not.toBe(baseSharedTip)
     } finally {
       rmSync(root, { recursive: true, force: true })
     }

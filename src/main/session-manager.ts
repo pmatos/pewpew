@@ -844,19 +844,13 @@ async function createRemotePrSession(
     // branch name so pushes update the PR via origin/<branch>.
     const localBranch = isFork ? worktreeName : branch
 
-    // Fetch the PR head. execRemote resolves (rather than rejecting) on a
-    // non-zero git exit, so probe result.code to decide whether to fall back
-    // to GitHub's refs/pull/<n>/head — the only origin ref a cross-repository
-    // (fork) PR head is reachable through. Fetch it into the local branch.
-    const fetched = await execRemote(host, [
-      'git',
-      '-C',
-      projectPath,
-      'fetch',
-      'origin',
-      branch,
-    ]).catch(() => ({ code: 1 }))
-    if (fetched.code !== 0) {
+    // Fetch the PR head into the local branch we'll check out. A fork PR head
+    // is ONLY authoritative via GitHub's refs/pull/<n>/head: never fetch
+    // origin/<branch>, because if the fork's head branch name also exists on
+    // the base repo (e.g. a fork whose head branch is `main`) that fetch would
+    // succeed and we'd check out the base repo's branch instead of the PR's
+    // commits. A same-repo PR head lives on origin/<branch>, so fetch that.
+    if (isFork) {
       await execRemote(host, [
         'git',
         '-C',
@@ -865,6 +859,10 @@ async function createRemotePrSession(
         'origin',
         `pull/${prNumber}/head:${localBranch}`,
       ]).catch(() => undefined)
+    } else {
+      await execRemote(host, ['git', '-C', projectPath, 'fetch', 'origin', branch]).catch(
+        () => undefined
+      )
     }
 
     // Pick the worktree-add form by probing for the local branch first instead
@@ -872,6 +870,11 @@ async function createRemotePrSession(
     // already checked out in a stale worktree) by surfacing the second
     // attempt's misleading "branch already exists" error.
     const branchExistsLocally = await remoteBranchExists(host, projectPath, localBranch)
+    if (isFork && !branchExistsLocally) {
+      // The pull-ref fetch should have created pr-<n>; if it didn't there's no
+      // valid origin fallback for a fork (origin/<branch> isn't the PR head).
+      return `Failed to create worktree for branch "${branch}": could not fetch refs/pull/${prNumber}/head`
+    }
     const addArgv = branchExistsLocally
       ? ['git', '-C', projectPath, 'worktree', 'add', worktreePath, localBranch]
       : [
@@ -1915,31 +1918,39 @@ export async function createPrSession(
   // origin/<branch>.
   const localBranch = isFork ? worktreeName : branch
 
-  // Fetch the PR head. A same-repo PR head lives on origin/<branch>; a
-  // cross-repository (fork) PR head only exists on origin as GitHub's
-  // refs/pull/<n>/head. Try the branch first and, when origin has no such
-  // branch, fall back to the pull ref — fetching it into the local branch we
-  // can then check out. This is failure-driven rather than keyed off
-  // isCrossRepository so it stays correct even if that flag is unavailable.
-  try {
-    await runGit(['fetch', 'origin', branch])
-  } catch {
+  // Fetch the PR head into the local branch we'll check out. A fork PR head is
+  // ONLY authoritative via GitHub's refs/pull/<n>/head: we must not fetch
+  // origin/<branch>, because if the fork's head branch name also exists on the
+  // base repo (e.g. a fork whose head branch is `main`) that fetch would
+  // succeed and we'd later check out the base repo's branch instead of the
+  // PR's commits. A same-repo PR head lives on origin/<branch>, so fetch that.
+  if (isFork) {
     try {
       await runGit(['fetch', 'origin', `pull/${prNumber}/head:${localBranch}`])
     } catch {
-      // Offline, or the branch is already present locally — fall through.
+      // Offline, or the PR-scoped branch is already present locally.
+    }
+  } else {
+    try {
+      await runGit(['fetch', 'origin', branch])
+    } catch {
+      // May already be available locally.
     }
   }
 
   // Create worktree from the PR branch
   try {
     await runGit(['worktree', 'add', worktreePath, localBranch])
-  } catch {
-    // Branch may already be checked out — try tracking remote
+  } catch (err) {
+    // A fork PR has no valid origin fallback — origin/<branch> is not its head.
+    if (isFork) {
+      return `Failed to create worktree for branch "${branch}": ${(err as Error).message}`
+    }
+    // Same-repo branch may not exist locally yet — create it tracking origin.
     try {
       await runGit(['worktree', 'add', worktreePath, '-b', localBranch, `origin/${branch}`])
-    } catch (err) {
-      return `Failed to create worktree for branch "${branch}": ${(err as Error).message}`
+    } catch (fallbackErr) {
+      return `Failed to create worktree for branch "${branch}": ${(fallbackErr as Error).message}`
     }
   }
 
