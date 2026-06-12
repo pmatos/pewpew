@@ -848,10 +848,12 @@ async function createRemotePrSession(
     const tmuxSession = `pewpew-${id}`
 
     // A fork PR's head branch name isn't unique across forks, so check it out
-    // under a PR-scoped local branch (the worktree name) to avoid colliding
-    // with a different fork that shares the name. Same-repo PRs keep the real
-    // branch name so pushes update the PR via origin/<branch>.
-    const localBranch = isFork ? worktreeName : branch
+    // under a PR-scoped local branch namespaced under `pewpew/` — both to avoid
+    // colliding with a different fork that shares the name and so the forced
+    // fetch below can't clobber an unrelated user branch named `pr-<n>`. Same-
+    // repo PRs keep the real branch name so pushes update the PR via
+    // origin/<branch>.
+    const localBranch = isFork ? `pewpew/${worktreeName}` : branch
 
     // Fetch the PR head into the local branch we'll check out. A fork PR head
     // is ONLY authoritative via GitHub's refs/pull/<n>/head: never fetch
@@ -860,11 +862,11 @@ async function createRemotePrSession(
     // succeed and we'd check out the base repo's branch instead of the PR's
     // commits. A same-repo PR head lives on origin/<branch>, so fetch that.
     if (isFork) {
-      // Forced refspec (`+`): a removed session can leave refs/heads/pr-<n>
+      // Forced refspec (`+`): a removed session can leave the pewpew/ branch
       // behind, and a later PR force-push makes a non-forced fetch reject as
       // non-fast-forward, so remoteBranchExists would see the stale branch and
-      // the worktree would check out old commits. pr-<n> is a pewpew-owned
-      // PR-scoped branch that must track the current PR head.
+      // the worktree would check out old commits. The pewpew/ branch is
+      // pewpew-owned and must track the current PR head.
       await execRemote(host, [
         'git',
         '-C',
@@ -1926,11 +1928,12 @@ export async function createPrSession(
   const worktreePath = join(projectPath, '.claude', 'worktrees', worktreeName)
 
   // The local branch to check out. A fork PR's head branch name isn't unique
-  // across forks, so give it a PR-scoped local branch (the worktree name) to
-  // avoid colliding with a different fork that shares the name. Same-repo PRs
-  // keep the real branch name so pushes from the worktree update the PR via
-  // origin/<branch>.
-  const localBranch = isFork ? worktreeName : branch
+  // across forks, so give it a PR-scoped local branch. We namespace it under
+  // `pewpew/` (rather than a bare `pr-<n>`) so the forced fetch below can never
+  // clobber an unrelated user branch that happens to be named `pr-<n>`. Same-
+  // repo PRs keep the real branch name so pushes from the worktree update the
+  // PR via origin/<branch>.
+  const localBranch = isFork ? `pewpew/${worktreeName}` : branch
 
   // Fetch the PR head into the local branch we'll check out. A fork PR head is
   // ONLY authoritative via GitHub's refs/pull/<n>/head: we must not fetch
@@ -1939,21 +1942,21 @@ export async function createPrSession(
   // succeed and we'd later check out the base repo's branch instead of the
   // PR's commits. A same-repo PR head lives on origin/<branch>, so fetch that.
   if (isFork) {
-    // Forced refspec (`+`): a removed session leaves refs/heads/pr-<n> behind,
-    // and a later PR force-push makes a non-forced fetch reject as
-    // non-fast-forward — silently reopening stale commits. pr-<n> is a
-    // pewpew-owned PR-scoped branch that must always track the current PR head,
-    // and same-PR reuse already returned above, so it isn't checked out here.
+    // Forced refspec (`+`): a removed session leaves refs/heads/pewpew/pr-<n>
+    // behind, and a later PR force-push makes a non-forced fetch reject as
+    // non-fast-forward — silently reopening stale commits. The pewpew/ branch
+    // is pewpew-owned and must always track the current PR head, and same-PR
+    // reuse already returned above, so it isn't checked out here.
     try {
       await runGit(['fetch', 'origin', `+pull/${prNumber}/head:${localBranch}`])
     } catch {
-      // Offline, or the PR-scoped branch is already present locally.
+      // Offline, or the namespaced branch is already present locally.
     }
-    // The pull ref must have produced refs/heads/pr-<n>. If the fetch failed
-    // and it doesn't exist, do NOT run `git worktree add <path> pr-<n>`: with
-    // no local branch, git DWIMs the name to a remote-tracking origin/pr-<n>
-    // (if the base repo has a branch named pr-<n>) and silently checks out the
-    // wrong commits. Fail explicitly instead, mirroring the remote path.
+    // The pull ref must have produced the local branch. If the fetch failed and
+    // it doesn't exist, do NOT run `git worktree add <path> <localBranch>`:
+    // with no local branch, git DWIMs the name to a remote-tracking
+    // origin/<localBranch> (if one exists) and silently checks out the wrong
+    // commits. Fail explicitly instead, mirroring the remote path.
     if (!(await localBranchExists(runGit, localBranch))) {
       return `Failed to create worktree for branch "${branch}": could not fetch refs/pull/${prNumber}/head`
     }

@@ -1840,13 +1840,13 @@ describe('createPrSession fork handling', () => {
     const runGit = vi.fn(async (argv: string[]) => {
       const key = argv.join(' ')
       // A fork PR head is fetched straight from the pull ref into a PR-scoped
-      // local branch (pr-335) with a FORCED refspec — origin/<branch> is never
-      // fetched, since the fork's head branch name could collide with a
-      // base-repo branch.
-      if (key === 'fetch origin +pull/335/head:pr-335') return { stdout: '' }
+      // local branch namespaced under pewpew/ with a FORCED refspec —
+      // origin/<branch> is never fetched, and the pewpew/ namespace keeps the
+      // forced fetch from clobbering an unrelated user branch named pr-335.
+      if (key === 'fetch origin +pull/335/head:pewpew/pr-335') return { stdout: '' }
       // The PR-scoped branch is verified to exist before `worktree add`.
-      if (key === 'rev-parse --verify --quiet refs/heads/pr-335') return { stdout: 'abc123\n' }
-      if (key === 'worktree add /proj/.claude/worktrees/pr-335 pr-335') return { stdout: '' }
+      if (key === 'rev-parse --verify --quiet refs/heads/pewpew/pr-335') return { stdout: 'abc\n' }
+      if (key === 'worktree add /proj/.claude/worktrees/pr-335 pewpew/pr-335') return { stdout: '' }
       throw new Error(`unexpected git ${key}`)
     })
     const createSessionForWorktree = vi.fn(async () =>
@@ -1855,7 +1855,7 @@ describe('createPrSession fork handling', () => {
         projectPath: '/proj',
         worktreeName: 'pr-335',
         worktreePath: '/proj/.claude/worktrees/pr-335',
-        branch: 'pr-335',
+        branch: 'pewpew/pr-335',
       })
     )
 
@@ -1876,14 +1876,14 @@ describe('createPrSession fork handling', () => {
     expect(result.prNumber).toBe(335)
     expect(result.prIsFork).toBe(true)
     expect(result.prHeadRepo).toBe('contributor/s11')
-    // The pull ref was force-fetched into a PR-scoped local branch, and the
-    // worktree was added from it.
-    expect(runGit).toHaveBeenCalledWith(['fetch', 'origin', '+pull/335/head:pr-335'])
+    // The pull ref was force-fetched into a pewpew-namespaced PR-scoped local
+    // branch, and the worktree was added from it.
+    expect(runGit).toHaveBeenCalledWith(['fetch', 'origin', '+pull/335/head:pewpew/pr-335'])
     expect(runGit).toHaveBeenCalledWith([
       'worktree',
       'add',
       '/proj/.claude/worktrees/pr-335',
-      'pr-335',
+      'pewpew/pr-335',
     ])
     // origin/<branch> is never fetched or used for a fork PR — the fork's head
     // branch name could collide with a base-repo branch of the same name.
@@ -1893,7 +1893,7 @@ describe('createPrSession fork handling', () => {
       'add',
       '/proj/.claude/worktrees/pr-335',
       '-b',
-      'pr-335',
+      'pewpew/pr-335',
       'origin/codex/fix-x',
     ])
   })
@@ -1904,8 +1904,9 @@ describe('createPrSession fork handling', () => {
       const key = argv.join(' ')
       // The pull ref can't be fetched (offline / transient), so the PR-scoped
       // branch is never created.
-      if (key === 'fetch origin +pull/335/head:pr-335') throw new Error('network down')
-      if (key === 'rev-parse --verify --quiet refs/heads/pr-335') throw new Error('no such ref')
+      if (key === 'fetch origin +pull/335/head:pewpew/pr-335') throw new Error('network down')
+      if (key === 'rev-parse --verify --quiet refs/heads/pewpew/pr-335')
+        throw new Error('no such ref')
       throw new Error(`unexpected git ${key}`)
     })
     const createSessionForWorktree = vi.fn()
@@ -1918,14 +1919,14 @@ describe('createPrSession fork handling', () => {
       { runGit, prView: forkPrView, createSessionForWorktree }
     )
 
-    // No local pr-335 exists, so we must fail explicitly rather than let
-    // `git worktree add pr-335` DWIM to a remote-tracking origin/pr-335.
+    // No local pewpew/pr-335 exists, so we must fail explicitly rather than let
+    // `git worktree add` DWIM to a remote-tracking origin/pewpew/pr-335.
     expect(typeof result).toBe('string')
     expect(runGit).not.toHaveBeenCalledWith([
       'worktree',
       'add',
       '/proj/.claude/worktrees/pr-335',
-      'pr-335',
+      'pewpew/pr-335',
     ])
     expect(createSessionForWorktree).not.toHaveBeenCalled()
   })
@@ -2027,7 +2028,7 @@ describe('createPrSession fork handling', () => {
               projectPath: p,
               worktreeName: label ?? 'pr-335',
               worktreePath,
-              branch: 'pr-335',
+              branch: 'pewpew/pr-335',
               tool: tool ?? 'claude',
             }),
         }
@@ -2038,10 +2039,11 @@ describe('createPrSession fork handling', () => {
       expect(result.prIsFork).toBe(true)
       const worktreeTip = git(result.worktreePath, ['rev-parse', 'HEAD']).trim()
       expect(worktreeTip).toBe(prHead)
-      // Fork PRs check out under a PR-scoped local branch, not the fork's head
-      // branch name (which isn't unique across forks).
+      // Fork PRs check out under a pewpew-namespaced PR-scoped local branch, not
+      // the fork's head branch name (which isn't unique across forks) and not a
+      // bare pr-<n> (which could clobber a user branch).
       const worktreeBranch = git(result.worktreePath, ['rev-parse', '--abbrev-ref', 'HEAD']).trim()
-      expect(worktreeBranch).toBe('pr-335')
+      expect(worktreeBranch).toBe('pewpew/pr-335')
     } finally {
       rmSync(root, { recursive: true, force: true })
     }
@@ -2109,7 +2111,7 @@ describe('createPrSession fork handling', () => {
               projectPath: p,
               worktreeName: label ?? 'pr-501',
               worktreePath,
-              branch: 'pr-501',
+              branch: 'pewpew/pr-501',
               tool: tool ?? 'claude',
             }),
         }
@@ -2144,7 +2146,7 @@ describe('createPrSession fork handling', () => {
 
       // Two divergent fork-head commits (siblings off main): the old PR head and
       // the force-pushed new head. `newHead` is NOT a descendant of `oldHead`,
-      // so a non-forced fetch into an existing pr-<n> at oldHead would reject.
+      // so a non-forced fetch into an existing pewpew/pr-<n> at oldHead rejects.
       git(source, ['checkout', '-b', 'old'])
       writeFileSync(join(source, 'file.txt'), 'OLD head\n')
       git(source, ['commit', '-am', 'old head'])
@@ -2163,12 +2165,12 @@ describe('createPrSession fork handling', () => {
       execFileSync('git', ['clone', remote, project], { stdio: 'ignore' })
       mkdirSync(join(project, '.claude', 'worktrees'), { recursive: true })
 
-      // Simulate a previously-removed session: a leftover pr-601 branch at the
-      // OLD head, with no worktree checked out.
-      execFileSync('git', ['-C', project, 'fetch', 'origin', 'pull/601/head:pr-601'], {
+      // Simulate a previously-removed session: a leftover pewpew/pr-601 branch
+      // at the OLD head, with no worktree checked out.
+      execFileSync('git', ['-C', project, 'fetch', 'origin', 'pull/601/head:pewpew/pr-601'], {
         stdio: 'ignore',
       })
-      expect(git(project, ['rev-parse', 'pr-601']).trim()).toBe(oldHead)
+      expect(git(project, ['rev-parse', 'pewpew/pr-601']).trim()).toBe(oldHead)
 
       // The contributor force-pushes: the PR head now points at the divergent
       // new commit.
@@ -2197,7 +2199,7 @@ describe('createPrSession fork handling', () => {
               projectPath: p,
               worktreeName: label ?? 'pr-601',
               worktreePath,
-              branch: 'pr-601',
+              branch: 'pewpew/pr-601',
               tool: tool ?? 'claude',
             }),
         }
@@ -2215,7 +2217,7 @@ describe('createPrSession fork handling', () => {
   })
 
   gitIt(
-    'fails a fork PR rather than DWIM to origin/pr-<n> when the pull ref is missing',
+    'fails a fork PR rather than DWIM to origin/pewpew/pr-<n> when the pull ref is missing',
     async () => {
       const root = mkdtempSync(join(tmpdir(), 'fork-pr-dwim-'))
       try {
@@ -2230,19 +2232,21 @@ describe('createPrSession fork handling', () => {
         git(source, ['add', 'file.txt'])
         git(source, ['commit', '-m', 'one'])
         git(source, ['branch', '-M', 'main'])
-        // The base repo has a branch literally named "pr-808" (unrelated commits).
-        // There is NO refs/pull/808/head, so the fork pull-ref fetch will fail.
-        git(source, ['checkout', '-b', 'pr-808'])
-        writeFileSync(join(source, 'file.txt'), 'WRONG base pr-808 branch\n')
-        git(source, ['commit', '-am', 'base pr-808'])
+        // The base repo has a branch matching pewpew's namespaced fork branch
+        // name (unrelated commits). There is NO refs/pull/808/head, so the fork
+        // pull-ref fetch will fail and `git worktree add <path> pewpew/pr-808`
+        // would otherwise DWIM onto origin/pewpew/pr-808.
+        git(source, ['checkout', '-b', 'pewpew/pr-808'])
+        writeFileSync(join(source, 'file.txt'), 'WRONG base branch\n')
+        git(source, ['commit', '-am', 'base pewpew/pr-808'])
         const baseBranchTip = git(source, ['rev-parse', 'HEAD']).trim()
         git(source, ['checkout', 'main'])
 
         execFileSync('git', ['clone', '--bare', source, remote], { stdio: 'ignore' })
         execFileSync('git', ['clone', remote, project], { stdio: 'ignore' })
         mkdirSync(join(project, '.claude', 'worktrees'), { recursive: true })
-        // origin/pr-808 now exists as a remote-tracking branch in the clone.
-        expect(git(project, ['rev-parse', 'origin/pr-808']).trim()).toBe(baseBranchTip)
+        // origin/pewpew/pr-808 now exists as a remote-tracking branch.
+        expect(git(project, ['rev-parse', 'origin/pewpew/pr-808']).trim()).toBe(baseBranchTip)
 
         const sm = await loadSessionManager()
         const result = await sm.createPrSession(
@@ -2265,7 +2269,7 @@ describe('createPrSession fork handling', () => {
         )
 
         // The pull ref is missing, so creation must fail explicitly — not DWIM a
-        // worktree onto origin/pr-808 (the unrelated base branch).
+        // worktree onto origin/pewpew/pr-808 (the unrelated base branch).
         expect(typeof result).toBe('string')
         expect(existsSync(join(project, '.claude', 'worktrees', 'pr-808'))).toBe(false)
       } finally {
