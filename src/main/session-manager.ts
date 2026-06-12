@@ -834,13 +834,20 @@ async function createRemotePrSession(
 
     const branch = prInfo.headRefName
     const forkFields = forkFieldsFromPr(prInfo)
+    const isFork = forkFields.prIsFork === true
     const id = randomUUID().slice(0, 8)
     const tmuxSession = `pewpew-${id}`
+
+    // A fork PR's head branch name isn't unique across forks, so check it out
+    // under a PR-scoped local branch (the worktree name) to avoid colliding
+    // with a different fork that shares the name. Same-repo PRs keep the real
+    // branch name so pushes update the PR via origin/<branch>.
+    const localBranch = isFork ? worktreeName : branch
 
     // Fetch the PR head. execRemote resolves (rather than rejecting) on a
     // non-zero git exit, so probe result.code to decide whether to fall back
     // to GitHub's refs/pull/<n>/head — the only origin ref a cross-repository
-    // (fork) PR head is reachable through. Fetch it into a local branch.
+    // (fork) PR head is reachable through. Fetch it into the local branch.
     const fetched = await execRemote(host, [
       'git',
       '-C',
@@ -856,7 +863,7 @@ async function createRemotePrSession(
         projectPath,
         'fetch',
         'origin',
-        `pull/${prNumber}/head:${branch}`,
+        `pull/${prNumber}/head:${localBranch}`,
       ]).catch(() => undefined)
     }
 
@@ -864,9 +871,9 @@ async function createRemotePrSession(
     // of try-then-fallback. The fallback masked real failures (e.g. branch
     // already checked out in a stale worktree) by surfacing the second
     // attempt's misleading "branch already exists" error.
-    const branchExistsLocally = await remoteBranchExists(host, projectPath, branch)
+    const branchExistsLocally = await remoteBranchExists(host, projectPath, localBranch)
     const addArgv = branchExistsLocally
-      ? ['git', '-C', projectPath, 'worktree', 'add', worktreePath, branch]
+      ? ['git', '-C', projectPath, 'worktree', 'add', worktreePath, localBranch]
       : [
           'git',
           '-C',
@@ -875,7 +882,7 @@ async function createRemotePrSession(
           'add',
           worktreePath,
           '-b',
-          branch,
+          localBranch,
           `origin/${branch}`,
         ]
     try {
@@ -1692,6 +1699,24 @@ function findSessionByBranch(
   return undefined
 }
 
+function findSessionByPrNumber(
+  projectPath: string,
+  hostId: string | null,
+  prNumber: number
+): Session | undefined {
+  for (const entry of sessions.values()) {
+    const session = entry.session
+    if (
+      session.hostId === hostId &&
+      session.projectPath === projectPath &&
+      session.prNumber === prNumber
+    ) {
+      return session
+    }
+  }
+  return undefined
+}
+
 async function createSessionsForNumbers(
   projectPath: string,
   hostId: string | null,
@@ -1853,40 +1878,54 @@ export async function createPrSession(
 
   const branch = prInfo.headRefName
   const forkFields = forkFieldsFromPr(prInfo)
+  const isFork = forkFields.prIsFork === true
 
-  // A branch can only live in one worktree, so if a session already has this
-  // PR's head branch checked out (e.g. opened earlier as an issue session),
-  // reuse it: tag it with the PR number instead of failing on `worktree add`.
-  const existingForBranch = findSessionByBranch(projectPath, hostId, branch)
-  if (existingForBranch) {
+  const worktreeName = `pr-${prNumber}`
+
+  // Reuse an existing session for this PR. First match by PR number (the only
+  // globally-unique key), then — for a same-repo PR whose head branch name
+  // uniquely identifies it — by branch, so a session opened earlier as an issue
+  // gets tagged instead of failing on `worktree add`. A fork PR's head branch
+  // name is NOT unique (two forks can share `fix`), so we never reuse a fork PR
+  // by branch: that would hijack a different fork's session.
+  const existing =
+    findSessionByPrNumber(projectPath, hostId, prNumber) ??
+    (isFork ? undefined : findSessionByBranch(projectPath, hostId, branch))
+  if (existing) {
     // `gh pr view <prNumber>` just confirmed this branch belongs to the
     // requested PR, so overwrite any stale prNumber rather than only filling
     // an empty one — otherwise the requested PR is reported as linked but the
     // session keeps a different number and the PR gets offered again.
-    existingForBranch.prNumber = prNumber
-    existingForBranch.prIsFork = forkFields.prIsFork
-    existingForBranch.prHeadRepo = forkFields.prHeadRepo
-    if (existingForBranch.issueNumber === undefined) {
-      existingForBranch.issueNumber = parseIssueNumber(prInfo.title)
+    existing.prNumber = prNumber
+    existing.prIsFork = forkFields.prIsFork
+    existing.prHeadRepo = forkFields.prHeadRepo
+    if (existing.issueNumber === undefined) {
+      existing.issueNumber = parseIssueNumber(prInfo.title)
     }
     onSessionsChanged()
-    return existingForBranch
+    return existing
   }
 
-  const worktreeName = `pr-${prNumber}`
   const worktreePath = join(projectPath, '.claude', 'worktrees', worktreeName)
+
+  // The local branch to check out. A fork PR's head branch name isn't unique
+  // across forks, so give it a PR-scoped local branch (the worktree name) to
+  // avoid colliding with a different fork that shares the name. Same-repo PRs
+  // keep the real branch name so pushes from the worktree update the PR via
+  // origin/<branch>.
+  const localBranch = isFork ? worktreeName : branch
 
   // Fetch the PR head. A same-repo PR head lives on origin/<branch>; a
   // cross-repository (fork) PR head only exists on origin as GitHub's
   // refs/pull/<n>/head. Try the branch first and, when origin has no such
-  // branch, fall back to the pull ref — fetching it into a local branch we
+  // branch, fall back to the pull ref — fetching it into the local branch we
   // can then check out. This is failure-driven rather than keyed off
   // isCrossRepository so it stays correct even if that flag is unavailable.
   try {
     await runGit(['fetch', 'origin', branch])
   } catch {
     try {
-      await runGit(['fetch', 'origin', `pull/${prNumber}/head:${branch}`])
+      await runGit(['fetch', 'origin', `pull/${prNumber}/head:${localBranch}`])
     } catch {
       // Offline, or the branch is already present locally — fall through.
     }
@@ -1894,11 +1933,11 @@ export async function createPrSession(
 
   // Create worktree from the PR branch
   try {
-    await runGit(['worktree', 'add', worktreePath, branch])
+    await runGit(['worktree', 'add', worktreePath, localBranch])
   } catch {
     // Branch may already be checked out — try tracking remote
     try {
-      await runGit(['worktree', 'add', worktreePath, '-b', branch, `origin/${branch}`])
+      await runGit(['worktree', 'add', worktreePath, '-b', localBranch, `origin/${branch}`])
     } catch (err) {
       return `Failed to create worktree for branch "${branch}": ${(err as Error).message}`
     }
