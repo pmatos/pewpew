@@ -753,6 +753,28 @@ async function createRemoteSession(
   return session
 }
 
+// Fields gh returns for a PR. Beyond head branch/state/title we read the
+// cross-repository flag and the head repo identity so a fork PR can be both
+// checked out (via refs/pull/<n>/head) and marked as such on the session.
+interface PrViewInfo {
+  headRefName: string
+  state: string
+  title: string
+  isCrossRepository?: boolean
+  headRepositoryOwner?: { login?: string } | null
+  headRepository?: { name?: string } | null
+}
+
+const PR_VIEW_FIELDS =
+  'headRefName,state,title,isCrossRepository,headRepositoryOwner,headRepository'
+
+function forkFieldsFromPr(prInfo: PrViewInfo): { prIsFork?: boolean; prHeadRepo?: string } {
+  if (prInfo.isCrossRepository !== true) return {}
+  const owner = prInfo.headRepositoryOwner?.login
+  const name = prInfo.headRepository?.name
+  return { prIsFork: true, prHeadRepo: owner && name ? `${owner}/${name}` : undefined }
+}
+
 async function createRemotePrSession(
   hostId: string,
   projectPath: string,
@@ -777,14 +799,14 @@ async function createRemotePrSession(
       return ghProbe.error
     }
 
-    let prInfo: { headRefName: string; state: string; title: string }
+    let prInfo: PrViewInfo
     try {
       const stdout = await expectRemoteOk(
         host,
         [
           'sh',
           '-c',
-          'cd "$1" && gh pr view "$2" --json headRefName,state,title',
+          `cd "$1" && gh pr view "$2" --json ${PR_VIEW_FIELDS}`,
           '_',
           projectPath,
           String(prNumber),
@@ -811,12 +833,32 @@ async function createRemotePrSession(
     }
 
     const branch = prInfo.headRefName
+    const forkFields = forkFieldsFromPr(prInfo)
     const id = randomUUID().slice(0, 8)
     const tmuxSession = `pewpew-${id}`
 
-    await execRemote(host, ['git', '-C', projectPath, 'fetch', 'origin', branch]).catch(
-      () => undefined
-    )
+    // Fetch the PR head. execRemote resolves (rather than rejecting) on a
+    // non-zero git exit, so probe result.code to decide whether to fall back
+    // to GitHub's refs/pull/<n>/head — the only origin ref a cross-repository
+    // (fork) PR head is reachable through. Fetch it into a local branch.
+    const fetched = await execRemote(host, [
+      'git',
+      '-C',
+      projectPath,
+      'fetch',
+      'origin',
+      branch,
+    ]).catch(() => ({ code: 1 }))
+    if (fetched.code !== 0) {
+      await execRemote(host, [
+        'git',
+        '-C',
+        projectPath,
+        'fetch',
+        'origin',
+        `pull/${prNumber}/head:${branch}`,
+      ]).catch(() => undefined)
+    }
 
     // Pick the worktree-add form by probing for the local branch first instead
     // of try-then-fallback. The fallback masked real failures (e.g. branch
@@ -863,6 +905,7 @@ async function createRemotePrSession(
       worktreePath,
       branch: resolvedBranch,
       prNumber,
+      ...forkFields,
       issueNumber: parseIssueNumber(worktreeName, resolvedBranch, prInfo.title),
       pid: 0,
       tmuxSession,
@@ -1511,6 +1554,17 @@ interface CreateIssueSessionDeps {
   ) => Promise<Session>
 }
 
+interface CreatePrSessionDeps {
+  runGit?: GitRunner
+  prView?: (projectPath: string, prNumber: number) => Promise<PrViewInfo>
+  createSessionForWorktree?: (
+    projectPath: string,
+    worktreePath: string,
+    label?: string,
+    tool?: AgentTool
+  ) => Promise<Session>
+}
+
 function describeGhError(err: unknown): string {
   const detail =
     typeof err === 'object' && err !== null && 'stderr' in err
@@ -1762,19 +1816,33 @@ export async function createPrSession(
   projectPath: string,
   prNumber: number,
   hostId: string | null = null,
-  options: CreateSessionOptions = {}
+  options: CreateSessionOptions = {},
+  deps: CreatePrSessionDeps = {}
 ): Promise<Session | string> {
   if (hostId !== null) return createRemotePrSession(hostId, projectPath, prNumber, options)
 
+  const runGit =
+    deps.runGit ??
+    (async (argv: string[]) => {
+      const { stdout } = await execFileAsync('git', ['-C', projectPath, ...argv])
+      return { stdout: String(stdout) }
+    })
+  const prView =
+    deps.prView ??
+    (async (cwd: string, number: number): Promise<PrViewInfo> => {
+      const { stdout } = await execFileAsync(
+        'gh',
+        ['pr', 'view', String(number), '--json', PR_VIEW_FIELDS],
+        { cwd }
+      )
+      return JSON.parse(stdout)
+    })
+  const adopt = deps.createSessionForWorktree ?? createSessionForWorktree
+
   // Look up PR via gh CLI
-  let prInfo: { headRefName: string; state: string; title: string }
+  let prInfo: PrViewInfo
   try {
-    const { stdout } = await execFileAsync(
-      'gh',
-      ['pr', 'view', String(prNumber), '--json', 'headRefName,state,title'],
-      { cwd: projectPath }
-    )
-    prInfo = JSON.parse(stdout)
+    prInfo = await prView(projectPath, prNumber)
   } catch {
     return `PR #${prNumber} not found in this repository.`
   }
@@ -1784,6 +1852,7 @@ export async function createPrSession(
   }
 
   const branch = prInfo.headRefName
+  const forkFields = forkFieldsFromPr(prInfo)
 
   // A branch can only live in one worktree, so if a session already has this
   // PR's head branch checked out (e.g. opened earlier as an issue session),
@@ -1795,6 +1864,8 @@ export async function createPrSession(
     // an empty one — otherwise the requested PR is reported as linked but the
     // session keeps a different number and the PR gets offered again.
     existingForBranch.prNumber = prNumber
+    existingForBranch.prIsFork = forkFields.prIsFork
+    existingForBranch.prHeadRepo = forkFields.prHeadRepo
     if (existingForBranch.issueNumber === undefined) {
       existingForBranch.issueNumber = parseIssueNumber(prInfo.title)
     }
@@ -1805,43 +1876,40 @@ export async function createPrSession(
   const worktreeName = `pr-${prNumber}`
   const worktreePath = join(projectPath, '.claude', 'worktrees', worktreeName)
 
-  // Fetch the PR branch
+  // Fetch the PR head. A same-repo PR head lives on origin/<branch>; a
+  // cross-repository (fork) PR head only exists on origin as GitHub's
+  // refs/pull/<n>/head. Try the branch first and, when origin has no such
+  // branch, fall back to the pull ref — fetching it into a local branch we
+  // can then check out. This is failure-driven rather than keyed off
+  // isCrossRepository so it stays correct even if that flag is unavailable.
   try {
-    await execFileAsync('git', ['-C', projectPath, 'fetch', 'origin', branch])
+    await runGit(['fetch', 'origin', branch])
   } catch {
-    // May already be available locally
+    try {
+      await runGit(['fetch', 'origin', `pull/${prNumber}/head:${branch}`])
+    } catch {
+      // Offline, or the branch is already present locally — fall through.
+    }
   }
 
   // Create worktree from the PR branch
   try {
-    await execFileAsync('git', ['-C', projectPath, 'worktree', 'add', worktreePath, branch])
+    await runGit(['worktree', 'add', worktreePath, branch])
   } catch {
     // Branch may already be checked out — try tracking remote
     try {
-      await execFileAsync('git', [
-        '-C',
-        projectPath,
-        'worktree',
-        'add',
-        worktreePath,
-        '-b',
-        branch,
-        `origin/${branch}`,
-      ])
+      await runGit(['worktree', 'add', worktreePath, '-b', branch, `origin/${branch}`])
     } catch (err) {
       return `Failed to create worktree for branch "${branch}": ${(err as Error).message}`
     }
   }
 
-  const session = await createSessionForWorktree(
-    projectPath,
-    worktreePath,
-    worktreeName,
-    options.tool
-  )
+  const session = await adopt(projectPath, worktreePath, worktreeName, options.tool)
   // We already know the PR number; set it directly so it shows immediately
   // (the async lookup fired by adoptWorktree will no-op since prNumber is set).
   session.prNumber = prNumber
+  session.prIsFork = forkFields.prIsFork
+  session.prHeadRepo = forkFields.prHeadRepo
   // Prefer an issue number parsed from the PR title if the name/branch didn't yield one.
   if (session.issueNumber === undefined) {
     session.issueNumber = parseIssueNumber(prInfo.title)

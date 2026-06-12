@@ -1825,6 +1825,186 @@ describe('openSessionsForOpenIssues', () => {
   })
 })
 
+describe('createPrSession fork handling', () => {
+  const forkPrView = async () => ({
+    headRefName: 'codex/fix-x',
+    state: 'OPEN',
+    title: 'docs: fix x',
+    isCrossRepository: true,
+    headRepositoryOwner: { login: 'contributor' },
+    headRepository: { name: 's11' },
+  })
+
+  it('falls back to refs/pull/<n>/head for a cross-repository (fork) PR', async () => {
+    const sm = await loadSessionManager()
+    const runGit = vi.fn(async (argv: string[]) => {
+      const key = argv.join(' ')
+      // Same-repo fetch fails: a fork PR head is not on origin/<branch>.
+      if (key === 'fetch origin codex/fix-x') throw new Error('couldn’t find remote ref')
+      if (key === 'fetch origin pull/335/head:codex/fix-x') return { stdout: '' }
+      if (key === 'worktree add /proj/.claude/worktrees/pr-335 codex/fix-x') return { stdout: '' }
+      throw new Error(`unexpected git ${key}`)
+    })
+    const createSessionForWorktree = vi.fn(async () =>
+      baseLocalSession({
+        id: 'pr-335',
+        projectPath: '/proj',
+        worktreeName: 'pr-335',
+        worktreePath: '/proj/.claude/worktrees/pr-335',
+        branch: 'codex/fix-x',
+      })
+    )
+
+    const result = await sm.createPrSession(
+      '/proj',
+      335,
+      null,
+      {},
+      {
+        runGit,
+        prView: forkPrView,
+        createSessionForWorktree,
+      }
+    )
+
+    expect(typeof result).not.toBe('string')
+    if (typeof result === 'string') throw new Error(result)
+    expect(result.prNumber).toBe(335)
+    expect(result.prIsFork).toBe(true)
+    expect(result.prHeadRepo).toBe('contributor/s11')
+    // The pull ref was fetched into a local branch, and the worktree was added
+    // from that branch — never from the non-existent origin/<branch>.
+    expect(runGit).toHaveBeenCalledWith(['fetch', 'origin', 'pull/335/head:codex/fix-x'])
+    expect(runGit).toHaveBeenCalledWith([
+      'worktree',
+      'add',
+      '/proj/.claude/worktrees/pr-335',
+      'codex/fix-x',
+    ])
+    expect(runGit).not.toHaveBeenCalledWith([
+      'worktree',
+      'add',
+      '/proj/.claude/worktrees/pr-335',
+      '-b',
+      'codex/fix-x',
+      'origin/codex/fix-x',
+    ])
+  })
+
+  it('does not fetch the pull ref for a same-repo PR', async () => {
+    const sm = await loadSessionManager()
+    const runGit = vi.fn(async (argv: string[]) => {
+      const key = argv.join(' ')
+      if (key === 'fetch origin feat-y') return { stdout: '' }
+      if (key === 'worktree add /proj/.claude/worktrees/pr-7 feat-y') return { stdout: '' }
+      throw new Error(`unexpected git ${key}`)
+    })
+    const createSessionForWorktree = vi.fn(async () =>
+      baseLocalSession({
+        id: 'pr-7',
+        projectPath: '/proj',
+        worktreeName: 'pr-7',
+        worktreePath: '/proj/.claude/worktrees/pr-7',
+        branch: 'feat-y',
+      })
+    )
+
+    const result = await sm.createPrSession(
+      '/proj',
+      7,
+      null,
+      {},
+      {
+        runGit,
+        prView: async () => ({ headRefName: 'feat-y', state: 'OPEN', title: 'feat' }),
+        createSessionForWorktree,
+      }
+    )
+
+    expect(typeof result).not.toBe('string')
+    if (typeof result === 'string') throw new Error(result)
+    expect(result.prNumber).toBe(7)
+    expect(result.prIsFork).toBeUndefined()
+    expect(result.prHeadRepo).toBeUndefined()
+    expect(runGit).not.toHaveBeenCalledWith(['fetch', 'origin', 'pull/7/head:feat-y'])
+  })
+
+  const gitIt = canRunGit ? it : it.skip
+
+  function git(cwd: string, args: string[]): string {
+    return execFileSync('git', args, { cwd, encoding: 'utf-8' })
+  }
+
+  gitIt('checks out a fork PR head end-to-end via the pull ref (real git)', async () => {
+    const root = mkdtempSync(join(tmpdir(), 'fork-pr-'))
+    try {
+      const source = join(root, 'source')
+      const remote = join(root, 'remote.git')
+      const project = join(root, 'project')
+      mkdirSync(source)
+      git(source, ['init'])
+      git(source, ['config', 'user.email', 'test@example.com'])
+      git(source, ['config', 'user.name', 'Test User'])
+      writeFileSync(join(source, 'file.txt'), 'one\n')
+      git(source, ['add', 'file.txt'])
+      git(source, ['commit', '-m', 'one'])
+      git(source, ['branch', '-M', 'main'])
+      // The PR head lives on its own branch (stands in for the fork). Capture
+      // its tip, then keep main where it is.
+      git(source, ['checkout', '-b', 'pr-src'])
+      writeFileSync(join(source, 'file.txt'), 'two\n')
+      git(source, ['commit', '-am', 'pr head'])
+      const prHead = git(source, ['rev-parse', 'HEAD']).trim()
+      git(source, ['checkout', 'main'])
+
+      execFileSync('git', ['clone', '--bare', source, remote], { stdio: 'ignore' })
+      // Expose the head only through GitHub's refs/pull/<n>/head, then drop the
+      // branch so origin has no refs/heads/<branch> — exactly a fork PR.
+      execFileSync('git', ['-C', remote, 'update-ref', 'refs/pull/335/head', prHead], {
+        stdio: 'ignore',
+      })
+      execFileSync('git', ['-C', remote, 'branch', '-D', 'pr-src'], { stdio: 'ignore' })
+      execFileSync('git', ['clone', remote, project], { stdio: 'ignore' })
+      mkdirSync(join(project, '.claude', 'worktrees'), { recursive: true })
+
+      const sm = await loadSessionManager()
+      const result = await sm.createPrSession(
+        project,
+        335,
+        null,
+        {},
+        {
+          prView: async () => ({
+            headRefName: 'codex/fix-x',
+            state: 'OPEN',
+            title: 'docs: fix x',
+            isCrossRepository: true,
+            headRepositoryOwner: { login: 'contributor' },
+            headRepository: { name: 's11' },
+          }),
+          createSessionForWorktree: async (p, worktreePath, label, tool) =>
+            baseLocalSession({
+              id: 'pr-335',
+              projectPath: p,
+              worktreeName: label ?? 'pr-335',
+              worktreePath,
+              branch: 'codex/fix-x',
+              tool: tool ?? 'claude',
+            }),
+        }
+      )
+
+      expect(typeof result).not.toBe('string')
+      if (typeof result === 'string') throw new Error(result)
+      expect(result.prIsFork).toBe(true)
+      const worktreeTip = git(result.worktreePath, ['rev-parse', 'HEAD']).trim()
+      expect(worktreeTip).toBe(prHead)
+    } finally {
+      rmSync(root, { recursive: true, force: true })
+    }
+  })
+})
+
 describe('createPrSessions', () => {
   it('skips numbers that already have a session and creates the rest', async () => {
     const sm = await loadSessionManager()
