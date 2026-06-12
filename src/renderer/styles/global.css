@@ -27,6 +27,7 @@
   --accent-red: #f87171;
   --accent-blue: #60a5fa;
   --accent-orange: #f59e0b;
+  --accent-purple: #c084fc;
   --accent-error: #e07070;
 
   --shadow-md: rgba(0, 0, 0, 0.4);
@@ -67,6 +68,7 @@
   --accent-red: #dc2626;
   --accent-blue: #1d4ed8;
   --accent-orange: #c2410c;
+  --accent-purple: #7e22ce;
   --accent-error: #b91c1c;
 
   --shadow-md: rgba(15, 23, 42, 0.14);
@@ -497,6 +499,13 @@ body,
   background: rgba(74, 222, 128, 0.1);
   border-color: rgba(74, 222, 128, 0.35);
   color: var(--accent-green);
+  flex: 0 0 auto;
+}
+
+.session-card-chip.chip-fork {
+  background: rgba(192, 132, 252, 0.12);
+  border-color: rgba(192, 132, 252, 0.4);
+  color: var(--accent-purple);
   flex: 0 0 auto;
 }
 

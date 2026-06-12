@@ -753,6 +753,37 @@ async function createRemoteSession(
   return session
 }
 
+// Fields gh returns for a PR. Beyond head branch/state/title we read the
+// cross-repository flag and the head repo identity so a fork PR can be both
+// checked out (via refs/pull/<n>/head) and marked as such on the session.
+interface PrViewInfo {
+  headRefName: string
+  state: string
+  title: string
+  isCrossRepository?: boolean
+  headRepositoryOwner?: { login?: string } | null
+  headRepository?: { name?: string } | null
+}
+
+const PR_VIEW_FIELDS =
+  'headRefName,state,title,isCrossRepository,headRepositoryOwner,headRepository'
+
+function forkFieldsFromPr(prInfo: PrViewInfo): { prIsFork?: boolean; prHeadRepo?: string } {
+  if (prInfo.isCrossRepository !== true) return {}
+  const owner = prInfo.headRepositoryOwner?.login
+  const name = prInfo.headRepository?.name
+  return { prIsFork: true, prHeadRepo: owner && name ? `${owner}/${name}` : undefined }
+}
+
+async function localBranchExists(runGit: GitRunner, branch: string): Promise<boolean> {
+  try {
+    await runGit(['rev-parse', '--verify', '--quiet', `refs/heads/${branch}`])
+    return true
+  } catch {
+    return false
+  }
+}
+
 async function createRemotePrSession(
   hostId: string,
   projectPath: string,
@@ -777,14 +808,14 @@ async function createRemotePrSession(
       return ghProbe.error
     }
 
-    let prInfo: { headRefName: string; state: string; title: string }
+    let prInfo: PrViewInfo
     try {
       const stdout = await expectRemoteOk(
         host,
         [
           'sh',
           '-c',
-          'cd "$1" && gh pr view "$2" --json headRefName,state,title',
+          `cd "$1" && gh pr view "$2" --json ${PR_VIEW_FIELDS}`,
           '_',
           projectPath,
           String(prNumber),
@@ -811,20 +842,57 @@ async function createRemotePrSession(
     }
 
     const branch = prInfo.headRefName
+    const forkFields = forkFieldsFromPr(prInfo)
+    const isFork = forkFields.prIsFork === true
     const id = randomUUID().slice(0, 8)
     const tmuxSession = `pewpew-${id}`
 
-    await execRemote(host, ['git', '-C', projectPath, 'fetch', 'origin', branch]).catch(
-      () => undefined
-    )
+    // A fork PR's head branch name isn't unique across forks, so check it out
+    // under a PR-scoped local branch namespaced under `pewpew/` — both to avoid
+    // colliding with a different fork that shares the name and so the forced
+    // fetch below can't clobber an unrelated user branch named `pr-<n>`. Same-
+    // repo PRs keep the real branch name so pushes update the PR via
+    // origin/<branch>.
+    const localBranch = isFork ? `pewpew/${worktreeName}` : branch
+
+    // Fetch the PR head into the local branch we'll check out. A fork PR head
+    // is ONLY authoritative via GitHub's refs/pull/<n>/head: never fetch
+    // origin/<branch>, because if the fork's head branch name also exists on
+    // the base repo (e.g. a fork whose head branch is `main`) that fetch would
+    // succeed and we'd check out the base repo's branch instead of the PR's
+    // commits. A same-repo PR head lives on origin/<branch>, so fetch that.
+    if (isFork) {
+      // Forced refspec (`+`): a removed session can leave the pewpew/ branch
+      // behind, and a later PR force-push makes a non-forced fetch reject as
+      // non-fast-forward, so remoteBranchExists would see the stale branch and
+      // the worktree would check out old commits. The pewpew/ branch is
+      // pewpew-owned and must track the current PR head.
+      await execRemote(host, [
+        'git',
+        '-C',
+        projectPath,
+        'fetch',
+        'origin',
+        `+pull/${prNumber}/head:${localBranch}`,
+      ]).catch(() => undefined)
+    } else {
+      await execRemote(host, ['git', '-C', projectPath, 'fetch', 'origin', branch]).catch(
+        () => undefined
+      )
+    }
 
     // Pick the worktree-add form by probing for the local branch first instead
     // of try-then-fallback. The fallback masked real failures (e.g. branch
     // already checked out in a stale worktree) by surfacing the second
     // attempt's misleading "branch already exists" error.
-    const branchExistsLocally = await remoteBranchExists(host, projectPath, branch)
+    const branchExistsLocally = await remoteBranchExists(host, projectPath, localBranch)
+    if (isFork && !branchExistsLocally) {
+      // The pull-ref fetch should have created pr-<n>; if it didn't there's no
+      // valid origin fallback for a fork (origin/<branch> isn't the PR head).
+      return `Failed to create worktree for branch "${branch}": could not fetch refs/pull/${prNumber}/head`
+    }
     const addArgv = branchExistsLocally
-      ? ['git', '-C', projectPath, 'worktree', 'add', worktreePath, branch]
+      ? ['git', '-C', projectPath, 'worktree', 'add', worktreePath, localBranch]
       : [
           'git',
           '-C',
@@ -833,7 +901,7 @@ async function createRemotePrSession(
           'add',
           worktreePath,
           '-b',
-          branch,
+          localBranch,
           `origin/${branch}`,
         ]
     try {
@@ -863,6 +931,7 @@ async function createRemotePrSession(
       worktreePath,
       branch: resolvedBranch,
       prNumber,
+      ...forkFields,
       issueNumber: parseIssueNumber(worktreeName, resolvedBranch, prInfo.title),
       pid: 0,
       tmuxSession,
@@ -1511,6 +1580,17 @@ interface CreateIssueSessionDeps {
   ) => Promise<Session>
 }
 
+interface CreatePrSessionDeps {
+  runGit?: GitRunner
+  prView?: (projectPath: string, prNumber: number) => Promise<PrViewInfo>
+  createSessionForWorktree?: (
+    projectPath: string,
+    worktreePath: string,
+    label?: string,
+    tool?: AgentTool
+  ) => Promise<Session>
+}
+
 function describeGhError(err: unknown): string {
   const detail =
     typeof err === 'object' && err !== null && 'stderr' in err
@@ -1631,6 +1711,24 @@ function findSessionByBranch(
       session.hostId === hostId &&
       session.projectPath === projectPath &&
       session.branch === branch
+    ) {
+      return session
+    }
+  }
+  return undefined
+}
+
+function findSessionByPrNumber(
+  projectPath: string,
+  hostId: string | null,
+  prNumber: number
+): Session | undefined {
+  for (const entry of sessions.values()) {
+    const session = entry.session
+    if (
+      session.hostId === hostId &&
+      session.projectPath === projectPath &&
+      session.prNumber === prNumber
     ) {
       return session
     }
@@ -1762,19 +1860,33 @@ export async function createPrSession(
   projectPath: string,
   prNumber: number,
   hostId: string | null = null,
-  options: CreateSessionOptions = {}
+  options: CreateSessionOptions = {},
+  deps: CreatePrSessionDeps = {}
 ): Promise<Session | string> {
   if (hostId !== null) return createRemotePrSession(hostId, projectPath, prNumber, options)
 
+  const runGit =
+    deps.runGit ??
+    (async (argv: string[]) => {
+      const { stdout } = await execFileAsync('git', ['-C', projectPath, ...argv])
+      return { stdout: String(stdout) }
+    })
+  const prView =
+    deps.prView ??
+    (async (cwd: string, number: number): Promise<PrViewInfo> => {
+      const { stdout } = await execFileAsync(
+        'gh',
+        ['pr', 'view', String(number), '--json', PR_VIEW_FIELDS],
+        { cwd }
+      )
+      return JSON.parse(stdout)
+    })
+  const adopt = deps.createSessionForWorktree ?? createSessionForWorktree
+
   // Look up PR via gh CLI
-  let prInfo: { headRefName: string; state: string; title: string }
+  let prInfo: PrViewInfo
   try {
-    const { stdout } = await execFileAsync(
-      'gh',
-      ['pr', 'view', String(prNumber), '--json', 'headRefName,state,title'],
-      { cwd: projectPath }
-    )
-    prInfo = JSON.parse(stdout)
+    prInfo = await prView(projectPath, prNumber)
   } catch {
     return `PR #${prNumber} not found in this repository.`
   }
@@ -1784,64 +1896,100 @@ export async function createPrSession(
   }
 
   const branch = prInfo.headRefName
+  const forkFields = forkFieldsFromPr(prInfo)
+  const isFork = forkFields.prIsFork === true
 
-  // A branch can only live in one worktree, so if a session already has this
-  // PR's head branch checked out (e.g. opened earlier as an issue session),
-  // reuse it: tag it with the PR number instead of failing on `worktree add`.
-  const existingForBranch = findSessionByBranch(projectPath, hostId, branch)
-  if (existingForBranch) {
+  const worktreeName = `pr-${prNumber}`
+
+  // Reuse an existing session for this PR. First match by PR number (the only
+  // globally-unique key), then — for a same-repo PR whose head branch name
+  // uniquely identifies it — by branch, so a session opened earlier as an issue
+  // gets tagged instead of failing on `worktree add`. A fork PR's head branch
+  // name is NOT unique (two forks can share `fix`), so we never reuse a fork PR
+  // by branch: that would hijack a different fork's session.
+  const existing =
+    findSessionByPrNumber(projectPath, hostId, prNumber) ??
+    (isFork ? undefined : findSessionByBranch(projectPath, hostId, branch))
+  if (existing) {
     // `gh pr view <prNumber>` just confirmed this branch belongs to the
     // requested PR, so overwrite any stale prNumber rather than only filling
     // an empty one — otherwise the requested PR is reported as linked but the
     // session keeps a different number and the PR gets offered again.
-    existingForBranch.prNumber = prNumber
-    if (existingForBranch.issueNumber === undefined) {
-      existingForBranch.issueNumber = parseIssueNumber(prInfo.title)
+    existing.prNumber = prNumber
+    existing.prIsFork = forkFields.prIsFork
+    existing.prHeadRepo = forkFields.prHeadRepo
+    if (existing.issueNumber === undefined) {
+      existing.issueNumber = parseIssueNumber(prInfo.title)
     }
     onSessionsChanged()
-    return existingForBranch
+    return existing
   }
 
-  const worktreeName = `pr-${prNumber}`
   const worktreePath = join(projectPath, '.claude', 'worktrees', worktreeName)
 
-  // Fetch the PR branch
-  try {
-    await execFileAsync('git', ['-C', projectPath, 'fetch', 'origin', branch])
-  } catch {
-    // May already be available locally
+  // The local branch to check out. A fork PR's head branch name isn't unique
+  // across forks, so give it a PR-scoped local branch. We namespace it under
+  // `pewpew/` (rather than a bare `pr-<n>`) so the forced fetch below can never
+  // clobber an unrelated user branch that happens to be named `pr-<n>`. Same-
+  // repo PRs keep the real branch name so pushes from the worktree update the
+  // PR via origin/<branch>.
+  const localBranch = isFork ? `pewpew/${worktreeName}` : branch
+
+  // Fetch the PR head into the local branch we'll check out. A fork PR head is
+  // ONLY authoritative via GitHub's refs/pull/<n>/head: we must not fetch
+  // origin/<branch>, because if the fork's head branch name also exists on the
+  // base repo (e.g. a fork whose head branch is `main`) that fetch would
+  // succeed and we'd later check out the base repo's branch instead of the
+  // PR's commits. A same-repo PR head lives on origin/<branch>, so fetch that.
+  if (isFork) {
+    // Forced refspec (`+`): a removed session leaves refs/heads/pewpew/pr-<n>
+    // behind, and a later PR force-push makes a non-forced fetch reject as
+    // non-fast-forward — silently reopening stale commits. The pewpew/ branch
+    // is pewpew-owned and must always track the current PR head, and same-PR
+    // reuse already returned above, so it isn't checked out here.
+    try {
+      await runGit(['fetch', 'origin', `+pull/${prNumber}/head:${localBranch}`])
+    } catch {
+      // Offline, or the namespaced branch is already present locally.
+    }
+    // The pull ref must have produced the local branch. If the fetch failed and
+    // it doesn't exist, do NOT run `git worktree add <path> <localBranch>`:
+    // with no local branch, git DWIMs the name to a remote-tracking
+    // origin/<localBranch> (if one exists) and silently checks out the wrong
+    // commits. Fail explicitly instead, mirroring the remote path.
+    if (!(await localBranchExists(runGit, localBranch))) {
+      return `Failed to create worktree for branch "${branch}": could not fetch refs/pull/${prNumber}/head`
+    }
+  } else {
+    try {
+      await runGit(['fetch', 'origin', branch])
+    } catch {
+      // May already be available locally.
+    }
   }
 
   // Create worktree from the PR branch
   try {
-    await execFileAsync('git', ['-C', projectPath, 'worktree', 'add', worktreePath, branch])
-  } catch {
-    // Branch may already be checked out — try tracking remote
-    try {
-      await execFileAsync('git', [
-        '-C',
-        projectPath,
-        'worktree',
-        'add',
-        worktreePath,
-        '-b',
-        branch,
-        `origin/${branch}`,
-      ])
-    } catch (err) {
+    await runGit(['worktree', 'add', worktreePath, localBranch])
+  } catch (err) {
+    // A fork PR has no valid origin fallback — origin/<branch> is not its head.
+    if (isFork) {
       return `Failed to create worktree for branch "${branch}": ${(err as Error).message}`
+    }
+    // Same-repo branch may not exist locally yet — create it tracking origin.
+    try {
+      await runGit(['worktree', 'add', worktreePath, '-b', localBranch, `origin/${branch}`])
+    } catch (fallbackErr) {
+      return `Failed to create worktree for branch "${branch}": ${(fallbackErr as Error).message}`
     }
   }
 
-  const session = await createSessionForWorktree(
-    projectPath,
-    worktreePath,
-    worktreeName,
-    options.tool
-  )
+  const session = await adopt(projectPath, worktreePath, worktreeName, options.tool)
   // We already know the PR number; set it directly so it shows immediately
   // (the async lookup fired by adoptWorktree will no-op since prNumber is set).
   session.prNumber = prNumber
+  session.prIsFork = forkFields.prIsFork
+  session.prHeadRepo = forkFields.prHeadRepo
   // Prefer an issue number parsed from the PR title if the name/branch didn't yield one.
   if (session.issueNumber === undefined) {
     session.issueNumber = parseIssueNumber(prInfo.title)

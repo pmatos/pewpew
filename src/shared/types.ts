@@ -41,6 +41,12 @@ export interface Session {
   worktreePath: string
   branch: string
   prNumber?: number
+  // Set when the PR head lives in a different repository (a fork). The head
+  // branch is then only reachable via GitHub's refs/pull/<n>/head, and pushes
+  // from this worktree won't update the PR (origin has no such branch).
+  prIsFork?: boolean
+  // "owner/name" of the fork the PR head lives in, when known (display only).
+  prHeadRepo?: string
   issueNumber?: number
   pid: number
   tmuxSession: string

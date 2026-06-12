@@ -1,5 +1,5 @@
 import { execFileSync } from 'child_process'
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'fs'
+import { existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'fs'
 import { tmpdir } from 'os'
 import { join } from 'path'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
@@ -1822,6 +1822,535 @@ describe('openSessionsForOpenIssues', () => {
     expect(result.created).toEqual([])
     expect(result.skipped).toEqual([])
     expect(result.failed).toEqual([{ number: 5, error: 'boom' }])
+  })
+})
+
+describe('createPrSession fork handling', () => {
+  const forkPrView = async () => ({
+    headRefName: 'codex/fix-x',
+    state: 'OPEN',
+    title: 'docs: fix x',
+    isCrossRepository: true,
+    headRepositoryOwner: { login: 'contributor' },
+    headRepository: { name: 's11' },
+  })
+
+  it('fetches refs/pull/<n>/head for a fork PR and never touches origin/<branch>', async () => {
+    const sm = await loadSessionManager()
+    const runGit = vi.fn(async (argv: string[]) => {
+      const key = argv.join(' ')
+      // A fork PR head is fetched straight from the pull ref into a PR-scoped
+      // local branch namespaced under pewpew/ with a FORCED refspec —
+      // origin/<branch> is never fetched, and the pewpew/ namespace keeps the
+      // forced fetch from clobbering an unrelated user branch named pr-335.
+      if (key === 'fetch origin +pull/335/head:pewpew/pr-335') return { stdout: '' }
+      // The PR-scoped branch is verified to exist before `worktree add`.
+      if (key === 'rev-parse --verify --quiet refs/heads/pewpew/pr-335') return { stdout: 'abc\n' }
+      if (key === 'worktree add /proj/.claude/worktrees/pr-335 pewpew/pr-335') return { stdout: '' }
+      throw new Error(`unexpected git ${key}`)
+    })
+    const createSessionForWorktree = vi.fn(async () =>
+      baseLocalSession({
+        id: 'pr-335',
+        projectPath: '/proj',
+        worktreeName: 'pr-335',
+        worktreePath: '/proj/.claude/worktrees/pr-335',
+        branch: 'pewpew/pr-335',
+      })
+    )
+
+    const result = await sm.createPrSession(
+      '/proj',
+      335,
+      null,
+      {},
+      {
+        runGit,
+        prView: forkPrView,
+        createSessionForWorktree,
+      }
+    )
+
+    expect(typeof result).not.toBe('string')
+    if (typeof result === 'string') throw new Error(result)
+    expect(result.prNumber).toBe(335)
+    expect(result.prIsFork).toBe(true)
+    expect(result.prHeadRepo).toBe('contributor/s11')
+    // The pull ref was force-fetched into a pewpew-namespaced PR-scoped local
+    // branch, and the worktree was added from it.
+    expect(runGit).toHaveBeenCalledWith(['fetch', 'origin', '+pull/335/head:pewpew/pr-335'])
+    expect(runGit).toHaveBeenCalledWith([
+      'worktree',
+      'add',
+      '/proj/.claude/worktrees/pr-335',
+      'pewpew/pr-335',
+    ])
+    // origin/<branch> is never fetched or used for a fork PR — the fork's head
+    // branch name could collide with a base-repo branch of the same name.
+    expect(runGit).not.toHaveBeenCalledWith(['fetch', 'origin', 'codex/fix-x'])
+    expect(runGit).not.toHaveBeenCalledWith([
+      'worktree',
+      'add',
+      '/proj/.claude/worktrees/pr-335',
+      '-b',
+      'pewpew/pr-335',
+      'origin/codex/fix-x',
+    ])
+  })
+
+  it('errors without running worktree add when the fork pull-ref fetch fails', async () => {
+    const sm = await loadSessionManager()
+    const runGit = vi.fn(async (argv: string[]) => {
+      const key = argv.join(' ')
+      // The pull ref can't be fetched (offline / transient), so the PR-scoped
+      // branch is never created.
+      if (key === 'fetch origin +pull/335/head:pewpew/pr-335') throw new Error('network down')
+      if (key === 'rev-parse --verify --quiet refs/heads/pewpew/pr-335')
+        throw new Error('no such ref')
+      throw new Error(`unexpected git ${key}`)
+    })
+    const createSessionForWorktree = vi.fn()
+
+    const result = await sm.createPrSession(
+      '/proj',
+      335,
+      null,
+      {},
+      { runGit, prView: forkPrView, createSessionForWorktree }
+    )
+
+    // No local pewpew/pr-335 exists, so we must fail explicitly rather than let
+    // `git worktree add` DWIM to a remote-tracking origin/pewpew/pr-335.
+    expect(typeof result).toBe('string')
+    expect(runGit).not.toHaveBeenCalledWith([
+      'worktree',
+      'add',
+      '/proj/.claude/worktrees/pr-335',
+      'pewpew/pr-335',
+    ])
+    expect(createSessionForWorktree).not.toHaveBeenCalled()
+  })
+
+  it('does not fetch the pull ref for a same-repo PR', async () => {
+    const sm = await loadSessionManager()
+    const runGit = vi.fn(async (argv: string[]) => {
+      const key = argv.join(' ')
+      if (key === 'fetch origin feat-y') return { stdout: '' }
+      if (key === 'worktree add /proj/.claude/worktrees/pr-7 feat-y') return { stdout: '' }
+      throw new Error(`unexpected git ${key}`)
+    })
+    const createSessionForWorktree = vi.fn(async () =>
+      baseLocalSession({
+        id: 'pr-7',
+        projectPath: '/proj',
+        worktreeName: 'pr-7',
+        worktreePath: '/proj/.claude/worktrees/pr-7',
+        branch: 'feat-y',
+      })
+    )
+
+    const result = await sm.createPrSession(
+      '/proj',
+      7,
+      null,
+      {},
+      {
+        runGit,
+        prView: async () => ({ headRefName: 'feat-y', state: 'OPEN', title: 'feat' }),
+        createSessionForWorktree,
+      }
+    )
+
+    expect(typeof result).not.toBe('string')
+    if (typeof result === 'string') throw new Error(result)
+    expect(result.prNumber).toBe(7)
+    expect(result.prIsFork).toBeUndefined()
+    expect(result.prHeadRepo).toBeUndefined()
+    expect(runGit).not.toHaveBeenCalledWith(['fetch', 'origin', 'pull/7/head:feat-y'])
+  })
+
+  const gitIt = canRunGit ? it : it.skip
+
+  function git(cwd: string, args: string[]): string {
+    return execFileSync('git', args, { cwd, encoding: 'utf-8' })
+  }
+
+  gitIt('checks out a fork PR head end-to-end via the pull ref (real git)', async () => {
+    const root = mkdtempSync(join(tmpdir(), 'fork-pr-'))
+    try {
+      const source = join(root, 'source')
+      const remote = join(root, 'remote.git')
+      const project = join(root, 'project')
+      mkdirSync(source)
+      git(source, ['init'])
+      git(source, ['config', 'user.email', 'test@example.com'])
+      git(source, ['config', 'user.name', 'Test User'])
+      writeFileSync(join(source, 'file.txt'), 'one\n')
+      git(source, ['add', 'file.txt'])
+      git(source, ['commit', '-m', 'one'])
+      git(source, ['branch', '-M', 'main'])
+      // The PR head lives on its own branch (stands in for the fork). Capture
+      // its tip, then keep main where it is.
+      git(source, ['checkout', '-b', 'pr-src'])
+      writeFileSync(join(source, 'file.txt'), 'two\n')
+      git(source, ['commit', '-am', 'pr head'])
+      const prHead = git(source, ['rev-parse', 'HEAD']).trim()
+      git(source, ['checkout', 'main'])
+
+      execFileSync('git', ['clone', '--bare', source, remote], { stdio: 'ignore' })
+      // Expose the head only through GitHub's refs/pull/<n>/head, then drop the
+      // branch so origin has no refs/heads/<branch> — exactly a fork PR.
+      execFileSync('git', ['-C', remote, 'update-ref', 'refs/pull/335/head', prHead], {
+        stdio: 'ignore',
+      })
+      execFileSync('git', ['-C', remote, 'branch', '-D', 'pr-src'], { stdio: 'ignore' })
+      execFileSync('git', ['clone', remote, project], { stdio: 'ignore' })
+      mkdirSync(join(project, '.claude', 'worktrees'), { recursive: true })
+
+      const sm = await loadSessionManager()
+      const result = await sm.createPrSession(
+        project,
+        335,
+        null,
+        {},
+        {
+          prView: async () => ({
+            headRefName: 'codex/fix-x',
+            state: 'OPEN',
+            title: 'docs: fix x',
+            isCrossRepository: true,
+            headRepositoryOwner: { login: 'contributor' },
+            headRepository: { name: 's11' },
+          }),
+          createSessionForWorktree: async (p, worktreePath, label, tool) =>
+            baseLocalSession({
+              id: 'pr-335',
+              projectPath: p,
+              worktreeName: label ?? 'pr-335',
+              worktreePath,
+              branch: 'pewpew/pr-335',
+              tool: tool ?? 'claude',
+            }),
+        }
+      )
+
+      expect(typeof result).not.toBe('string')
+      if (typeof result === 'string') throw new Error(result)
+      expect(result.prIsFork).toBe(true)
+      const worktreeTip = git(result.worktreePath, ['rev-parse', 'HEAD']).trim()
+      expect(worktreeTip).toBe(prHead)
+      // Fork PRs check out under a pewpew-namespaced PR-scoped local branch, not
+      // the fork's head branch name (which isn't unique across forks) and not a
+      // bare pr-<n> (which could clobber a user branch).
+      const worktreeBranch = git(result.worktreePath, ['rev-parse', '--abbrev-ref', 'HEAD']).trim()
+      expect(worktreeBranch).toBe('pewpew/pr-335')
+    } finally {
+      rmSync(root, { recursive: true, force: true })
+    }
+  })
+
+  gitIt('checks out the fork PR head, not the base branch, on a name collision', async () => {
+    const root = mkdtempSync(join(tmpdir(), 'fork-pr-namecollide-'))
+    try {
+      const source = join(root, 'source')
+      const remote = join(root, 'remote.git')
+      const project = join(root, 'project')
+      mkdirSync(source)
+      git(source, ['init'])
+      git(source, ['config', 'user.email', 'test@example.com'])
+      git(source, ['config', 'user.name', 'Test User'])
+      writeFileSync(join(source, 'file.txt'), 'one\n')
+      git(source, ['add', 'file.txt'])
+      git(source, ['commit', '-m', 'one'])
+      git(source, ['branch', '-M', 'main'])
+
+      // The base repo HAS a branch named "shared" (the fork PR's head branch
+      // name collides with it) pointing at different commits than the PR head.
+      git(source, ['checkout', '-b', 'shared'])
+      writeFileSync(join(source, 'file.txt'), 'BASE shared branch\n')
+      git(source, ['commit', '-am', 'base shared'])
+      const baseSharedTip = git(source, ['rev-parse', 'HEAD']).trim()
+      // The actual fork PR head, on its own branch, with different content.
+      git(source, ['checkout', 'main'])
+      git(source, ['checkout', '-b', 'fork-head'])
+      writeFileSync(join(source, 'file.txt'), 'FORK pr head\n')
+      git(source, ['commit', '-am', 'fork head'])
+      const forkHead = git(source, ['rev-parse', 'HEAD']).trim()
+      git(source, ['checkout', 'main'])
+
+      execFileSync('git', ['clone', '--bare', source, remote], { stdio: 'ignore' })
+      // Keep refs/heads/shared on origin (the collision); expose the fork PR head
+      // only through refs/pull/501/head and drop its branch.
+      execFileSync('git', ['-C', remote, 'update-ref', 'refs/pull/501/head', forkHead], {
+        stdio: 'ignore',
+      })
+      execFileSync('git', ['-C', remote, 'branch', '-D', 'fork-head'], { stdio: 'ignore' })
+      execFileSync('git', ['clone', remote, project], { stdio: 'ignore' })
+      mkdirSync(join(project, '.claude', 'worktrees'), { recursive: true })
+
+      const sm = await loadSessionManager()
+      const result = await sm.createPrSession(
+        project,
+        501,
+        null,
+        {},
+        {
+          // The fork PR's head branch is named "shared" — the same name as the
+          // base-repo branch that exists on origin.
+          prView: async () => ({
+            headRefName: 'shared',
+            state: 'OPEN',
+            title: 'fork pr',
+            isCrossRepository: true,
+            headRepositoryOwner: { login: 'contributor' },
+            headRepository: { name: 'proj' },
+          }),
+          createSessionForWorktree: async (p, worktreePath, label, tool) =>
+            baseLocalSession({
+              id: 'pr-501',
+              projectPath: p,
+              worktreeName: label ?? 'pr-501',
+              worktreePath,
+              branch: 'pewpew/pr-501',
+              tool: tool ?? 'claude',
+            }),
+        }
+      )
+
+      expect(typeof result).not.toBe('string')
+      if (typeof result === 'string') throw new Error(result)
+      const worktreeTip = git(result.worktreePath, ['rev-parse', 'HEAD']).trim()
+      // The worktree must hold the fork PR head, NOT origin/shared (the base
+      // branch that shares the name).
+      expect(worktreeTip).toBe(forkHead)
+      expect(worktreeTip).not.toBe(baseSharedTip)
+    } finally {
+      rmSync(root, { recursive: true, force: true })
+    }
+  })
+
+  gitIt('force-refreshes a stale pr-<n> branch after a PR force-push', async () => {
+    const root = mkdtempSync(join(tmpdir(), 'fork-pr-forcepush-'))
+    try {
+      const source = join(root, 'source')
+      const remote = join(root, 'remote.git')
+      const project = join(root, 'project')
+      mkdirSync(source)
+      git(source, ['init'])
+      git(source, ['config', 'user.email', 'test@example.com'])
+      git(source, ['config', 'user.name', 'Test User'])
+      writeFileSync(join(source, 'file.txt'), 'one\n')
+      git(source, ['add', 'file.txt'])
+      git(source, ['commit', '-m', 'one'])
+      git(source, ['branch', '-M', 'main'])
+
+      // Two divergent fork-head commits (siblings off main): the old PR head and
+      // the force-pushed new head. `newHead` is NOT a descendant of `oldHead`,
+      // so a non-forced fetch into an existing pewpew/pr-<n> at oldHead rejects.
+      git(source, ['checkout', '-b', 'old'])
+      writeFileSync(join(source, 'file.txt'), 'OLD head\n')
+      git(source, ['commit', '-am', 'old head'])
+      const oldHead = git(source, ['rev-parse', 'HEAD']).trim()
+      git(source, ['checkout', 'main'])
+      git(source, ['checkout', '-b', 'new'])
+      writeFileSync(join(source, 'file.txt'), 'NEW head\n')
+      git(source, ['commit', '-am', 'new head'])
+      const newHead = git(source, ['rev-parse', 'HEAD']).trim()
+      git(source, ['checkout', 'main'])
+
+      execFileSync('git', ['clone', '--bare', source, remote], { stdio: 'ignore' })
+      execFileSync('git', ['-C', remote, 'update-ref', 'refs/pull/601/head', oldHead], {
+        stdio: 'ignore',
+      })
+      execFileSync('git', ['clone', remote, project], { stdio: 'ignore' })
+      mkdirSync(join(project, '.claude', 'worktrees'), { recursive: true })
+
+      // Simulate a previously-removed session: a leftover pewpew/pr-601 branch
+      // at the OLD head, with no worktree checked out.
+      execFileSync('git', ['-C', project, 'fetch', 'origin', 'pull/601/head:pewpew/pr-601'], {
+        stdio: 'ignore',
+      })
+      expect(git(project, ['rev-parse', 'pewpew/pr-601']).trim()).toBe(oldHead)
+
+      // The contributor force-pushes: the PR head now points at the divergent
+      // new commit.
+      execFileSync('git', ['-C', remote, 'update-ref', 'refs/pull/601/head', newHead], {
+        stdio: 'ignore',
+      })
+
+      const sm = await loadSessionManager()
+      const result = await sm.createPrSession(
+        project,
+        601,
+        null,
+        {},
+        {
+          prView: async () => ({
+            headRefName: 'feature',
+            state: 'OPEN',
+            title: 'fork pr',
+            isCrossRepository: true,
+            headRepositoryOwner: { login: 'contributor' },
+            headRepository: { name: 'proj' },
+          }),
+          createSessionForWorktree: async (p, worktreePath, label, tool) =>
+            baseLocalSession({
+              id: 'pr-601',
+              projectPath: p,
+              worktreeName: label ?? 'pr-601',
+              worktreePath,
+              branch: 'pewpew/pr-601',
+              tool: tool ?? 'claude',
+            }),
+        }
+      )
+
+      expect(typeof result).not.toBe('string')
+      if (typeof result === 'string') throw new Error(result)
+      // The worktree must hold the force-pushed head, not the stale old commit.
+      const worktreeTip = git(result.worktreePath, ['rev-parse', 'HEAD']).trim()
+      expect(worktreeTip).toBe(newHead)
+      expect(worktreeTip).not.toBe(oldHead)
+    } finally {
+      rmSync(root, { recursive: true, force: true })
+    }
+  })
+
+  gitIt(
+    'fails a fork PR rather than DWIM to origin/pewpew/pr-<n> when the pull ref is missing',
+    async () => {
+      const root = mkdtempSync(join(tmpdir(), 'fork-pr-dwim-'))
+      try {
+        const source = join(root, 'source')
+        const remote = join(root, 'remote.git')
+        const project = join(root, 'project')
+        mkdirSync(source)
+        git(source, ['init'])
+        git(source, ['config', 'user.email', 'test@example.com'])
+        git(source, ['config', 'user.name', 'Test User'])
+        writeFileSync(join(source, 'file.txt'), 'one\n')
+        git(source, ['add', 'file.txt'])
+        git(source, ['commit', '-m', 'one'])
+        git(source, ['branch', '-M', 'main'])
+        // The base repo has a branch matching pewpew's namespaced fork branch
+        // name (unrelated commits). There is NO refs/pull/808/head, so the fork
+        // pull-ref fetch will fail and `git worktree add <path> pewpew/pr-808`
+        // would otherwise DWIM onto origin/pewpew/pr-808.
+        git(source, ['checkout', '-b', 'pewpew/pr-808'])
+        writeFileSync(join(source, 'file.txt'), 'WRONG base branch\n')
+        git(source, ['commit', '-am', 'base pewpew/pr-808'])
+        const baseBranchTip = git(source, ['rev-parse', 'HEAD']).trim()
+        git(source, ['checkout', 'main'])
+
+        execFileSync('git', ['clone', '--bare', source, remote], { stdio: 'ignore' })
+        execFileSync('git', ['clone', remote, project], { stdio: 'ignore' })
+        mkdirSync(join(project, '.claude', 'worktrees'), { recursive: true })
+        // origin/pewpew/pr-808 now exists as a remote-tracking branch.
+        expect(git(project, ['rev-parse', 'origin/pewpew/pr-808']).trim()).toBe(baseBranchTip)
+
+        const sm = await loadSessionManager()
+        const result = await sm.createPrSession(
+          project,
+          808,
+          null,
+          {},
+          {
+            prView: async () => ({
+              headRefName: 'feature',
+              state: 'OPEN',
+              title: 'fork pr',
+              isCrossRepository: true,
+              headRepositoryOwner: { login: 'contributor' },
+              headRepository: { name: 'proj' },
+            }),
+            createSessionForWorktree: async (p, worktreePath) =>
+              baseLocalSession({ id: 'pr-808', projectPath: p, worktreePath }),
+          }
+        )
+
+        // The pull ref is missing, so creation must fail explicitly — not DWIM a
+        // worktree onto origin/pewpew/pr-808 (the unrelated base branch).
+        expect(typeof result).toBe('string')
+        expect(existsSync(join(project, '.claude', 'worktrees', 'pr-808'))).toBe(false)
+      } finally {
+        rmSync(root, { recursive: true, force: true })
+      }
+    }
+  )
+
+  gitIt('does not let two fork PRs sharing a head branch name collide', async () => {
+    const root = mkdtempSync(join(tmpdir(), 'fork-pr-collide-'))
+    try {
+      const source = join(root, 'source')
+      const remote = join(root, 'remote.git')
+      const project = join(root, 'project')
+      mkdirSync(source)
+      git(source, ['init'])
+      git(source, ['config', 'user.email', 'test@example.com'])
+      git(source, ['config', 'user.name', 'Test User'])
+      writeFileSync(join(source, 'file.txt'), 'one\n')
+      git(source, ['add', 'file.txt'])
+      git(source, ['commit', '-m', 'one'])
+      git(source, ['branch', '-M', 'main'])
+
+      // Two different fork heads that happen to share the branch name
+      // "shared-fix": alice's PR #401 and bob's PR #402 point at different tips.
+      git(source, ['checkout', '-b', 'alice'])
+      writeFileSync(join(source, 'file.txt'), 'alice\n')
+      git(source, ['commit', '-am', 'alice head'])
+      const aliceHead = git(source, ['rev-parse', 'HEAD']).trim()
+      git(source, ['checkout', 'main'])
+      git(source, ['checkout', '-b', 'bob'])
+      writeFileSync(join(source, 'file.txt'), 'bob\n')
+      git(source, ['commit', '-am', 'bob head'])
+      const bobHead = git(source, ['rev-parse', 'HEAD']).trim()
+      git(source, ['checkout', 'main'])
+
+      execFileSync('git', ['clone', '--bare', source, remote], { stdio: 'ignore' })
+      execFileSync('git', ['-C', remote, 'update-ref', 'refs/pull/401/head', aliceHead], {
+        stdio: 'ignore',
+      })
+      execFileSync('git', ['-C', remote, 'update-ref', 'refs/pull/402/head', bobHead], {
+        stdio: 'ignore',
+      })
+      execFileSync('git', ['-C', remote, 'branch', '-D', 'alice'], { stdio: 'ignore' })
+      execFileSync('git', ['-C', remote, 'branch', '-D', 'bob'], { stdio: 'ignore' })
+      execFileSync('git', ['clone', remote, project], { stdio: 'ignore' })
+      mkdirSync(join(project, '.claude', 'worktrees'), { recursive: true })
+
+      const forkView = (owner: string) => async () => ({
+        headRefName: 'shared-fix',
+        state: 'OPEN',
+        title: `fix from ${owner}`,
+        isCrossRepository: true,
+        headRepositoryOwner: { login: owner },
+        headRepository: { name: 'proj' },
+      })
+
+      // Real adopt (no createSessionForWorktree stub) so sessions register in
+      // the internal map and the reuse lookups can see the first session.
+      const sm = await loadSessionManager()
+      const a = await sm.createPrSession(project, 401, null, {}, { prView: forkView('alice') })
+      const b = await sm.createPrSession(project, 402, null, {}, { prView: forkView('bob') })
+
+      expect(typeof a).not.toBe('string')
+      expect(typeof b).not.toBe('string')
+      if (typeof a === 'string') throw new Error(a)
+      if (typeof b === 'string') throw new Error(b)
+
+      // Distinct sessions — the second PR must not hijack the first.
+      expect(a.id).not.toBe(b.id)
+      expect(a.prNumber).toBe(401)
+      expect(b.prNumber).toBe(402)
+      expect(a.prHeadRepo).toBe('alice/proj')
+      expect(b.prHeadRepo).toBe('bob/proj')
+      expect(a.worktreePath).not.toBe(b.worktreePath)
+      // Each worktree points at its own PR head, not the other's.
+      expect(git(a.worktreePath, ['rev-parse', 'HEAD']).trim()).toBe(aliceHead)
+      expect(git(b.worktreePath, ['rev-parse', 'HEAD']).trim()).toBe(bobHead)
+    } finally {
+      rmSync(root, { recursive: true, force: true })
+    }
   })
 })
 

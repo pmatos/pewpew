@@ -213,6 +213,19 @@ export default function SessionCard({ session, thumbnail, style, onOpenSession, 
               PR #{session.prNumber}
             </span>
           )}
+          {session.prIsFork && (
+            <span
+              className="session-card-chip chip-fork"
+              title={
+                session.prHeadRepo
+                  ? `fork PR — head in ${session.prHeadRepo} (pushes won't update the PR)`
+                  : "fork PR — head in a forked repo (pushes won't update the PR)"
+              }
+            >
+              <span className="chip-icon">⑂</span>
+              fork
+            </span>
+          )}
         </div>
         <div className="session-card-status">
           <span className={`status-dot ${statusClass}`} />
