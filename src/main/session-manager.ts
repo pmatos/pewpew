@@ -775,6 +775,15 @@ function forkFieldsFromPr(prInfo: PrViewInfo): { prIsFork?: boolean; prHeadRepo?
   return { prIsFork: true, prHeadRepo: owner && name ? `${owner}/${name}` : undefined }
 }
 
+async function localBranchExists(runGit: GitRunner, branch: string): Promise<boolean> {
+  try {
+    await runGit(['rev-parse', '--verify', '--quiet', `refs/heads/${branch}`])
+    return true
+  } catch {
+    return false
+  }
+}
+
 async function createRemotePrSession(
   hostId: string,
   projectPath: string,
@@ -1939,6 +1948,14 @@ export async function createPrSession(
       await runGit(['fetch', 'origin', `+pull/${prNumber}/head:${localBranch}`])
     } catch {
       // Offline, or the PR-scoped branch is already present locally.
+    }
+    // The pull ref must have produced refs/heads/pr-<n>. If the fetch failed
+    // and it doesn't exist, do NOT run `git worktree add <path> pr-<n>`: with
+    // no local branch, git DWIMs the name to a remote-tracking origin/pr-<n>
+    // (if the base repo has a branch named pr-<n>) and silently checks out the
+    // wrong commits. Fail explicitly instead, mirroring the remote path.
+    if (!(await localBranchExists(runGit, localBranch))) {
+      return `Failed to create worktree for branch "${branch}": could not fetch refs/pull/${prNumber}/head`
     }
   } else {
     try {

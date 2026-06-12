@@ -1,5 +1,5 @@
 import { execFileSync } from 'child_process'
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'fs'
+import { existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'fs'
 import { tmpdir } from 'os'
 import { join } from 'path'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
@@ -1844,6 +1844,8 @@ describe('createPrSession fork handling', () => {
       // fetched, since the fork's head branch name could collide with a
       // base-repo branch.
       if (key === 'fetch origin +pull/335/head:pr-335') return { stdout: '' }
+      // The PR-scoped branch is verified to exist before `worktree add`.
+      if (key === 'rev-parse --verify --quiet refs/heads/pr-335') return { stdout: 'abc123\n' }
       if (key === 'worktree add /proj/.claude/worktrees/pr-335 pr-335') return { stdout: '' }
       throw new Error(`unexpected git ${key}`)
     })
@@ -1894,6 +1896,38 @@ describe('createPrSession fork handling', () => {
       'pr-335',
       'origin/codex/fix-x',
     ])
+  })
+
+  it('errors without running worktree add when the fork pull-ref fetch fails', async () => {
+    const sm = await loadSessionManager()
+    const runGit = vi.fn(async (argv: string[]) => {
+      const key = argv.join(' ')
+      // The pull ref can't be fetched (offline / transient), so the PR-scoped
+      // branch is never created.
+      if (key === 'fetch origin +pull/335/head:pr-335') throw new Error('network down')
+      if (key === 'rev-parse --verify --quiet refs/heads/pr-335') throw new Error('no such ref')
+      throw new Error(`unexpected git ${key}`)
+    })
+    const createSessionForWorktree = vi.fn()
+
+    const result = await sm.createPrSession(
+      '/proj',
+      335,
+      null,
+      {},
+      { runGit, prView: forkPrView, createSessionForWorktree }
+    )
+
+    // No local pr-335 exists, so we must fail explicitly rather than let
+    // `git worktree add pr-335` DWIM to a remote-tracking origin/pr-335.
+    expect(typeof result).toBe('string')
+    expect(runGit).not.toHaveBeenCalledWith([
+      'worktree',
+      'add',
+      '/proj/.claude/worktrees/pr-335',
+      'pr-335',
+    ])
+    expect(createSessionForWorktree).not.toHaveBeenCalled()
   })
 
   it('does not fetch the pull ref for a same-repo PR', async () => {
@@ -2179,6 +2213,66 @@ describe('createPrSession fork handling', () => {
       rmSync(root, { recursive: true, force: true })
     }
   })
+
+  gitIt(
+    'fails a fork PR rather than DWIM to origin/pr-<n> when the pull ref is missing',
+    async () => {
+      const root = mkdtempSync(join(tmpdir(), 'fork-pr-dwim-'))
+      try {
+        const source = join(root, 'source')
+        const remote = join(root, 'remote.git')
+        const project = join(root, 'project')
+        mkdirSync(source)
+        git(source, ['init'])
+        git(source, ['config', 'user.email', 'test@example.com'])
+        git(source, ['config', 'user.name', 'Test User'])
+        writeFileSync(join(source, 'file.txt'), 'one\n')
+        git(source, ['add', 'file.txt'])
+        git(source, ['commit', '-m', 'one'])
+        git(source, ['branch', '-M', 'main'])
+        // The base repo has a branch literally named "pr-808" (unrelated commits).
+        // There is NO refs/pull/808/head, so the fork pull-ref fetch will fail.
+        git(source, ['checkout', '-b', 'pr-808'])
+        writeFileSync(join(source, 'file.txt'), 'WRONG base pr-808 branch\n')
+        git(source, ['commit', '-am', 'base pr-808'])
+        const baseBranchTip = git(source, ['rev-parse', 'HEAD']).trim()
+        git(source, ['checkout', 'main'])
+
+        execFileSync('git', ['clone', '--bare', source, remote], { stdio: 'ignore' })
+        execFileSync('git', ['clone', remote, project], { stdio: 'ignore' })
+        mkdirSync(join(project, '.claude', 'worktrees'), { recursive: true })
+        // origin/pr-808 now exists as a remote-tracking branch in the clone.
+        expect(git(project, ['rev-parse', 'origin/pr-808']).trim()).toBe(baseBranchTip)
+
+        const sm = await loadSessionManager()
+        const result = await sm.createPrSession(
+          project,
+          808,
+          null,
+          {},
+          {
+            prView: async () => ({
+              headRefName: 'feature',
+              state: 'OPEN',
+              title: 'fork pr',
+              isCrossRepository: true,
+              headRepositoryOwner: { login: 'contributor' },
+              headRepository: { name: 'proj' },
+            }),
+            createSessionForWorktree: async (p, worktreePath) =>
+              baseLocalSession({ id: 'pr-808', projectPath: p, worktreePath }),
+          }
+        )
+
+        // The pull ref is missing, so creation must fail explicitly — not DWIM a
+        // worktree onto origin/pr-808 (the unrelated base branch).
+        expect(typeof result).toBe('string')
+        expect(existsSync(join(project, '.claude', 'worktrees', 'pr-808'))).toBe(false)
+      } finally {
+        rmSync(root, { recursive: true, force: true })
+      }
+    }
+  )
 
   gitIt('does not let two fork PRs sharing a head branch name collide', async () => {
     const root = mkdtempSync(join(tmpdir(), 'fork-pr-collide-'))
