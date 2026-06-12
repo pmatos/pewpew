@@ -851,13 +851,18 @@ async function createRemotePrSession(
     // succeed and we'd check out the base repo's branch instead of the PR's
     // commits. A same-repo PR head lives on origin/<branch>, so fetch that.
     if (isFork) {
+      // Forced refspec (`+`): a removed session can leave refs/heads/pr-<n>
+      // behind, and a later PR force-push makes a non-forced fetch reject as
+      // non-fast-forward, so remoteBranchExists would see the stale branch and
+      // the worktree would check out old commits. pr-<n> is a pewpew-owned
+      // PR-scoped branch that must track the current PR head.
       await execRemote(host, [
         'git',
         '-C',
         projectPath,
         'fetch',
         'origin',
-        `pull/${prNumber}/head:${localBranch}`,
+        `+pull/${prNumber}/head:${localBranch}`,
       ]).catch(() => undefined)
     } else {
       await execRemote(host, ['git', '-C', projectPath, 'fetch', 'origin', branch]).catch(
@@ -1925,8 +1930,13 @@ export async function createPrSession(
   // succeed and we'd later check out the base repo's branch instead of the
   // PR's commits. A same-repo PR head lives on origin/<branch>, so fetch that.
   if (isFork) {
+    // Forced refspec (`+`): a removed session leaves refs/heads/pr-<n> behind,
+    // and a later PR force-push makes a non-forced fetch reject as
+    // non-fast-forward — silently reopening stale commits. pr-<n> is a
+    // pewpew-owned PR-scoped branch that must always track the current PR head,
+    // and same-PR reuse already returned above, so it isn't checked out here.
     try {
-      await runGit(['fetch', 'origin', `pull/${prNumber}/head:${localBranch}`])
+      await runGit(['fetch', 'origin', `+pull/${prNumber}/head:${localBranch}`])
     } catch {
       // Offline, or the PR-scoped branch is already present locally.
     }

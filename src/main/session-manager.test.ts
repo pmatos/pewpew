@@ -1840,9 +1840,10 @@ describe('createPrSession fork handling', () => {
     const runGit = vi.fn(async (argv: string[]) => {
       const key = argv.join(' ')
       // A fork PR head is fetched straight from the pull ref into a PR-scoped
-      // local branch (pr-335) — origin/<branch> is never fetched, since the
-      // fork's head branch name could collide with a base-repo branch.
-      if (key === 'fetch origin pull/335/head:pr-335') return { stdout: '' }
+      // local branch (pr-335) with a FORCED refspec — origin/<branch> is never
+      // fetched, since the fork's head branch name could collide with a
+      // base-repo branch.
+      if (key === 'fetch origin +pull/335/head:pr-335') return { stdout: '' }
       if (key === 'worktree add /proj/.claude/worktrees/pr-335 pr-335') return { stdout: '' }
       throw new Error(`unexpected git ${key}`)
     })
@@ -1873,9 +1874,9 @@ describe('createPrSession fork handling', () => {
     expect(result.prNumber).toBe(335)
     expect(result.prIsFork).toBe(true)
     expect(result.prHeadRepo).toBe('contributor/s11')
-    // The pull ref was fetched into a PR-scoped local branch, and the worktree
-    // was added from it.
-    expect(runGit).toHaveBeenCalledWith(['fetch', 'origin', 'pull/335/head:pr-335'])
+    // The pull ref was force-fetched into a PR-scoped local branch, and the
+    // worktree was added from it.
+    expect(runGit).toHaveBeenCalledWith(['fetch', 'origin', '+pull/335/head:pr-335'])
     expect(runGit).toHaveBeenCalledWith([
       'worktree',
       'add',
@@ -2087,6 +2088,93 @@ describe('createPrSession fork handling', () => {
       // branch that shares the name).
       expect(worktreeTip).toBe(forkHead)
       expect(worktreeTip).not.toBe(baseSharedTip)
+    } finally {
+      rmSync(root, { recursive: true, force: true })
+    }
+  })
+
+  gitIt('force-refreshes a stale pr-<n> branch after a PR force-push', async () => {
+    const root = mkdtempSync(join(tmpdir(), 'fork-pr-forcepush-'))
+    try {
+      const source = join(root, 'source')
+      const remote = join(root, 'remote.git')
+      const project = join(root, 'project')
+      mkdirSync(source)
+      git(source, ['init'])
+      git(source, ['config', 'user.email', 'test@example.com'])
+      git(source, ['config', 'user.name', 'Test User'])
+      writeFileSync(join(source, 'file.txt'), 'one\n')
+      git(source, ['add', 'file.txt'])
+      git(source, ['commit', '-m', 'one'])
+      git(source, ['branch', '-M', 'main'])
+
+      // Two divergent fork-head commits (siblings off main): the old PR head and
+      // the force-pushed new head. `newHead` is NOT a descendant of `oldHead`,
+      // so a non-forced fetch into an existing pr-<n> at oldHead would reject.
+      git(source, ['checkout', '-b', 'old'])
+      writeFileSync(join(source, 'file.txt'), 'OLD head\n')
+      git(source, ['commit', '-am', 'old head'])
+      const oldHead = git(source, ['rev-parse', 'HEAD']).trim()
+      git(source, ['checkout', 'main'])
+      git(source, ['checkout', '-b', 'new'])
+      writeFileSync(join(source, 'file.txt'), 'NEW head\n')
+      git(source, ['commit', '-am', 'new head'])
+      const newHead = git(source, ['rev-parse', 'HEAD']).trim()
+      git(source, ['checkout', 'main'])
+
+      execFileSync('git', ['clone', '--bare', source, remote], { stdio: 'ignore' })
+      execFileSync('git', ['-C', remote, 'update-ref', 'refs/pull/601/head', oldHead], {
+        stdio: 'ignore',
+      })
+      execFileSync('git', ['clone', remote, project], { stdio: 'ignore' })
+      mkdirSync(join(project, '.claude', 'worktrees'), { recursive: true })
+
+      // Simulate a previously-removed session: a leftover pr-601 branch at the
+      // OLD head, with no worktree checked out.
+      execFileSync('git', ['-C', project, 'fetch', 'origin', 'pull/601/head:pr-601'], {
+        stdio: 'ignore',
+      })
+      expect(git(project, ['rev-parse', 'pr-601']).trim()).toBe(oldHead)
+
+      // The contributor force-pushes: the PR head now points at the divergent
+      // new commit.
+      execFileSync('git', ['-C', remote, 'update-ref', 'refs/pull/601/head', newHead], {
+        stdio: 'ignore',
+      })
+
+      const sm = await loadSessionManager()
+      const result = await sm.createPrSession(
+        project,
+        601,
+        null,
+        {},
+        {
+          prView: async () => ({
+            headRefName: 'feature',
+            state: 'OPEN',
+            title: 'fork pr',
+            isCrossRepository: true,
+            headRepositoryOwner: { login: 'contributor' },
+            headRepository: { name: 'proj' },
+          }),
+          createSessionForWorktree: async (p, worktreePath, label, tool) =>
+            baseLocalSession({
+              id: 'pr-601',
+              projectPath: p,
+              worktreeName: label ?? 'pr-601',
+              worktreePath,
+              branch: 'pr-601',
+              tool: tool ?? 'claude',
+            }),
+        }
+      )
+
+      expect(typeof result).not.toBe('string')
+      if (typeof result === 'string') throw new Error(result)
+      // The worktree must hold the force-pushed head, not the stale old commit.
+      const worktreeTip = git(result.worktreePath, ['rev-parse', 'HEAD']).trim()
+      expect(worktreeTip).toBe(newHead)
+      expect(worktreeTip).not.toBe(oldHead)
     } finally {
       rmSync(root, { recursive: true, force: true })
     }
