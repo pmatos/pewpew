@@ -775,6 +775,23 @@ function forkFieldsFromPr(prInfo: PrViewInfo): { prIsFork?: boolean; prHeadRepo?
   return { prIsFork: true, prHeadRepo: owner && name ? `${owner}/${name}` : undefined }
 }
 
+// `gh pr view` fails for many reasons beyond the PR genuinely not existing —
+// rate limiting, auth, network, or gh resolving the wrong default repo. Only
+// report "not found" when gh actually said the PR couldn't be resolved;
+// otherwise surface the real error so a rate-limit or auth failure isn't
+// misreported as a missing PR (which sends the user hunting for a PR that's
+// right there on GitHub).
+function describePrLookupFailure(prNumber: number, detail: string): string {
+  const trimmed = detail.trim()
+  const genuinelyMissing =
+    /could not resolve to a (pull ?request|issue)/i.test(trimmed) ||
+    /no pull requests? found/i.test(trimmed)
+  if (!trimmed || genuinelyMissing) {
+    return `PR #${prNumber} not found in this repository.`
+  }
+  return `Failed to look up PR #${prNumber}: ${trimmed}`
+}
+
 async function localBranchExists(runGit: GitRunner, branch: string): Promise<boolean> {
   try {
     await runGit(['rev-parse', '--verify', '--quiet', `refs/heads/${branch}`])
@@ -809,26 +826,23 @@ async function createRemotePrSession(
     }
 
     let prInfo: PrViewInfo
+    const viewResult = await execRemote(host, [
+      'sh',
+      '-c',
+      `cd "$1" && gh pr view "$2" --json ${PR_VIEW_FIELDS}`,
+      '_',
+      projectPath,
+      String(prNumber),
+    ])
+    if (viewResult.timedOut || viewResult.code !== 0) {
+      const detail =
+        viewResult.stderr.trim() || viewResult.stdout.trim() || `exit ${viewResult.code}`
+      return describePrLookupFailure(prNumber, detail)
+    }
     try {
-      const stdout = await expectRemoteOk(
-        host,
-        [
-          'sh',
-          '-c',
-          `cd "$1" && gh pr view "$2" --json ${PR_VIEW_FIELDS}`,
-          '_',
-          projectPath,
-          String(prNumber),
-        ],
-        'gh failed'
-      )
-      try {
-        prInfo = JSON.parse(stdout)
-      } catch {
-        return `Failed to parse PR metadata for #${prNumber}.`
-      }
+      prInfo = JSON.parse(viewResult.stdout)
     } catch {
-      return `PR #${prNumber} not found in this repository.`
+      return `Failed to parse PR metadata for #${prNumber}.`
     }
 
     if (prInfo.state !== 'OPEN') {
@@ -1887,8 +1901,8 @@ export async function createPrSession(
   let prInfo: PrViewInfo
   try {
     prInfo = await prView(projectPath, prNumber)
-  } catch {
-    return `PR #${prNumber} not found in this repository.`
+  } catch (err) {
+    return describePrLookupFailure(prNumber, describeGhError(err))
   }
 
   if (prInfo.state !== 'OPEN') {
