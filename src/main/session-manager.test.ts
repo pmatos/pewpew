@@ -1825,6 +1825,32 @@ describe('openSessionsForOpenIssues', () => {
   })
 })
 
+describe('createPrSession lookup failures', () => {
+  it('surfaces the real gh error (e.g. rate limit) instead of reporting "not found"', async () => {
+    const sm = await loadSessionManager()
+    const prView = async () => {
+      const err = new Error('Command failed') as Error & { stderr: string }
+      err.stderr = 'GraphQL: API rate limit already exceeded for user ID 7911.'
+      throw err
+    }
+    const result = await sm.createPrSession('/proj', 175, null, {}, { prView })
+    expect(result).toBe(
+      'Failed to look up PR #175: GraphQL: API rate limit already exceeded for user ID 7911.'
+    )
+  })
+
+  it('still reports "not found" when gh says the PR cannot be resolved', async () => {
+    const sm = await loadSessionManager()
+    const prView = async () => {
+      const err = new Error('Command failed') as Error & { stderr: string }
+      err.stderr = 'GraphQL: Could not resolve to a PullRequest with the number of 175.'
+      throw err
+    }
+    const result = await sm.createPrSession('/proj', 175, null, {}, { prView })
+    expect(result).toBe('PR #175 not found in this repository.')
+  })
+})
+
 describe('createPrSession fork handling', () => {
   const forkPrView = async () => ({
     headRefName: 'codex/fix-x',
