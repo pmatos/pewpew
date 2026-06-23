@@ -301,13 +301,20 @@ function useProjectTreeElement({ onOpenSession }: TreeProps) {
             ? `Mirror all worktrees (${remoteUnmirrored})`
             : 'Mirror all worktrees',
         onClick: async () => {
-          const { result } = await window.api.mirrorAllWorktrees(projectPath, hostId)
-          const { mirrored, failed } = result
-          const parts: string[] = []
-          if (mirrored.length > 0) parts.push(`Mirrored ${mirrored.length}`)
-          if (failed.length > 0) parts.push(`${failed.length} failed`)
-          if (parts.length > 0) showToast(parts.join(', '))
-          void fetchRemoteWorktrees(hostId, projectPath)
+          // Unlike the local path, the remote mirror-all rejects when the host
+          // is unreachable or `git worktree list` fails — surface it as a toast
+          // instead of an unhandled rejection.
+          try {
+            const { result } = await window.api.mirrorAllWorktrees(projectPath, hostId)
+            const { mirrored, failed } = result
+            const parts: string[] = []
+            if (mirrored.length > 0) parts.push(`Mirrored ${mirrored.length}`)
+            if (failed.length > 0) parts.push(`${failed.length} failed`)
+            if (parts.length > 0) showToast(parts.join(', '))
+            void fetchRemoteWorktrees(hostId, projectPath)
+          } catch (err) {
+            showToast(`Mirror all failed: ${String(err)}`)
+          }
         },
       })
       items.push({ label: '', separator: true, onClick: () => {} })

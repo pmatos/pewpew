@@ -3,7 +3,7 @@ import { existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'fs'
 import { tmpdir } from 'os'
 import { join } from 'path'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
-import type { Host, RemoteProject, Session, WorktreeBase } from '../shared/types'
+import type { AgentTool, Host, RemoteProject, Session, WorktreeBase } from '../shared/types'
 
 // Hoisted state so vi.mock factories can reach mutable per-test values before
 // the SUT imports run.
@@ -15,6 +15,7 @@ const state = vi.hoisted(() => ({
   hosts: [] as Host[],
   remoteProjects: [] as RemoteProject[],
   worktreeBase: 'local' as WorktreeBase,
+  defaultTool: 'claude' as AgentTool,
   runtimeStates: new Map<string, string>(),
   // Call logs for assertion.
   ensureHostConnectionCalls: [] as string[],
@@ -60,7 +61,7 @@ vi.mock('./config', () => ({
     uiScale: 1,
     hosts: state.hosts,
     remoteProjects: [],
-    defaultTool: 'claude',
+    defaultTool: state.defaultTool,
     worktreeBase: state.worktreeBase,
   }),
   saveConfig: vi.fn(),
@@ -289,6 +290,7 @@ beforeEach(() => {
   state.hosts = [{ hostId: 'h1', alias: 'devbox', label: 'Dev' }]
   state.remoteProjects = []
   state.worktreeBase = 'local'
+  state.defaultTool = 'claude'
   state.runtimeStates = new Map()
   state.ensureHostConnectionCalls = []
   state.createRemotePtyCalls = []
@@ -521,6 +523,89 @@ describe('mirrorAllWorktrees — remote', () => {
 
     expect(result.mirrored.map((s) => s.worktreePath)).toEqual([wtB])
     expect(state.createRemotePtyCalls).toHaveLength(1)
+  })
+})
+
+describe('mirrorAllWorktrees — remote Codex serialization', () => {
+  const projectPath = '/remote/proj'
+  const wtA = '/remote/proj/.claude/worktrees/feat-a'
+  const wtB = '/remote/proj/.claude/worktrees/feat-b'
+
+  function primeList(): void {
+    state.remoteProjects = [{ hostId: 'h1', path: projectPath, name: 'proj' }]
+    state.execRemoteResults.set('git -C /remote/proj worktree list --porcelain', {
+      stdout: [
+        'worktree /remote/proj',
+        'HEAD a',
+        'branch refs/heads/main',
+        '',
+        `worktree ${wtA}`,
+        'HEAD b',
+        'branch refs/heads/pewpew/feat-a',
+        '',
+        `worktree ${wtB}`,
+        'HEAD c',
+        'branch refs/heads/pewpew/feat-b',
+        '',
+      ].join('\n'),
+      stderr: '',
+      code: 0,
+      timedOut: false,
+    })
+  }
+
+  function gatedAdopt(started: string[], gateFor: string, gate: Promise<void>) {
+    return async (wt: { path: string }): Promise<Session> => {
+      started.push(wt.path)
+      if (wt.path === gateFor) await gate
+      return baseRemoteSession({ id: `s-${started.length}`, hostId: 'h1', worktreePath: wt.path })
+    }
+  }
+
+  it('serializes adoptions when the default tool is Codex', async () => {
+    state.defaultTool = 'codex'
+    primeList()
+    const sm = await loadSessionManager()
+    let releaseFirst!: () => void
+    const firstGate = new Promise<void>((resolve) => {
+      releaseFirst = resolve
+    })
+    const started: string[] = []
+
+    const resultPromise = sm.mirrorAllWorktrees(projectPath, 'h1', {
+      adopt: gatedAdopt(started, wtA, firstGate),
+    })
+    await new Promise((resolve) => setTimeout(resolve, 0))
+    // Second adoption must not start until the first resolves.
+    expect(started).toEqual([wtA])
+
+    releaseFirst()
+    const result = await resultPromise
+    expect(started).toEqual([wtA, wtB])
+    expect(result.mirrored).toHaveLength(2)
+    expect(result.failed).toEqual([])
+  })
+
+  it('adopts in parallel for the default (non-Codex) tool', async () => {
+    state.defaultTool = 'claude'
+    primeList()
+    const sm = await loadSessionManager()
+    let releaseFirst!: () => void
+    const firstGate = new Promise<void>((resolve) => {
+      releaseFirst = resolve
+    })
+    const started: string[] = []
+
+    const resultPromise = sm.mirrorAllWorktrees(projectPath, 'h1', {
+      adopt: gatedAdopt(started, wtA, firstGate),
+    })
+    await new Promise((resolve) => setTimeout(resolve, 0))
+    // Both adoptions start before the first resolves.
+    expect(started).toEqual([wtA, wtB])
+
+    releaseFirst()
+    const result = await resultPromise
+    expect(result.mirrored).toHaveLength(2)
   })
 })
 

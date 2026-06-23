@@ -596,13 +596,31 @@ export interface MirrorAllResult {
   failed: { path: string; error: string }[]
 }
 
-// Adopts each target worktree concurrently, partitioning fulfilled/rejected
-// outcomes into the mirrored/failed buckets a MirrorAllResult reports.
+// Adopts each target worktree, partitioning fulfilled/rejected outcomes into the
+// mirrored/failed buckets a MirrorAllResult reports. Runs concurrently unless
+// `serialize` is set, in which case adoptions run one at a time (used for remote
+// Codex, where hook installation mutates a shared remote config file).
 async function adoptTargets(
   targets: Worktree[],
-  adopt: (wt: Worktree) => Promise<Session>
+  adopt: (wt: Worktree) => Promise<Session>,
+  serialize = false
 ): Promise<MirrorAllResult> {
-  const results = await Promise.allSettled(targets.map(adopt))
+  const settle = async (wt: Worktree): Promise<PromiseSettledResult<Session>> => {
+    try {
+      return { status: 'fulfilled', value: await adopt(wt) }
+    } catch (reason) {
+      return { status: 'rejected', reason }
+    }
+  }
+
+  let results: PromiseSettledResult<Session>[]
+  if (serialize) {
+    results = []
+    for (const wt of targets) results.push(await settle(wt))
+  } else {
+    results = await Promise.allSettled(targets.map(adopt))
+  }
+
   const mirrored: Session[] = []
   const failed: { path: string; error: string }[] = []
   results.forEach((r, i) => {
@@ -612,11 +630,16 @@ async function adoptTargets(
   return { mirrored, failed }
 }
 
+interface MirrorAllDeps {
+  adopt?: (wt: Worktree) => Promise<Session>
+}
+
 export async function mirrorAllWorktrees(
   projectPath: string,
-  hostId?: string | null
+  hostId?: string | null,
+  deps: MirrorAllDeps = {}
 ): Promise<MirrorAllResult> {
-  if (hostId) return mirrorAllRemoteWorktrees(hostId, projectPath)
+  if (hostId) return mirrorAllRemoteWorktrees(hostId, projectPath, deps)
 
   const worktrees = await gitWorktrees(projectPath)
   const existingPaths = new Set<string>()
@@ -624,12 +647,14 @@ export async function mirrorAllWorktrees(
 
   const targets = worktrees.filter((wt) => !wt.isMain && !existingPaths.has(canonicalPath(wt.path)))
 
-  return adoptTargets(targets, (wt) => createSessionForWorktree(projectPath, wt.path))
+  const adopt = deps.adopt ?? ((wt: Worktree) => createSessionForWorktree(projectPath, wt.path))
+  return adoptTargets(targets, adopt)
 }
 
 async function mirrorAllRemoteWorktrees(
   hostId: string,
-  projectPath: string
+  projectPath: string,
+  deps: MirrorAllDeps = {}
 ): Promise<MirrorAllResult> {
   const host = getRequiredHost(hostId)
   const worktrees = await gitRemoteWorktrees(host, projectPath)
@@ -640,7 +665,13 @@ async function mirrorAllRemoteWorktrees(
 
   const targets = worktrees.filter((wt) => !wt.isMain && !adopted.has(wt.path))
 
-  return adoptTargets(targets, (wt) => createRemoteSessionForWorktree(hostId, projectPath, wt.path))
+  // Concurrent remote Codex adoptions race on the shared remote ~/.codex/
+  // config.toml (written via temp file + mv during hook install), so serialize
+  // them — matching createSessionsForNumbers' remote-Codex batch path.
+  const serialize = getConfig().defaultTool === 'codex'
+  const adopt =
+    deps.adopt ?? ((wt: Worktree) => createRemoteSessionForWorktree(hostId, projectPath, wt.path))
+  return adoptTargets(targets, adopt, serialize)
 }
 
 async function installRemoteAgentHooks(
@@ -664,7 +695,7 @@ async function installRemoteAgentHooks(
   await installRemoteHooks(remote, worktreePath, notifyScriptPath)
 }
 
-// In-flight adoptions for remote worktrees, keyed by `${hostId}\0${worktreePath}`.
+// In-flight adoptions for remote worktrees, keyed by `${hostId} ${worktreePath}`.
 // Mirrors `inflightAdoptions` (local) so a double-click or a concurrent
 // mirror-all only creates one session/PTY per remote worktree.
 const inflightRemoteAdoptions = new Map<string, InflightAdoption>()
@@ -692,7 +723,7 @@ export async function createRemoteSessionForWorktree(
     }
   }
 
-  const key = `${hostId} ${worktreePath}`
+  const key = `${hostId} ${worktreePath}`
   const inflight = inflightRemoteAdoptions.get(key)
   if (inflight) {
     if (inflight.tool !== effectiveTool) {
