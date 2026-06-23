@@ -12,6 +12,13 @@ interface MenuState {
   items: MenuItem[]
 }
 
+// Expansion state is keyed host-qualified (matching the React node key and the
+// remote worktree cache) so two remote projects that share the same path on
+// different hosts expand and fetch independently.
+function expansionKey(hostId: string | null, path: string): string {
+  return `${hostId ?? 'local'}:${path}`
+}
+
 interface TreeProps {
   onOpenSession?: (id: string, name: string) => void
 }
@@ -131,13 +138,14 @@ function useProjectTreeElement({ onOpenSession }: TreeProps) {
   // Expanding a remote project lazily lists its worktrees over SSH (and retries
   // on a prior error). Already-loaded entries are served from the cache.
   const toggleProject = (projectPath: string, hostId: string | null) => {
-    if (hostId !== null && !expanded.has(projectPath)) {
+    const key = expansionKey(hostId, projectPath)
+    if (hostId !== null && !expanded.has(key)) {
       const status = remoteWorktreesStatus[remoteWorktreeKey(hostId, projectPath)]
       if (status !== 'loading' && status !== 'loaded') {
         void fetchRemoteWorktrees(hostId, projectPath)
       }
     }
-    toggle(projectPath)
+    toggle(key)
   }
 
   const handleContextMenu = (
@@ -597,7 +605,7 @@ function useProjectTreeElement({ onOpenSession }: TreeProps) {
         </div>
       )}
       {displayProjects.map((project) => {
-        const isExpanded = expanded.has(project.path)
+        const isExpanded = expanded.has(expansionKey(project.hostId, project.path))
         const isRemote = project.hostId !== null
         const rwKey = isRemote ? remoteWorktreeKey(project.hostId as string, project.path) : ''
         const remoteWorktrees = isRemote ? remoteWorktreesCache[rwKey] : undefined
