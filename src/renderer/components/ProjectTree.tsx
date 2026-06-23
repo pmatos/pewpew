@@ -323,7 +323,18 @@ function useProjectTreeElement({ onOpenSession }: TreeProps) {
         onClick: () => void removeRemoteProject(hostId, projectPath),
       })
       items.push({ label: '', separator: true, onClick: () => {} })
-      items.push({ label: 'Rescan', onClick: () => scanProjects() })
+      items.push({
+        label: 'Rescan',
+        onClick: () => {
+          void scanProjects()
+          // scanProjects() does not touch the lazy remote-worktree cache, so
+          // force-refresh it here if this project's worktrees were already
+          // loaded — otherwise added/removed remote worktrees stay stale.
+          if (remoteWorktreesStatus[remoteWorktreeKey(hostId, projectPath)]) {
+            void fetchRemoteWorktrees(hostId, projectPath)
+          }
+        },
+      })
       return items
     }
 
