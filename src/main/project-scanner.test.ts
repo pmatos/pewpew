@@ -1,7 +1,7 @@
 import { describe, it, expect, beforeEach, afterEach } from 'vitest'
 import { mkdtempSync, mkdirSync, symlinkSync, rmSync, chmodSync, writeFileSync } from 'fs'
 import { tmpdir } from 'os'
-import { join } from 'path'
+import { join, posix } from 'path'
 import { detectSetupState, discoverRepos, parseWorktreeList } from './project-scanner'
 
 describe('parseWorktreeList', () => {
@@ -65,6 +65,26 @@ describe('parseWorktreeList', () => {
     const result = parseWorktreeList(stdout)
     expect(result).toHaveLength(1)
     expect(result[0].isMain).toBe(true)
+  })
+
+  it('derives worktree names with a supplied basename function (remote POSIX paths)', () => {
+    const stdout = [
+      'worktree /srv/repo',
+      'HEAD abc123',
+      'branch refs/heads/main',
+      '',
+      'worktree /srv/repo/.claude/worktrees/feat-x',
+      'HEAD def456',
+      'branch refs/heads/pewpew/feat-x',
+      '',
+    ].join('\n')
+
+    // Supply a distinguishing basename to prove the injected function is used
+    // (this is how remote callers pass posix.basename for SSH-listed paths).
+    const lastSegmentUpper = (p: string): string => posix.basename(p).toUpperCase()
+    const result = parseWorktreeList(stdout, lastSegmentUpper)
+
+    expect(result.map((w) => w.name)).toEqual(['REPO', 'FEAT-X'])
   })
 })
 

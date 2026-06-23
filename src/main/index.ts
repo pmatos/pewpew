@@ -31,6 +31,8 @@ import {
   initSessionManager,
   createSession,
   createSessionForWorktree,
+  createRemoteSessionForWorktree,
+  gitRemoteWorktrees,
   mirrorAllWorktrees,
   createPrSession,
   createPrSessions,
@@ -380,19 +382,38 @@ app.whenReady().then(async () => {
     return undefined
   }
 
-  ipcMain.handle('sessions:mirror', async (_event, projectPath: string, worktreePath: string) => {
-    const session = await createSessionForWorktree(projectPath, worktreePath)
-    const warning = await gitignoreWarning(projectPath, [session.worktreePath])
-    return { session, warning }
-  })
+  ipcMain.handle(
+    'sessions:mirror',
+    async (_event, projectPath: string, worktreePath: string, hostId?: string | null) => {
+      if (hostId) {
+        const session = await createRemoteSessionForWorktree(hostId, projectPath, worktreePath)
+        // The gitignore warning inspects the local filesystem, which has no
+        // bearing on a remote worktree — skip it.
+        return { session, warning: undefined }
+      }
+      const session = await createSessionForWorktree(projectPath, worktreePath)
+      const warning = await gitignoreWarning(projectPath, [session.worktreePath])
+      return { session, warning }
+    }
+  )
 
-  ipcMain.handle('sessions:mirror-all', async (_event, projectPath: string) => {
-    const result = await mirrorAllWorktrees(projectPath)
-    const warning = await gitignoreWarning(
-      projectPath,
-      result.mirrored.map((s) => s.worktreePath)
-    )
-    return { result, warning }
+  ipcMain.handle(
+    'sessions:mirror-all',
+    async (_event, projectPath: string, hostId?: string | null) => {
+      const result = await mirrorAllWorktrees(projectPath, hostId)
+      if (hostId) return { result, warning: undefined }
+      const warning = await gitignoreWarning(
+        projectPath,
+        result.mirrored.map((s) => s.worktreePath)
+      )
+      return { result, warning }
+    }
+  )
+
+  ipcMain.handle('projects:list-remote-worktrees', async (_event, hostId: string, path: string) => {
+    const host = getHost(hostId)
+    if (!host) throw new Error('Unknown host')
+    return gitRemoteWorktrees(host, path)
   })
 
   ipcMain.handle('sessions:list', () => {

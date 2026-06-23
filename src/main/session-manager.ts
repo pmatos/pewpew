@@ -26,7 +26,7 @@ import {
   createRemotePty,
   setUnexpectedExitListener,
 } from './pty-manager'
-import { getRepoFingerprint, gitWorktrees } from './project-scanner'
+import { getRepoFingerprint, gitWorktrees, parseWorktreeList } from './project-scanner'
 import {
   installHooks,
   installRemoteHooks,
@@ -52,6 +52,7 @@ import type {
   RemoteProject,
   Session,
   SessionStatus,
+  Worktree,
   WorktreeBase,
 } from '../shared/types'
 
@@ -220,6 +221,19 @@ async function expectRemoteOk(host: Host, argv: string[], message: string): Prom
     throw new Error(`${message}: ${detail}`)
   }
   return result.stdout
+}
+
+// Lists the worktrees of a remote project over SSH. Remote paths are always
+// POSIX, so names are derived with posix.basename regardless of the host OS the
+// app runs on. Throws (via expectRemoteOk) on a non-zero/timed-out git command
+// so callers can surface the failure instead of silently showing no worktrees.
+export async function gitRemoteWorktrees(host: Host, projectPath: string): Promise<Worktree[]> {
+  const stdout = await expectRemoteOk(
+    host,
+    ['git', '-C', projectPath, 'worktree', 'list', '--porcelain'],
+    'Failed to list remote worktrees'
+  )
+  return parseWorktreeList(stdout, posix.basename)
 }
 
 function effectiveWorktreeBase(options: CreateSessionOptions): WorktreeBase {
@@ -582,25 +596,51 @@ export interface MirrorAllResult {
   failed: { path: string; error: string }[]
 }
 
-export async function mirrorAllWorktrees(projectPath: string): Promise<MirrorAllResult> {
-  const worktrees = await gitWorktrees(projectPath)
-  const existingPaths = new Set<string>()
-  for (const e of sessions.values()) existingPaths.add(canonicalPath(e.session.worktreePath))
-
-  const targets = worktrees.filter((wt) => !wt.isMain && !existingPaths.has(canonicalPath(wt.path)))
-
-  const results = await Promise.allSettled(
-    targets.map((wt) => createSessionForWorktree(projectPath, wt.path))
-  )
-
+// Adopts each target worktree concurrently, partitioning fulfilled/rejected
+// outcomes into the mirrored/failed buckets a MirrorAllResult reports.
+async function adoptTargets(
+  targets: Worktree[],
+  adopt: (wt: Worktree) => Promise<Session>
+): Promise<MirrorAllResult> {
+  const results = await Promise.allSettled(targets.map(adopt))
   const mirrored: Session[] = []
   const failed: { path: string; error: string }[] = []
   results.forEach((r, i) => {
     if (r.status === 'fulfilled') mirrored.push(r.value)
     else failed.push({ path: targets[i].path, error: String(r.reason) })
   })
-
   return { mirrored, failed }
+}
+
+export async function mirrorAllWorktrees(
+  projectPath: string,
+  hostId?: string | null
+): Promise<MirrorAllResult> {
+  if (hostId) return mirrorAllRemoteWorktrees(hostId, projectPath)
+
+  const worktrees = await gitWorktrees(projectPath)
+  const existingPaths = new Set<string>()
+  for (const e of sessions.values()) existingPaths.add(canonicalPath(e.session.worktreePath))
+
+  const targets = worktrees.filter((wt) => !wt.isMain && !existingPaths.has(canonicalPath(wt.path)))
+
+  return adoptTargets(targets, (wt) => createSessionForWorktree(projectPath, wt.path))
+}
+
+async function mirrorAllRemoteWorktrees(
+  hostId: string,
+  projectPath: string
+): Promise<MirrorAllResult> {
+  const host = getRequiredHost(hostId)
+  const worktrees = await gitRemoteWorktrees(host, projectPath)
+  const adopted = new Set<string>()
+  for (const e of sessions.values()) {
+    if (e.session.hostId === hostId) adopted.add(e.session.worktreePath)
+  }
+
+  const targets = worktrees.filter((wt) => !wt.isMain && !adopted.has(wt.path))
+
+  return adoptTargets(targets, (wt) => createRemoteSessionForWorktree(hostId, projectPath, wt.path))
 }
 
 async function installRemoteAgentHooks(
@@ -622,6 +662,125 @@ async function installRemoteAgentHooks(
     return
   }
   await installRemoteHooks(remote, worktreePath, notifyScriptPath)
+}
+
+// In-flight adoptions for remote worktrees, keyed by `${hostId}\0${worktreePath}`.
+// Mirrors `inflightAdoptions` (local) so a double-click or a concurrent
+// mirror-all only creates one session/PTY per remote worktree.
+const inflightRemoteAdoptions = new Map<string, InflightAdoption>()
+
+// Adopts an EXISTING remote worktree as a pewpew session: it installs hooks and
+// attaches a PTY but never runs `git worktree add`. This is the remote analogue
+// of createSessionForWorktree/adoptWorktree.
+export async function createRemoteSessionForWorktree(
+  hostId: string,
+  projectPath: string,
+  worktreePath: string,
+  label?: string,
+  tool?: AgentTool
+): Promise<Session> {
+  const effectiveTool: AgentTool = tool ?? getConfig().defaultTool
+
+  for (const e of sessions.values()) {
+    if (e.session.hostId === hostId && e.session.worktreePath === worktreePath) {
+      if (e.session.tool !== effectiveTool) {
+        throw new Error(
+          `Worktree already has a ${e.session.tool} session; mixed tools per worktree are not supported`
+        )
+      }
+      return e.session
+    }
+  }
+
+  const key = `${hostId} ${worktreePath}`
+  const inflight = inflightRemoteAdoptions.get(key)
+  if (inflight) {
+    if (inflight.tool !== effectiveTool) {
+      throw new Error(
+        `Worktree already has a ${inflight.tool} session in-flight; mixed tools per worktree are not supported`
+      )
+    }
+    return inflight.promise
+  }
+
+  const promise = adoptRemoteWorktree(hostId, projectPath, worktreePath, label, effectiveTool)
+  inflightRemoteAdoptions.set(key, { promise, tool: effectiveTool })
+  try {
+    return await promise
+  } finally {
+    inflightRemoteAdoptions.delete(key)
+  }
+}
+
+async function adoptRemoteWorktree(
+  hostId: string,
+  projectPath: string,
+  worktreePath: string,
+  label: string | undefined,
+  tool: AgentTool
+): Promise<Session> {
+  const host = getRequiredHost(hostId)
+  const remoteProject = getRemoteProject(hostId, projectPath)
+  const worktreeName = label || posix.basename(worktreePath)
+  const id = randomUUID().slice(0, 8)
+  const tmuxSession = `pewpew-${id}`
+
+  const branch = await remoteHostRuntime.withPreparedHost(
+    host,
+    async ({ notifyScriptPath, agentPaths }) => {
+      const agentPath = agentPaths[tool]
+      if (!agentPath) {
+        throw new Error(`${tool} is not installed on host ${host.label || host.alias}`)
+      }
+
+      const isWorktree = (
+        await expectRemoteOk(
+          host,
+          ['git', '-C', worktreePath, 'rev-parse', '--is-inside-work-tree'],
+          'Failed to validate remote worktree'
+        )
+      ).trim()
+      if (isWorktree !== 'true') {
+        throw new Error(`${worktreePath} is not a valid git worktree`)
+      }
+
+      const resolvedBranch =
+        (
+          await expectRemoteOk(
+            host,
+            ['git', '-C', worktreePath, 'rev-parse', '--abbrev-ref', 'HEAD'],
+            'Failed to resolve remote branch'
+          )
+        ).trim() || 'HEAD'
+
+      await installRemoteAgentHooks(tool, host, worktreePath, notifyScriptPath)
+      await createRemotePty(id, worktreePath, host, { tool, agentPath })
+      return resolvedBranch
+    }
+  )
+
+  const session: Session = {
+    id,
+    hostId,
+    projectPath,
+    projectName: remoteProject.name,
+    worktreeName,
+    worktreePath,
+    branch,
+    issueNumber: parseIssueNumber(worktreeName, branch),
+    pid: 0,
+    tmuxSession,
+    status: 'running',
+    connectionState: 'live',
+    lastActivity: Date.now(),
+    hookEvents: [],
+    tool,
+    ...(remoteProject.repoFingerprint ? { repoFingerprint: remoteProject.repoFingerprint } : {}),
+  }
+
+  sessions.set(id, { session })
+  onSessionsChanged()
+  return session
 }
 
 async function createRemoteSession(
