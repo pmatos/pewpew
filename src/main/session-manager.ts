@@ -2534,18 +2534,21 @@ function hasClaudeConversationHistory(worktreePath: string): boolean {
 }
 
 // Remote analogue of hasClaudeConversationHistory. Claude keys the per-worktree
-// directory off the *canonical* path, so we `readlink -f` on the remote before
-// applying the same `[^a-zA-Z0-9-]` → '-' encoding, then test for the directory
-// under the remote $HOME. Runs as a single positional-arg `sh -c` so paths with
-// shell metacharacters stay inert. Any SSH/probe failure returns false, so
-// revival falls back to a fresh spawn rather than risk `claude --continue`
-// exiting immediately.
+// directory off the *canonical* path, so we resolve symlinks on the remote
+// before applying the same `[^a-zA-Z0-9-]` → '-' encoding, then test for the
+// directory under the remote $HOME. Canonicalization uses `cd -P`/`pwd -P`
+// (POSIX shell builtins) rather than `readlink -f`, which is GNU-only — BSD
+// (macOS) readlink has no `-f` and would silently leave the symlink path
+// unresolved, missing the conversation. Runs as a single positional-arg `sh -c`
+// so paths with shell metacharacters stay inert. Any SSH/probe failure returns
+// false, so revival falls back to a fresh spawn rather than risk
+// `claude --continue` exiting immediately.
 async function hasRemoteClaudeConversationHistory(
   host: Host,
   worktreePath: string
 ): Promise<boolean> {
   const script =
-    'p=$(readlink -f -- "$1" 2>/dev/null); [ -n "$p" ] || p="$1"; ' +
+    'p=$(CDPATH= cd -P -- "$1" 2>/dev/null && pwd -P); [ -n "$p" ] || p="$1"; ' +
     "enc=$(printf '%s' \"$p\" | sed 's/[^a-zA-Z0-9-]/-/g'); " +
     '[ -d "$HOME/.claude/projects/$enc" ]'
   try {
