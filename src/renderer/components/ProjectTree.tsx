@@ -744,13 +744,14 @@ function useProjectTreeElement({ onOpenSession }: TreeProps) {
               {issueError && <div className="pr-error">{issueError}</div>}
               <div className="create-actions">
                 <button
+                  type="button"
                   className="create-btn"
                   onClick={handleSubmitIssues}
                   disabled={creating || issueLabels === null}
                 >
                   {creating ? 'Working…' : 'Open sessions'}
                 </button>
-                <button className="create-btn cancel" onClick={closeIssuesDialog}>
+                <button type="button" className="create-btn cancel" onClick={closeIssuesDialog}>
                   Cancel
                 </button>
               </div>
@@ -765,6 +766,7 @@ function useProjectTreeElement({ onOpenSession }: TreeProps) {
               {issueError && <div className="pr-error">{issueError}</div>}
               <div className="create-actions">
                 <button
+                  type="button"
                   className="create-btn"
                   onClick={() =>
                     void proceedOpenIssues(pendingIssuePath, pendingIssueHostId, selectedIssueLabel)
@@ -773,7 +775,7 @@ function useProjectTreeElement({ onOpenSession }: TreeProps) {
                 >
                   {creating ? 'Opening…' : `Open ${issueConfirmCount}`}
                 </button>
-                <button className="create-btn cancel" onClick={closeIssuesDialog}>
+                <button type="button" className="create-btn cancel" onClick={closeIssuesDialog}>
                   Cancel
                 </button>
               </div>
