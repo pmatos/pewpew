@@ -3,7 +3,7 @@ import { existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'fs'
 import { tmpdir } from 'os'
 import { join } from 'path'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
-import type { Host, RemoteProject, Session, WorktreeBase } from '../shared/types'
+import type { AgentTool, Host, RemoteProject, Session, WorktreeBase } from '../shared/types'
 
 // Hoisted state so vi.mock factories can reach mutable per-test values before
 // the SUT imports run.
@@ -15,6 +15,7 @@ const state = vi.hoisted(() => ({
   hosts: [] as Host[],
   remoteProjects: [] as RemoteProject[],
   worktreeBase: 'local' as WorktreeBase,
+  defaultTool: 'claude' as AgentTool,
   runtimeStates: new Map<string, string>(),
   // Call logs for assertion.
   ensureHostConnectionCalls: [] as string[],
@@ -60,7 +61,7 @@ vi.mock('./config', () => ({
     uiScale: 1,
     hosts: state.hosts,
     remoteProjects: [],
-    defaultTool: 'claude',
+    defaultTool: state.defaultTool,
     worktreeBase: state.worktreeBase,
   }),
   saveConfig: vi.fn(),
@@ -92,10 +93,14 @@ vi.mock('electron', () => ({
   },
 }))
 
-vi.mock('./project-scanner', () => ({
-  getRepoFingerprint: vi.fn(async () => state.repoFingerprint),
-  gitWorktrees: vi.fn(async () => []),
-}))
+vi.mock('./project-scanner', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('./project-scanner')>()
+  return {
+    getRepoFingerprint: vi.fn(async () => state.repoFingerprint),
+    gitWorktrees: vi.fn(async () => []),
+    parseWorktreeList: actual.parseWorktreeList,
+  }
+})
 
 vi.mock('./hook-installer', () => ({
   installHooks: vi.fn(async () => undefined),
@@ -285,6 +290,7 @@ beforeEach(() => {
   state.hosts = [{ hostId: 'h1', alias: 'devbox', label: 'Dev' }]
   state.remoteProjects = []
   state.worktreeBase = 'local'
+  state.defaultTool = 'claude'
   state.runtimeStates = new Map()
   state.ensureHostConnectionCalls = []
   state.createRemotePtyCalls = []
@@ -306,6 +312,301 @@ beforeEach(() => {
 
 afterEach(() => {
   rmSync(state.configDir, { recursive: true, force: true })
+})
+
+describe('gitRemoteWorktrees', () => {
+  it('lists remote worktrees and parses POSIX paths', async () => {
+    const sm = await loadSessionManager()
+    state.execRemoteResults.set('git -C /srv/proj worktree list --porcelain', {
+      stdout: [
+        'worktree /srv/proj',
+        'HEAD abc',
+        'branch refs/heads/main',
+        '',
+        'worktree /srv/proj/.claude/worktrees/feat-a',
+        'HEAD def',
+        'branch refs/heads/pewpew/feat-a',
+        '',
+      ].join('\n'),
+      stderr: '',
+      code: 0,
+      timedOut: false,
+    })
+
+    const result = await sm.gitRemoteWorktrees(state.hosts[0], '/srv/proj')
+
+    expect(result).toEqual([
+      { name: 'proj', path: '/srv/proj', branch: 'main', isMain: true },
+      {
+        name: 'feat-a',
+        path: '/srv/proj/.claude/worktrees/feat-a',
+        branch: 'pewpew/feat-a',
+        isMain: false,
+      },
+    ])
+    expect(state.execRemoteCalls).toContainEqual({
+      hostId: 'h1',
+      argv: ['git', '-C', '/srv/proj', 'worktree', 'list', '--porcelain'],
+    })
+  })
+
+  it('throws with stderr detail when the remote git command fails', async () => {
+    const sm = await loadSessionManager()
+    state.execRemoteResults.set('git -C /srv/proj worktree list --porcelain', {
+      stdout: '',
+      stderr: 'fatal: not a git repository',
+      code: 128,
+      timedOut: false,
+    })
+
+    await expect(sm.gitRemoteWorktrees(state.hosts[0], '/srv/proj')).rejects.toThrow(
+      /not a git repository/
+    )
+  })
+})
+
+describe('createRemoteSessionForWorktree (adopt remote worktree)', () => {
+  const projectPath = '/remote/proj'
+  const worktreePath = '/remote/proj/.claude/worktrees/existing'
+
+  function primeWorktree(branch = 'feature/existing'): void {
+    state.remoteProjects = [{ hostId: 'h1', path: projectPath, name: 'proj' }]
+    state.execRemoteResults.set(
+      ['git', '-C', worktreePath, 'rev-parse', '--is-inside-work-tree'].join(' '),
+      { stdout: 'true\n', stderr: '', code: 0, timedOut: false }
+    )
+    state.execRemoteResults.set(
+      ['git', '-C', worktreePath, 'rev-parse', '--abbrev-ref', 'HEAD'].join(' '),
+      { stdout: `${branch}\n`, stderr: '', code: 0, timedOut: false }
+    )
+  }
+
+  it('adopts an existing remote worktree without creating a new one', async () => {
+    primeWorktree('feature/existing')
+    const sm = await loadSessionManager()
+
+    const session = await sm.createRemoteSessionForWorktree(
+      'h1',
+      projectPath,
+      worktreePath,
+      undefined,
+      'claude'
+    )
+
+    expect(session.hostId).toBe('h1')
+    expect(session.projectName).toBe('proj')
+    expect(session.worktreeName).toBe('existing')
+    expect(session.worktreePath).toBe(worktreePath)
+    expect(session.branch).toBe('feature/existing')
+    expect(session.connectionState).toBe('live')
+    expect(session.tool).toBe('claude')
+    expect(state.createRemotePtyCalls).toEqual([
+      { sessionId: session.id, cwd: worktreePath, hostId: 'h1' },
+    ])
+    const ranWorktreeAdd = state.execRemoteCalls.some(
+      (c) => c.argv[0] === 'git' && c.argv.includes('worktree') && c.argv.includes('add')
+    )
+    expect(ranWorktreeAdd).toBe(false)
+  })
+
+  it('returns the existing session when the same worktree is adopted twice', async () => {
+    primeWorktree()
+    const sm = await loadSessionManager()
+
+    const first = await sm.createRemoteSessionForWorktree(
+      'h1',
+      projectPath,
+      worktreePath,
+      undefined,
+      'claude'
+    )
+    const second = await sm.createRemoteSessionForWorktree(
+      'h1',
+      projectPath,
+      worktreePath,
+      undefined,
+      'claude'
+    )
+
+    expect(second.id).toBe(first.id)
+    expect(sm.getSessions()).toHaveLength(1)
+    expect(state.createRemotePtyCalls).toHaveLength(1)
+  })
+
+  it('rejects a mixed-tool adoption of the same worktree', async () => {
+    primeWorktree()
+    const sm = await loadSessionManager()
+
+    await sm.createRemoteSessionForWorktree('h1', projectPath, worktreePath, undefined, 'claude')
+
+    await expect(
+      sm.createRemoteSessionForWorktree('h1', projectPath, worktreePath, undefined, 'codex')
+    ).rejects.toThrow(/mixed tools/)
+  })
+
+  it('rejects when the path is not a git worktree', async () => {
+    state.remoteProjects = [{ hostId: 'h1', path: projectPath, name: 'proj' }]
+    state.execRemoteResults.set(
+      ['git', '-C', worktreePath, 'rev-parse', '--is-inside-work-tree'].join(' '),
+      { stdout: '', stderr: 'fatal: not a work tree', code: 128, timedOut: false }
+    )
+    const sm = await loadSessionManager()
+
+    await expect(
+      sm.createRemoteSessionForWorktree('h1', projectPath, worktreePath, undefined, 'claude')
+    ).rejects.toThrow()
+    expect(state.createRemotePtyCalls).toEqual([])
+  })
+})
+
+describe('mirrorAllWorktrees — remote', () => {
+  const projectPath = '/remote/proj'
+  const wtA = '/remote/proj/.claude/worktrees/feat-a'
+  const wtB = '/remote/proj/.claude/worktrees/feat-b'
+
+  function primeList(): void {
+    state.remoteProjects = [{ hostId: 'h1', path: projectPath, name: 'proj' }]
+    state.execRemoteResults.set('git -C /remote/proj worktree list --porcelain', {
+      stdout: [
+        'worktree /remote/proj',
+        'HEAD a',
+        'branch refs/heads/main',
+        '',
+        `worktree ${wtA}`,
+        'HEAD b',
+        'branch refs/heads/pewpew/feat-a',
+        '',
+        `worktree ${wtB}`,
+        'HEAD c',
+        'branch refs/heads/pewpew/feat-b',
+        '',
+      ].join('\n'),
+      stderr: '',
+      code: 0,
+      timedOut: false,
+    })
+    for (const wt of [wtA, wtB]) {
+      state.execRemoteResults.set(
+        ['git', '-C', wt, 'rev-parse', '--is-inside-work-tree'].join(' '),
+        { stdout: 'true\n', stderr: '', code: 0, timedOut: false }
+      )
+      state.execRemoteResults.set(
+        ['git', '-C', wt, 'rev-parse', '--abbrev-ref', 'HEAD'].join(' '),
+        {
+          stdout: 'branch\n',
+          stderr: '',
+          code: 0,
+          timedOut: false,
+        }
+      )
+    }
+  }
+
+  it('adopts every non-main remote worktree', async () => {
+    primeList()
+    const sm = await loadSessionManager()
+
+    const result = await sm.mirrorAllWorktrees(projectPath, 'h1')
+
+    expect(result.failed).toEqual([])
+    expect(new Set(result.mirrored.map((s) => s.worktreePath))).toEqual(new Set([wtA, wtB]))
+    expect(state.createRemotePtyCalls).toHaveLength(2)
+  })
+
+  it('skips the main worktree and already-adopted worktrees', async () => {
+    primeList()
+    const sm = await loadSessionManager()
+    await sm.createRemoteSessionForWorktree('h1', projectPath, wtA, undefined, 'claude')
+    state.createRemotePtyCalls = []
+
+    const result = await sm.mirrorAllWorktrees(projectPath, 'h1')
+
+    expect(result.mirrored.map((s) => s.worktreePath)).toEqual([wtB])
+    expect(state.createRemotePtyCalls).toHaveLength(1)
+  })
+})
+
+describe('mirrorAllWorktrees — remote Codex serialization', () => {
+  const projectPath = '/remote/proj'
+  const wtA = '/remote/proj/.claude/worktrees/feat-a'
+  const wtB = '/remote/proj/.claude/worktrees/feat-b'
+
+  function primeList(): void {
+    state.remoteProjects = [{ hostId: 'h1', path: projectPath, name: 'proj' }]
+    state.execRemoteResults.set('git -C /remote/proj worktree list --porcelain', {
+      stdout: [
+        'worktree /remote/proj',
+        'HEAD a',
+        'branch refs/heads/main',
+        '',
+        `worktree ${wtA}`,
+        'HEAD b',
+        'branch refs/heads/pewpew/feat-a',
+        '',
+        `worktree ${wtB}`,
+        'HEAD c',
+        'branch refs/heads/pewpew/feat-b',
+        '',
+      ].join('\n'),
+      stderr: '',
+      code: 0,
+      timedOut: false,
+    })
+  }
+
+  function gatedAdopt(started: string[], gateFor: string, gate: Promise<void>) {
+    return async (wt: { path: string }): Promise<Session> => {
+      started.push(wt.path)
+      if (wt.path === gateFor) await gate
+      return baseRemoteSession({ id: `s-${started.length}`, hostId: 'h1', worktreePath: wt.path })
+    }
+  }
+
+  it('serializes adoptions when the default tool is Codex', async () => {
+    state.defaultTool = 'codex'
+    primeList()
+    const sm = await loadSessionManager()
+    let releaseFirst!: () => void
+    const firstGate = new Promise<void>((resolve) => {
+      releaseFirst = resolve
+    })
+    const started: string[] = []
+
+    const resultPromise = sm.mirrorAllWorktrees(projectPath, 'h1', {
+      adopt: gatedAdopt(started, wtA, firstGate),
+    })
+    await new Promise((resolve) => setTimeout(resolve, 0))
+    // Second adoption must not start until the first resolves.
+    expect(started).toEqual([wtA])
+
+    releaseFirst()
+    const result = await resultPromise
+    expect(started).toEqual([wtA, wtB])
+    expect(result.mirrored).toHaveLength(2)
+    expect(result.failed).toEqual([])
+  })
+
+  it('adopts in parallel for the default (non-Codex) tool', async () => {
+    state.defaultTool = 'claude'
+    primeList()
+    const sm = await loadSessionManager()
+    let releaseFirst!: () => void
+    const firstGate = new Promise<void>((resolve) => {
+      releaseFirst = resolve
+    })
+    const started: string[] = []
+
+    const resultPromise = sm.mirrorAllWorktrees(projectPath, 'h1', {
+      adopt: gatedAdopt(started, wtA, firstGate),
+    })
+    await new Promise((resolve) => setTimeout(resolve, 0))
+    // Both adoptions start before the first resolves.
+    expect(started).toEqual([wtA, wtB])
+
+    releaseFirst()
+    const result = await resultPromise
+    expect(result.mirrored).toHaveLength(2)
+  })
 })
 
 describe('resolveOriginDefaultBase', () => {

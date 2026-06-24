@@ -1,5 +1,11 @@
 import { create } from 'zustand'
-import type { Project } from '../../shared/types'
+import type { Project, Worktree } from '../../shared/types'
+
+export type RemoteWorktreesStatus = 'loading' | 'loaded' | 'error'
+
+export function remoteWorktreeKey(hostId: string, path: string): string {
+  return `${hostId} ${path}`
+}
 
 interface ProjectsState {
   projects: Project[]
@@ -8,7 +14,13 @@ interface ProjectsState {
   addRemoteDialogOpen: boolean
   addRemoteError: string | null
   addRemoteSubmitting: boolean
+  // Remote worktrees are fetched lazily over SSH (on node expand), keyed by
+  // remoteWorktreeKey(hostId, path). This cache survives scanProjects(), which
+  // only replaces `projects`.
+  remoteWorktrees: Record<string, Worktree[]>
+  remoteWorktreesStatus: Record<string, RemoteWorktreesStatus>
   scanProjects: () => Promise<void>
+  fetchRemoteWorktrees: (hostId: string, path: string) => Promise<void>
   toggleFilterReady: () => void
   openAddRemoteDialog: () => void
   closeAddRemoteDialog: () => void
@@ -30,6 +42,8 @@ export const useProjectsStore = create<ProjectsState>((set, get) => ({
   addRemoteDialogOpen: false,
   addRemoteError: null,
   addRemoteSubmitting: false,
+  remoteWorktrees: {},
+  remoteWorktreesStatus: {},
   toggleFilterReady: () => set((state) => ({ filterReady: !state.filterReady })),
   scanProjects: async () => {
     set({ loading: true })
@@ -39,6 +53,24 @@ export const useProjectsStore = create<ProjectsState>((set, get) => ({
     } catch (err) {
       console.error('scanProjects failed:', err)
       set({ loading: false })
+    }
+  },
+  fetchRemoteWorktrees: async (hostId, path) => {
+    const key = remoteWorktreeKey(hostId, path)
+    set((state) => ({
+      remoteWorktreesStatus: { ...state.remoteWorktreesStatus, [key]: 'loading' },
+    }))
+    try {
+      const worktrees = await window.api.listRemoteWorktrees(hostId, path)
+      set((state) => ({
+        remoteWorktrees: { ...state.remoteWorktrees, [key]: worktrees },
+        remoteWorktreesStatus: { ...state.remoteWorktreesStatus, [key]: 'loaded' },
+      }))
+    } catch (e) {
+      console.error('listRemoteWorktrees failed:', e)
+      set((state) => ({
+        remoteWorktreesStatus: { ...state.remoteWorktreesStatus, [key]: 'error' },
+      }))
     }
   },
   openAddRemoteDialog: () =>

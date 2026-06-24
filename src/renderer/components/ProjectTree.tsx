@@ -1,5 +1,5 @@
 import { useEffect, useReducer, useRef } from 'react'
-import { useProjectsStore } from '../stores/projects'
+import { useProjectsStore, remoteWorktreeKey } from '../stores/projects'
 import { useSessionsStore } from '../stores/sessions'
 import { useHostsStore } from '../stores/hosts'
 import ContextMenu, { type MenuItem } from './ContextMenu'
@@ -10,6 +10,13 @@ interface MenuState {
   x: number
   y: number
   items: MenuItem[]
+}
+
+// Expansion state is keyed host-qualified (matching the React node key and the
+// remote worktree cache) so two remote projects that share the same path on
+// different hosts expand and fetch independently.
+function expansionKey(hostId: string | null, path: string): string {
+  return `${hostId ?? 'local'}:${path}`
 }
 
 interface TreeProps {
@@ -49,6 +56,9 @@ export default function ProjectTree(props: TreeProps) {
 function useProjectTreeElement({ onOpenSession }: TreeProps) {
   const { projects, loading, scanProjects, filterReady } = useProjectsStore()
   const removeRemoteProject = useProjectsStore((s) => s.removeRemoteProject)
+  const remoteWorktreesCache = useProjectsStore((s) => s.remoteWorktrees)
+  const remoteWorktreesStatus = useProjectsStore((s) => s.remoteWorktreesStatus)
+  const fetchRemoteWorktrees = useProjectsStore((s) => s.fetchRemoteWorktrees)
   const { sessions } = useSessionsStore()
   const hosts = useHostsStore((s) => s.hosts)
   const [ui, setUi] = useReducer(projectTreeUiReducer, {
@@ -123,6 +133,19 @@ function useProjectTreeElement({ onOpenSession }: TreeProps) {
       next.add(path)
     }
     setUi({ expanded: next })
+  }
+
+  // Expanding a remote project lazily lists its worktrees over SSH (and retries
+  // on a prior error). Already-loaded entries are served from the cache.
+  const toggleProject = (projectPath: string, hostId: string | null) => {
+    const key = expansionKey(hostId, projectPath)
+    if (hostId !== null && !expanded.has(key)) {
+      const status = remoteWorktreesStatus[remoteWorktreeKey(hostId, projectPath)]
+      if (status !== 'loading' && status !== 'loaded') {
+        void fetchRemoteWorktrees(hostId, projectPath)
+      }
+    }
+    toggle(key)
   }
 
   const handleContextMenu = (
@@ -266,13 +289,52 @@ function useProjectTreeElement({ onOpenSession }: TreeProps) {
         disabled: creating,
         onClick: () => void handleOpenAllIssues(projectPath, hostId),
       })
+      const remoteWts = remoteWorktreesCache[remoteWorktreeKey(hostId, projectPath)] ?? []
+      const remoteUnmirrored = remoteWts.filter(
+        (wt) =>
+          !wt.isMain &&
+          !sessions.some((s) => s.worktreePath === wt.path && (s.hostId ?? null) === hostId)
+      ).length
+      items.push({
+        label:
+          remoteUnmirrored > 0
+            ? `Mirror all worktrees (${remoteUnmirrored})`
+            : 'Mirror all worktrees',
+        onClick: async () => {
+          // Unlike the local path, the remote mirror-all rejects when the host
+          // is unreachable or `git worktree list` fails — surface it as a toast
+          // instead of an unhandled rejection.
+          try {
+            const { result } = await window.api.mirrorAllWorktrees(projectPath, hostId)
+            const { mirrored, failed } = result
+            const parts: string[] = []
+            if (mirrored.length > 0) parts.push(`Mirrored ${mirrored.length}`)
+            if (failed.length > 0) parts.push(`${failed.length} failed`)
+            if (parts.length > 0) showToast(parts.join(', '))
+            void fetchRemoteWorktrees(hostId, projectPath)
+          } catch (err) {
+            showToast(`Mirror all failed: ${String(err)}`)
+          }
+        },
+      })
       items.push({ label: '', separator: true, onClick: () => {} })
       items.push({
         label: 'Remove remote project',
         onClick: () => void removeRemoteProject(hostId, projectPath),
       })
       items.push({ label: '', separator: true, onClick: () => {} })
-      items.push({ label: 'Rescan', onClick: () => scanProjects() })
+      items.push({
+        label: 'Rescan',
+        onClick: () => {
+          void scanProjects()
+          // scanProjects() does not touch the lazy remote-worktree cache, so
+          // force-refresh it here if this project's worktrees were already
+          // loaded — otherwise added/removed remote worktrees stay stale.
+          if (remoteWorktreesStatus[remoteWorktreeKey(hostId, projectPath)]) {
+            void fetchRemoteWorktrees(hostId, projectPath)
+          }
+        },
+      })
       return items
     }
 
@@ -561,8 +623,15 @@ function useProjectTreeElement({ onOpenSession }: TreeProps) {
         </div>
       )}
       {displayProjects.map((project) => {
-        const isExpanded = expanded.has(project.path)
-        const hasWorktrees = project.worktrees.length > 1
+        const isExpanded = expanded.has(expansionKey(project.hostId, project.path))
+        const isRemote = project.hostId !== null
+        const rwKey = isRemote ? remoteWorktreeKey(project.hostId as string, project.path) : ''
+        const remoteWorktrees = isRemote ? remoteWorktreesCache[rwKey] : undefined
+        const remoteStatus = isRemote ? remoteWorktreesStatus[rwKey] : undefined
+        // Remote nodes are always expandable so the first expand can trigger the
+        // SSH listing; local nodes expand only when they have extra worktrees.
+        const worktrees = isRemote ? (remoteWorktrees ?? []) : project.worktrees
+        const canExpand = isRemote || project.worktrees.length > 1
         const host = project.hostId ? hosts.find((h) => h.hostId === project.hostId) : null
 
         return (
@@ -570,14 +639,12 @@ function useProjectTreeElement({ onOpenSession }: TreeProps) {
             <button
               type="button"
               className="project-row"
-              onClick={() => hasWorktrees && toggle(project.path)}
+              onClick={() => canExpand && toggleProject(project.path, project.hostId)}
               onContextMenu={(e) =>
                 handleContextMenu(e, project.path, project.setupState, project.hostId)
               }
             >
-              <span className="project-toggle">
-                {hasWorktrees ? (isExpanded ? '▼' : '▶') : ' '}
-              </span>
+              <span className="project-toggle">{canExpand ? (isExpanded ? '▼' : '▶') : ' '}</span>
               <span className="project-name">{project.name}</span>
               {host && (
                 <span className="host-pill" title={`Remote on ${host.alias}`}>
@@ -598,8 +665,16 @@ function useProjectTreeElement({ onOpenSession }: TreeProps) {
 
             {isExpanded && (
               <div className="worktree-list">
-                {project.worktrees.map((wt) => {
-                  const matchingSession = sessions.find((s) => s.worktreePath === wt.path)
+                {isRemote && remoteWorktrees === undefined && remoteStatus === 'loading' && (
+                  <div className="worktree-item worktree-empty">Loading worktrees…</div>
+                )}
+                {isRemote && remoteStatus === 'error' && (
+                  <div className="worktree-item worktree-empty">Failed to load worktrees</div>
+                )}
+                {worktrees.map((wt) => {
+                  const matchingSession = sessions.find(
+                    (s) => s.worktreePath === wt.path && (s.hostId ?? null) === project.hostId
+                  )
                   const canMirror = !matchingSession && !wt.isMain
                   const worktreeContent = (
                     <>
@@ -616,7 +691,8 @@ function useProjectTreeElement({ onOpenSession }: TreeProps) {
                             try {
                               const { warning } = await window.api.mirrorWorktree(
                                 project.path,
-                                wt.path
+                                wt.path,
+                                project.hostId
                               )
                               if (warning === 'gitignore') {
                                 showToast(

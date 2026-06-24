@@ -36,10 +36,10 @@ contextBridge.exposeInMainWorld('api', {
     ipcRenderer.invoke('sessions:open-all-prs', projectPath, hostId ?? null),
   openSessionsForOpenIssues: (projectPath: string, hostId?: string | null) =>
     ipcRenderer.invoke('sessions:open-all-issues', projectPath, hostId ?? null),
-  mirrorWorktree: (projectPath: string, worktreePath: string) =>
-    ipcRenderer.invoke('sessions:mirror', projectPath, worktreePath),
-  mirrorAllWorktrees: (projectPath: string) =>
-    ipcRenderer.invoke('sessions:mirror-all', projectPath),
+  mirrorWorktree: (projectPath: string, worktreePath: string, hostId?: string | null) =>
+    ipcRenderer.invoke('sessions:mirror', projectPath, worktreePath, hostId ?? null),
+  mirrorAllWorktrees: (projectPath: string, hostId?: string | null) =>
+    ipcRenderer.invoke('sessions:mirror-all', projectPath, hostId ?? null),
   getSessions: () => ipcRenderer.invoke('sessions:list'),
   killSession: (id: string) => ipcRenderer.invoke('sessions:kill', id),
   reviveSession: (id: string) => ipcRenderer.invoke('sessions:revive', id),
@@ -118,6 +118,8 @@ contextBridge.exposeInMainWorld('api', {
     ipcRenderer.invoke('projects:add-remote', input),
   removeRemoteProject: (hostId: string, path: string) =>
     ipcRenderer.invoke('projects:remove-remote', hostId, path),
+  listRemoteWorktrees: (hostId: string, path: string) =>
+    ipcRenderer.invoke('projects:list-remote-worktrees', hostId, path),
   onToast: (callback: (event: ToastEvent) => void) => {
     const handler = (_event: Electron.IpcRendererEvent, data: ToastEvent) => callback(data)
     ipcRenderer.on('toast:show', handler)

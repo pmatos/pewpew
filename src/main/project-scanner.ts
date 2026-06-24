@@ -20,7 +20,10 @@ async function gitBranches(repoPath: string): Promise<string[]> {
   }
 }
 
-export function parseWorktreeList(stdout: string): Worktree[] {
+export function parseWorktreeList(
+  stdout: string,
+  baseName: (p: string) => string = basename
+): Worktree[] {
   const worktrees: Worktree[] = []
   const blocks = stdout.split('\n\n').filter(Boolean)
 
@@ -39,7 +42,7 @@ export function parseWorktreeList(stdout: string): Worktree[] {
 
     if (path) {
       worktrees.push({
-        name: basename(path),
+        name: baseName(path),
         path,
         branch: branch || 'HEAD',
         isMain: worktrees.length === 0,

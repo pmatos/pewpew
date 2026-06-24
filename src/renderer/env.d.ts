@@ -15,6 +15,7 @@ import type {
   TestConnectionResult,
   Theme,
   ToastEvent,
+  Worktree,
   WorktreeBase,
 } from '../shared/types'
 
@@ -54,9 +55,13 @@ declare global {
       ) => Promise<OpenSessionsSummary | string>
       mirrorWorktree: (
         projectPath: string,
-        worktreePath: string
+        worktreePath: string,
+        hostId?: string | null
       ) => Promise<{ session: Session; warning?: 'gitignore' }>
-      mirrorAllWorktrees: (projectPath: string) => Promise<{
+      mirrorAllWorktrees: (
+        projectPath: string,
+        hostId?: string | null
+      ) => Promise<{
         result: { mirrored: Session[]; failed: { path: string; error: string }[] }
         warning?: 'gitignore'
       }>
@@ -109,6 +114,7 @@ declare global {
       testHostConnection: (hostId: string) => Promise<TestConnectionResult>
       addRemoteProject: (input: { hostId: string; path: string }) => Promise<RemoteProject>
       removeRemoteProject: (hostId: string, path: string) => Promise<void>
+      listRemoteWorktrees: (hostId: string, path: string) => Promise<Worktree[]>
       onToast: (callback: (event: ToastEvent) => void) => () => void
     }
   }
