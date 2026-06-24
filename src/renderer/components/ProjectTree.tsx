@@ -278,7 +278,7 @@ function useProjectTreeElement({ onOpenSession }: TreeProps) {
   }
 
   const openIssuesDialog = (projectPath: string, hostId: string | null) => {
-    issueRequestRef.current += 1
+    const token = (issueRequestRef.current += 1)
     setUi({
       pendingIssuePath: projectPath,
       pendingIssueHostId: hostId,
@@ -291,6 +291,9 @@ function useProjectTreeElement({ onOpenSession }: TreeProps) {
     window.api
       .listRepoLabels(projectPath, hostId)
       .then((result) => {
+        // Discard a response that resolved after the dialog was canceled or
+        // reopened (possibly for a different project).
+        if (issueRequestRef.current !== token) return
         if (typeof result === 'string') {
           setUi({ issueLabels: [], issueLabelsError: result })
         } else {
@@ -298,6 +301,7 @@ function useProjectTreeElement({ onOpenSession }: TreeProps) {
         }
       })
       .catch((err) => {
+        if (issueRequestRef.current !== token) return
         setUi({ issueLabels: [], issueLabelsError: String(err) })
       })
   }
