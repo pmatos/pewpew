@@ -2015,6 +2015,31 @@ describe('ghApiOpenItemsArgs', () => {
       '.[] | select(.pull_request | not) | .number',
     ])
   })
+
+  it('appends an encoded labels filter for issues when a label is given', async () => {
+    const sm = await loadSessionManager()
+    expect(sm.ghApiOpenItemsArgs('issue', 'owner/repo', 'bug')).toEqual([
+      'api',
+      '--paginate',
+      'repos/owner/repo/issues?state=open&per_page=100&labels=bug',
+      '--jq',
+      '.[] | select(.pull_request | not) | .number',
+    ])
+  })
+
+  it('url-encodes labels containing spaces', async () => {
+    const sm = await loadSessionManager()
+    expect(sm.ghApiOpenItemsArgs('issue', 'owner/repo', 'good first issue')[2]).toBe(
+      'repos/owner/repo/issues?state=open&per_page=100&labels=good%20first%20issue'
+    )
+  })
+
+  it('ignores the label for PRs', async () => {
+    const sm = await loadSessionManager()
+    expect(sm.ghApiOpenItemsArgs('pr', 'owner/repo', 'bug')[2]).toBe(
+      'repos/owner/repo/pulls?state=open&per_page=100'
+    )
+  })
 })
 
 describe('openSessionsForOpenPrs', () => {
@@ -2097,7 +2122,7 @@ describe('openSessionsForOpenIssues', () => {
         baseLocalSession({ id: `s-${issueNumber}`, issueNumber }) as Session | string
     )
 
-    const result = await sm.openSessionsForOpenIssues('/proj', null, {
+    const result = await sm.openSessionsForOpenIssues('/proj', null, undefined, {
       listIssues,
       createIssueSession,
     })
@@ -2114,7 +2139,7 @@ describe('openSessionsForOpenIssues', () => {
 
   it('records per-issue create failures in the summary', async () => {
     const sm = await loadSessionManager()
-    const result = await sm.openSessionsForOpenIssues('/proj', null, {
+    const result = await sm.openSessionsForOpenIssues('/proj', null, undefined, {
       listIssues: async () => [{ number: 5 }],
       createIssueSession: async () => 'boom',
     })
@@ -2123,6 +2148,67 @@ describe('openSessionsForOpenIssues', () => {
     expect(result.created).toEqual([])
     expect(result.skipped).toEqual([])
     expect(result.failed).toEqual([{ number: 5, error: 'boom' }])
+  })
+
+  it('accepts a label and still produces a summary via injected deps', async () => {
+    const sm = await loadSessionManager()
+    const listIssues = vi.fn(async () => [{ number: 7 }])
+    const createIssueSession = vi.fn(
+      async (_projectPath: string, issueNumber: number, _hostId: string | null) =>
+        baseLocalSession({ id: `s-${issueNumber}`, issueNumber }) as Session | string
+    )
+
+    const result = await sm.openSessionsForOpenIssues('/proj', null, 'bug', {
+      listIssues,
+      createIssueSession,
+    })
+    expect(typeof result).not.toBe('string')
+    if (typeof result === 'string') throw new Error(result)
+    expect(result.created.map((s) => s.issueNumber)).toEqual([7])
+  })
+})
+
+describe('countOpenIssues', () => {
+  it('returns the number of matched open issues', async () => {
+    const sm = await loadSessionManager()
+    const listIssues = vi.fn(async () => [{ number: 1 }, { number: 2 }, { number: 3 }])
+    const result = await sm.countOpenIssues('/proj', null, 'bug', { listIssues })
+    expect(result).toBe(3)
+    expect(listIssues).toHaveBeenCalledWith('/proj', null)
+  })
+
+  it('passes through gh list errors as a string', async () => {
+    const sm = await loadSessionManager()
+    const result = await sm.countOpenIssues('/proj', null, undefined, {
+      listIssues: async () => 'Failed to list open issues: gh auth failed',
+    })
+    expect(result).toBe('Failed to list open issues: gh auth failed')
+  })
+})
+
+describe('parseLabelLines', () => {
+  it('splits, trims, and drops blank lines', async () => {
+    const sm = await loadSessionManager()
+    expect(sm.parseLabelLines('bug\nenhancement\n\n  good first issue ')).toEqual([
+      'bug',
+      'enhancement',
+      'good first issue',
+    ])
+  })
+})
+
+describe('listRepoLabels', () => {
+  it('surfaces a remote gh probe failure instead of attempting to list', async () => {
+    const sm = await loadSessionManager()
+    state.execRemoteResults.set('sh -c command -v gh >/dev/null 2>&1', {
+      stdout: '',
+      stderr: 'Permission denied (publickey).\n',
+      code: 255,
+      timedOut: false,
+    })
+
+    const result = await sm.listRepoLabels('/remote/proj', 'h1')
+    expect(result).toBe('SSH authentication failed on Dev: Permission denied (publickey).')
   })
 })
 

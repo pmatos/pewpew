@@ -51,8 +51,15 @@ declare global {
       ) => Promise<OpenSessionsSummary | string>
       openSessionsForOpenIssues: (
         projectPath: string,
-        hostId?: string | null
+        hostId?: string | null,
+        label?: string | null
       ) => Promise<OpenSessionsSummary | string>
+      countOpenIssues: (
+        projectPath: string,
+        hostId?: string | null,
+        label?: string | null
+      ) => Promise<number | string>
+      listRepoLabels: (projectPath: string, hostId?: string | null) => Promise<string[] | string>
       mirrorWorktree: (
         projectPath: string,
         worktreePath: string,
@@ -86,6 +93,7 @@ declare global {
       saveSidebarWidth: (width: number) => Promise<void>
       getUiScale: () => Promise<number>
       getDefaultTool: () => Promise<AgentTool>
+      getBulkOpenConfirmThreshold: () => Promise<number>
       getWorktreeBase: () => Promise<WorktreeBase>
       getTheme: () => Promise<Theme>
       saveTheme: (theme: Theme) => Promise<void>
