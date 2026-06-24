@@ -85,6 +85,7 @@ import {
   ensureHostConnection,
   stopHostConnection,
   runtimeStateFor,
+  testConnection,
 } from './host-connection'
 
 const HOST: Host = { hostId: 'h1', alias: 'dev', label: 'Devbox' }
@@ -372,5 +373,86 @@ describe('ensureHostConnection / startRuntime', () => {
     await expect(promise).rejects.toThrow(/Permission denied/)
     expect(runtimeStateFor(HOST.hostId)).toBe('auth-failed')
     await stopHostConnection(HOST.hostId)
+  })
+})
+
+describe('testConnection', () => {
+  const okResult = (stdout = ''): FakeResult => ({ stdout, stderr: '', error: null, exitCode: 0 })
+  const failResult = (stderr: string, code: number): FakeResult => ({
+    stdout: '',
+    stderr,
+    error: { name: 'Error', message: 'x', code } as unknown as NodeJS.ErrnoException,
+    exitCode: code,
+  })
+
+  it('returns network when the connectivity probe times out', async () => {
+    nextResult = {
+      stdout: '',
+      stderr: '',
+      error: Object.assign(new Error('timeout'), { killed: true }) as NodeJS.ErrnoException & {
+        killed?: boolean
+      },
+      exitCode: null,
+    }
+    const result = await testConnection('dev')
+    expect(result).toEqual({ ok: false, reason: 'network', message: 'ssh timed out' })
+  })
+
+  it('returns auth-failed without probing deps when auth is rejected', async () => {
+    nextResult = failResult('Permission denied (publickey).', 255)
+    const result = await testConnection('dev')
+    expect(result.ok).toBe(false)
+    expect(result.reason).toBe('auth-failed')
+    // Only the connectivity probe ran — no dep/agent probes follow a failure.
+    expect(execFileCalls).toHaveLength(1)
+  })
+
+  it('reports all required tools present and agents resolved on a healthy host', async () => {
+    resultResolver = (args) => {
+      const joined = args.join(' ')
+      if (joined.includes('resolve_one claude'))
+        return okResult('/usr/bin/claude\n/usr/bin/codex\n')
+      if (joined.includes('command -v') && joined.includes('missing=')) return okResult('\n')
+      return okResult() // connectivity `true`
+    }
+    const result = await testConnection('dev')
+    expect(result.ok).toBe(true)
+    expect(result.requiredDeps).toEqual([
+      { name: 'tmux', installed: true },
+      { name: 'git', installed: true },
+      { name: 'jq', installed: true },
+      { name: 'socat', installed: true },
+    ])
+    expect(result.agentTools).toEqual([
+      { name: 'claude', installed: true },
+      { name: 'codex', installed: true },
+    ])
+  })
+
+  it('flags a missing required tool (socat) while staying connected', async () => {
+    resultResolver = (args) => {
+      const joined = args.join(' ')
+      if (joined.includes('resolve_one claude')) return okResult('/usr/bin/claude\n\n')
+      if (joined.includes('command -v') && joined.includes('missing=')) return okResult(' socat\n')
+      return okResult()
+    }
+    const result = await testConnection('dev')
+    expect(result.ok).toBe(true)
+    expect(result.requiredDeps?.filter((d) => !d.installed).map((d) => d.name)).toEqual(['socat'])
+    expect(result.agentTools).toEqual([
+      { name: 'claude', installed: true },
+      { name: 'codex', installed: false },
+    ])
+  })
+
+  it('leaves dep fields undefined when probes error but the host is reachable', async () => {
+    resultResolver = (args) => {
+      const joined = args.join(' ')
+      if (joined.includes('resolve_one claude')) return failResult('boom', 1)
+      if (joined.includes('command -v') && joined.includes('missing=')) return failResult('boom', 1)
+      return okResult()
+    }
+    const result = await testConnection('dev')
+    expect(result).toEqual({ ok: true, requiredDeps: undefined, agentTools: undefined })
   })
 })

@@ -3,7 +3,9 @@ import {
   bootstrapHost,
   HostBootstrapError,
   NOTIFY_SCRIPT_VERSION,
+  probeMissingDeps,
   resolveRemoteAgents,
+  STRICT_DEPS,
   type AgentResolution,
   type HostBootstrapConnection,
 } from './host-bootstrap'
@@ -209,6 +211,37 @@ describe('bootstrapHost', () => {
     await expect(
       bootstrapHost('host-probe-nonzero', failingConn, '/tmp/ipc')
     ).rejects.toMatchObject({ kind: 'install-failed' })
+  })
+})
+
+describe('probeMissingDeps', () => {
+  it('returns an empty array when every dep is present', async () => {
+    const conn: HostBootstrapConnection = { exec: async () => ok('\n') }
+    expect(await probeMissingDeps(conn)).toEqual([])
+  })
+
+  it('returns only the deps the probe reports missing, filtered to the requested set', async () => {
+    const conn: HostBootstrapConnection = { exec: async () => ok(' socat jq\n') }
+    expect(await probeMissingDeps(conn)).toEqual(['jq', 'socat'])
+  })
+
+  it('passes the requested deps to the probe as positional args', async () => {
+    const calls: string[][] = []
+    const conn: HostBootstrapConnection = {
+      exec: async (argv) => {
+        calls.push(argv)
+        return ok('\n')
+      },
+    }
+    await probeMissingDeps(conn)
+    expect(calls[0].slice(-STRICT_DEPS.length)).toEqual([...STRICT_DEPS])
+  })
+
+  it('throws missing-deps when the probe itself fails to run', async () => {
+    const conn: HostBootstrapConnection = {
+      exec: async () => ({ stdout: '', stderr: 'boom', code: 1, timedOut: false }),
+    }
+    await expect(probeMissingDeps(conn)).rejects.toMatchObject({ kind: 'missing-deps' })
   })
 })
 

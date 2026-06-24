@@ -1259,12 +1259,49 @@ body,
   margin-top: 2px;
 }
 
-.host-test-result.ok {
+.host-test-result.ok .host-test-headline {
   color: var(--accent-green);
+}
+
+.host-test-result.warn .host-test-headline {
+  color: var(--accent-orange);
 }
 
 .host-test-result.err {
   color: var(--accent-error);
+}
+
+.host-test-headline {
+  font-weight: 600;
+}
+
+.host-test-deps {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px;
+  margin-top: 2px;
+}
+
+.host-dep-label {
+  color: var(--text-secondary);
+}
+
+.host-dep {
+  font-family: monospace;
+  white-space: nowrap;
+}
+
+.host-dep.ok {
+  color: var(--accent-green);
+}
+
+.host-dep.err {
+  color: var(--accent-error);
+}
+
+.host-dep.muted {
+  color: var(--text-secondary);
 }
 
 .host-actions {

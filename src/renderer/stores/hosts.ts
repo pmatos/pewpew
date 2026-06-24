@@ -71,9 +71,12 @@ export const useHostsStore = create<HostsState>((set, get) => ({
 
   addHost: async (alias, label) => {
     try {
-      await window.api.addHost(alias, label)
+      const host = await window.api.addHost(alias, label)
       set({ addingNew: false, error: null })
       await get().fetchHosts()
+      // Immediately probe the new host so the user sees connectivity + missing
+      // tools (e.g. socat) right after setting it up, not when a session fails.
+      void get().testHost(host.hostId)
     } catch (e) {
       set({ error: errorMessage(e) })
       throw e
