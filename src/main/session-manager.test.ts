@@ -19,7 +19,12 @@ const state = vi.hoisted(() => ({
   runtimeStates: new Map<string, string>(),
   // Call logs for assertion.
   ensureHostConnectionCalls: [] as string[],
-  createRemotePtyCalls: [] as { sessionId: string; cwd: string; hostId: string }[],
+  createRemotePtyCalls: [] as {
+    sessionId: string
+    cwd: string
+    hostId: string
+    continueSession?: boolean
+  }[],
   reattachRemotePtyCalls: [] as { sessionId: string; hostId: string }[],
   createPtyCalls: [] as { sessionId: string; cwd: string }[],
   reattachPtyCalls: [] as string[],
@@ -40,6 +45,10 @@ const state = vi.hoisted(() => ({
     string,
     { stdout: string; stderr: string; code: number; timedOut: boolean }
   >(),
+  // Keyed by worktreePath: controls the remote `claude --continue` history probe
+  // (hasRemoteClaudeConversationHistory). true → directory present (resume),
+  // false → absent (spawn fresh). Unset falls through to the default code 0.
+  claudeHistoryProbeResult: new Map<string, boolean>(),
   // Toggle to simulate ensureHostConnection throwing.
   ensureHostConnectionThrows: null as null | { message: string; runtimeStateAfter: string },
   // When set, delays next ensureHostConnection resolution (used for idempotency
@@ -172,8 +181,18 @@ vi.mock('./pty-manager', () => ({
     // PTY's lifetime so the runtime survives the caller's release.
     state.runtimeRefs.set(host.hostId, (state.runtimeRefs.get(host.hostId) ?? 0) + 1)
   },
-  createRemotePty: async (sessionId: string, cwd: string, host: Host) => {
-    state.createRemotePtyCalls.push({ sessionId, cwd, hostId: host.hostId })
+  createRemotePty: async (
+    sessionId: string,
+    cwd: string,
+    host: Host,
+    options?: { continueSession?: boolean }
+  ) => {
+    state.createRemotePtyCalls.push({
+      sessionId,
+      cwd,
+      hostId: host.hostId,
+      continueSession: options?.continueSession,
+    })
     state.runtimeRefs.set(host.hostId, (state.runtimeRefs.get(host.hostId) ?? 0) + 1)
   },
   setUnexpectedExitListener: (fn: null | ((sessionId: string) => void)) => {
@@ -196,6 +215,15 @@ vi.mock('./host-connection', () => ({
   exec: async (hostOrAlias: Host | string, argv: string[]) => {
     const hostId = typeof hostOrAlias === 'string' ? hostOrAlias : hostOrAlias.hostId
     state.execRemoteCalls.push({ hostId, argv })
+    // Conversation-history probe: matched by the recognizable `.claude/projects`
+    // substring in its script so the test doesn't reproduce the exact (escaped,
+    // multi-segment) probe command. The probed worktree path is the last arg.
+    if (argv[0] === 'sh' && typeof argv[2] === 'string' && argv[2].includes('.claude/projects')) {
+      const present = state.claudeHistoryProbeResult.get(argv[argv.length - 1])
+      if (present !== undefined) {
+        return { stdout: '', stderr: '', code: present ? 0 : 1, timedOut: false }
+      }
+    }
     const configured = state.execRemoteResults.get(argv.join(' '))
     if (configured) return configured
     return { stdout: '', stderr: '', code: 0, timedOut: false }
@@ -305,6 +333,7 @@ beforeEach(() => {
   state.probeSideEffect = new Map()
   state.execRemoteCalls = []
   state.execRemoteResults = new Map()
+  state.claudeHistoryProbeResult = new Map()
   state.ensureHostConnectionThrows = null
   state.ensureHostConnectionGate = null
   state.unexpectedExitListener = null
@@ -1696,6 +1725,54 @@ describe('kill/revive clears stale connectionState=pending', () => {
     expect(got.status).toBe('idle')
     expect(got.connectionState).toBeUndefined()
     expect(state.createPtyCalls.map((c) => c.sessionId)).toEqual(['l1'])
+  })
+})
+
+describe('reviveSession — remote resume fallback', () => {
+  // Regression: the remote branch hardcoded `--continue`, so reviving a remote
+  // session with no prior conversation (e.g. a freshly mirrored worktree)
+  // spawned `claude --continue`, which prints "No conversation found to
+  // continue" and collapses the pane. It must spawn fresh instead.
+  it('spawns fresh when the remote has no claude conversation history', async () => {
+    const remote = baseRemoteSession({ id: 'r1', status: 'dead' })
+    writeSessionsJson([remote])
+    state.claudeHistoryProbeResult.set(remote.worktreePath, false)
+    const sm = await loadSessionManager()
+    sm.restoreSessions()
+
+    await sm.reviveSession('r1')
+
+    expect(state.createRemotePtyCalls).toEqual([
+      { sessionId: 'r1', cwd: remote.worktreePath, hostId: 'h1', continueSession: false },
+    ])
+    expect(sm.getSessions()[0].status).toBe('idle')
+  })
+
+  it('resumes when the remote has claude conversation history', async () => {
+    const remote = baseRemoteSession({ id: 'r1', status: 'dead' })
+    writeSessionsJson([remote])
+    state.claudeHistoryProbeResult.set(remote.worktreePath, true)
+    const sm = await loadSessionManager()
+    sm.restoreSessions()
+
+    await sm.reviveSession('r1')
+
+    expect(state.createRemotePtyCalls).toEqual([
+      { sessionId: 'r1', cwd: remote.worktreePath, hostId: 'h1', continueSession: true },
+    ])
+  })
+
+  it('spawns fresh for codex without a captured agentSessionId', async () => {
+    const remote = baseRemoteSession({ id: 'r1', status: 'dead', tool: 'codex' })
+    writeSessionsJson([remote])
+    const sm = await loadSessionManager()
+    sm.restoreSessions()
+
+    await sm.reviveSession('r1')
+
+    expect(state.createRemotePtyCalls).toEqual([
+      { sessionId: 'r1', cwd: remote.worktreePath, hostId: 'h1', continueSession: false },
+    ])
   })
 })
 

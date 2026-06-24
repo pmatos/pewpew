@@ -1529,8 +1529,14 @@ export async function reviveSession(id: string): Promise<void> {
           if (!agentPath) {
             throw new Error(`${session.tool} is not installed on host ${host.label || host.alias}`)
           }
+          const canResume = await canResumeRemoteAgent(session, host)
+          if (!canResume) {
+            console.warn(
+              `Session ${id} (${session.tool}) has no prior conversation on host ${host.alias}; spawning fresh instead of resuming`
+            )
+          }
           await createRemotePty(id, session.worktreePath, host, {
-            continueSession: true,
+            continueSession: canResume,
             tool: session.tool,
             agentSessionId: session.agentSessionId,
             agentPath,
@@ -1577,6 +1583,17 @@ export async function reviveSession(id: string): Promise<void> {
 function canResumeAgent(session: Session): boolean {
   if (session.tool === 'codex') return !!session.agentSessionId
   return hasClaudeConversationHistory(session.worktreePath)
+}
+
+// Remote analogue of canResumeAgent. The remote branch of reviveSession used to
+// hardcode `--continue`, so reviving a remote session with no prior
+// conversation (e.g. a freshly mirrored worktree that was never talked to) made
+// `claude --continue` print "No conversation found to continue" and collapse
+// the pane on spawn. Probe the remote first and spawn fresh when there's
+// nothing to resume, matching the local guard.
+async function canResumeRemoteAgent(session: Session, host: Host): Promise<boolean> {
+  if (session.tool === 'codex') return !!session.agentSessionId
+  return hasRemoteClaudeConversationHistory(host, session.worktreePath)
 }
 
 // On-demand local attach for sessions deferred during restoreSessions().
@@ -2514,6 +2531,34 @@ export async function relocateProject(
 function hasClaudeConversationHistory(worktreePath: string): boolean {
   const encoded = canonicalPath(worktreePath).replace(/[^a-zA-Z0-9-]/g, '-')
   return existsSync(join(homedir(), '.claude', 'projects', encoded))
+}
+
+// Remote analogue of hasClaudeConversationHistory. Claude keys the per-worktree
+// directory off the *canonical* path, so we resolve symlinks on the remote
+// before applying the same `[^a-zA-Z0-9-]` → '-' encoding, then test for the
+// directory under the remote $HOME. Canonicalization uses `cd -P`/`pwd -P`
+// (POSIX shell builtins) rather than `readlink -f`, which is GNU-only — BSD
+// (macOS) readlink has no `-f` and would silently leave the symlink path
+// unresolved, missing the conversation. Runs as a single positional-arg `sh -c`
+// so paths with shell metacharacters stay inert. Any SSH/probe failure returns
+// false, so revival falls back to a fresh spawn rather than risk
+// `claude --continue` exiting immediately.
+async function hasRemoteClaudeConversationHistory(
+  host: Host,
+  worktreePath: string
+): Promise<boolean> {
+  const script =
+    'p=$(CDPATH= cd -P -- "$1" 2>/dev/null && pwd -P); [ -n "$p" ] || p="$1"; ' +
+    "enc=$(printf '%s' \"$p\" | sed 's/[^a-zA-Z0-9-]/-/g'); " +
+    '[ -d "$HOME/.claude/projects/$enc" ]'
+  try {
+    const result = await execRemote(host, ['sh', '-c', script, '_', worktreePath], {
+      timeoutMs: 10000,
+    })
+    return !result.timedOut && result.code === 0
+  } catch {
+    return false
+  }
 }
 
 // Backfill / reconcile fields added in later versions. For local sessions
