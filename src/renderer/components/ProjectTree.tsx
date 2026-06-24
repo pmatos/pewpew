@@ -123,6 +123,9 @@ function useProjectTreeElement({ onOpenSession }: TreeProps) {
   } = ui
   const sessionNameInputRef = useRef<HTMLInputElement>(null)
   const prNumberInputRef = useRef<HTMLInputElement>(null)
+  // Monotonic token: bumped whenever the issue dialog opens or closes so an
+  // in-flight countOpenIssues can detect it was canceled/reopened mid-await.
+  const issueRequestRef = useRef(0)
 
   const showToast = (msg: string) => {
     setUi({ toast: msg })
@@ -275,6 +278,7 @@ function useProjectTreeElement({ onOpenSession }: TreeProps) {
   }
 
   const openIssuesDialog = (projectPath: string, hostId: string | null) => {
+    issueRequestRef.current += 1
     setUi({
       pendingIssuePath: projectPath,
       pendingIssueHostId: hostId,
@@ -299,6 +303,9 @@ function useProjectTreeElement({ onOpenSession }: TreeProps) {
   }
 
   const closeIssuesDialog = () => {
+    // Bump the token first so any in-flight count bails instead of opening
+    // sessions, and clear `creating` so the menu isn't stuck disabled.
+    issueRequestRef.current += 1
     setUi({
       pendingIssuePath: null,
       pendingIssueHostId: null,
@@ -307,6 +314,7 @@ function useProjectTreeElement({ onOpenSession }: TreeProps) {
       selectedIssueLabel: '',
       issueConfirmCount: null,
       issueError: null,
+      creating: false,
     })
   }
 
@@ -329,12 +337,23 @@ function useProjectTreeElement({ onOpenSession }: TreeProps) {
     const projectPath = pendingIssuePath
     const hostId = pendingIssueHostId
     const label = selectedIssueLabel
+    const token = issueRequestRef.current
     setUi({ creating: true, issueError: null })
     let count: number | string
     try {
       count = await window.api.countOpenIssues(projectPath, hostId, label || null)
     } catch (err) {
+      if (issueRequestRef.current !== token) {
+        setUi({ creating: false })
+        return
+      }
       setUi({ creating: false, issueError: `Failed to count open issues: ${String(err)}` })
+      return
+    }
+    // The dialog was canceled or reopened while the count was in flight —
+    // discard the result so we never open sessions for a dismissed dialog.
+    if (issueRequestRef.current !== token) {
+      setUi({ creating: false })
       return
     }
     setUi({ creating: false })
