@@ -12,6 +12,13 @@ import { homedir, userInfo } from 'os'
 import * as pty from 'node-pty'
 import type { IPty, IPtyForkOptions } from 'node-pty'
 import { shellQuote } from './shell-quote'
+import {
+  STRICT_DEPS,
+  AGENT_TOOLS,
+  probeMissingDeps,
+  resolveRemoteAgents,
+  type HostBootstrapConnection,
+} from './host-bootstrap'
 import { classifySshExit } from './ssh-exit-parser'
 import { recordSshInvocation } from './ssh-log-buffer'
 import { emitToast } from './notifications'
@@ -19,6 +26,7 @@ import { getHost } from './host-registry'
 import { CONFIG_DIR } from './config'
 import { sanitizeHostIdForPath } from './host-id'
 import type {
+  DependencyStatus,
   Host,
   HostId,
   SshInvocationKind,
@@ -498,11 +506,43 @@ export async function testConnection(
   if (timedOut) {
     return { ok: false, reason: 'network', message: 'ssh timed out' }
   }
-  if (code === 0) {
-    return { ok: true }
+  if (code !== 0) {
+    const { reason, message } = classifySshExit({ exitCode: code, stderr })
+    return { ok: false, reason, message }
   }
-  const { reason, message } = classifySshExit({ exitCode: code, stderr })
-  return { ok: false, reason, message }
+
+  // Connection works — probe the required tools and agent CLIs so the user
+  // sees exactly what's missing (e.g. socat) before a session or mirror fails
+  // deep in host bootstrap. Probes are best-effort: a probe that errors leaves
+  // its field undefined rather than failing the whole test.
+  const connection: HostBootstrapConnection = { exec: (a, o) => exec(alias, a, o) }
+  const [requiredDeps, agentTools] = await Promise.all([
+    probeRequiredDeps(connection),
+    probeAgentTools(connection),
+  ])
+  return { ok: true, requiredDeps, agentTools }
+}
+
+async function probeRequiredDeps(
+  connection: HostBootstrapConnection
+): Promise<DependencyStatus[] | undefined> {
+  try {
+    const missing = new Set(await probeMissingDeps(connection))
+    return STRICT_DEPS.map((name) => ({ name, installed: !missing.has(name) }))
+  } catch {
+    return undefined
+  }
+}
+
+async function probeAgentTools(
+  connection: HostBootstrapConnection
+): Promise<DependencyStatus[] | undefined> {
+  try {
+    const resolved = await resolveRemoteAgents(connection)
+    return AGENT_TOOLS.map((name) => ({ name, installed: Boolean(resolved[name]) }))
+  } catch {
+    return undefined
+  }
 }
 
 function aliasOf(aliasOrHost: string | Host): string {

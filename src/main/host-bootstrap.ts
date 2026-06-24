@@ -4,8 +4,11 @@ import type { AgentTool } from '../shared/types'
 
 export const NOTIFY_SCRIPT_VERSION = 1
 
-const STRICT_DEPS = ['tmux', 'git', 'jq', 'socat'] as const
-const AGENT_TOOLS: readonly AgentTool[] = ['claude', 'codex'] as const
+// Tools pewpew strictly requires on a remote host for sessions and the notify
+// hook to work. Exported so the connection-test flow can surface missing ones
+// up front instead of letting a session/mirror fail deep in bootstrap.
+export const STRICT_DEPS = ['tmux', 'git', 'jq', 'socat'] as const
+export const AGENT_TOOLS: readonly AgentTool[] = ['claude', 'codex'] as const
 
 const notifyScript = `#!/usr/bin/env bash
 # pewpew notify script v${NOTIFY_SCRIPT_VERSION}
@@ -148,6 +151,22 @@ export function invalidateBootstrap(hostId: string): void {
   bootstrapped.delete(hostId)
 }
 
+// Probe the remote for which of `deps` are missing, in a single ssh round
+// trip. Returns the subset of `deps` not found on PATH (empty = all present).
+// Throws HostBootstrapError('missing-deps') only when the probe itself fails to
+// run (timeout / non-zero), never for a tool simply being absent.
+export async function probeMissingDeps(
+  connection: HostBootstrapConnection,
+  deps: readonly string[] = STRICT_DEPS
+): Promise<string[]> {
+  const depProbe =
+    'missing=""; for dep in "$@"; do command -v "$dep" >/dev/null 2>&1 || missing="$missing $dep"; done; printf "%s\\n" "$missing"'
+  const result = await connection.exec(['sh', '-c', depProbe, '_', ...deps], { timeoutMs: 15000 })
+  await expectOk(result, 'missing-deps', 'Dependency probe failed')
+  const missing = new Set(result.stdout.trim().split(/\s+/).filter(Boolean))
+  return deps.filter((d) => missing.has(d))
+}
+
 async function expectOk(
   result: ExecResult,
   kind: HostBootstrapErrorKind,
@@ -176,14 +195,7 @@ export async function bootstrapHost(
     return { ...cached, agentPaths }
   }
 
-  const depProbe =
-    'missing=""; for dep in "$@"; do command -v "$dep" >/dev/null 2>&1 || missing="$missing $dep"; done; printf "%s\\n" "$missing"'
-  const deps = await connection.exec(['sh', '-c', depProbe, '_', ...STRICT_DEPS], {
-    timeoutMs: 15000,
-  })
-  await expectOk(deps, 'missing-deps', 'Dependency probe failed')
-  const missing = new Set(deps.stdout.trim().split(/\s+/).filter(Boolean))
-  const missingStrict = STRICT_DEPS.filter((d) => missing.has(d))
+  const missingStrict = await probeMissingDeps(connection)
   if (missingStrict.length > 0) {
     throw new HostBootstrapError(
       'missing-deps',

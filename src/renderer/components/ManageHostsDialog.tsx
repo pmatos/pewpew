@@ -15,6 +15,47 @@ function reasonToLabel(reason: TestConnectionResult['reason']): string {
   }
 }
 
+function HostTestResult({ result }: { result: TestConnectionResult }) {
+  if (!result.ok) {
+    return (
+      <div className="host-test-result err">
+        {reasonToLabel(result.reason)}
+        {result.message ? `: ${result.message}` : ''}
+      </div>
+    )
+  }
+
+  const missing = (result.requiredDeps ?? []).filter((d) => !d.installed).map((d) => d.name)
+  const headlineClass = missing.length > 0 ? 'warn' : 'ok'
+
+  return (
+    <div className={`host-test-result ${headlineClass}`}>
+      <div className="host-test-headline">
+        {missing.length > 0 ? `Connected — missing: ${missing.join(', ')}` : 'Connected'}
+      </div>
+      {result.requiredDeps && (
+        <div className="host-test-deps">
+          {result.requiredDeps.map((d) => (
+            <span key={d.name} className={`host-dep ${d.installed ? 'ok' : 'err'}`}>
+              {d.installed ? '✓' : '✗'} {d.name}
+            </span>
+          ))}
+        </div>
+      )}
+      {result.agentTools && result.agentTools.length > 0 && (
+        <div className="host-test-deps agents">
+          <span className="host-dep-label">Agents:</span>
+          {result.agentTools.map((d) => (
+            <span key={d.name} className={`host-dep ${d.installed ? 'ok' : 'muted'}`}>
+              {d.installed ? '✓' : '–'} {d.name}
+            </span>
+          ))}
+        </div>
+      )}
+    </div>
+  )
+}
+
 interface HostFormProps {
   initialAlias?: string
   initialLabel?: string
@@ -193,13 +234,7 @@ function HostRow({ host, testing, result, onTest, onEdit, onDelete }: HostRowPro
       <div className="hosts-row-main">
         <div className="host-label">{host.label}</div>
         <div className="host-alias">{host.alias}</div>
-        {result && (
-          <div className={`host-test-result ${result.ok ? 'ok' : 'err'}`}>
-            {result.ok
-              ? 'OK'
-              : `${reasonToLabel(result.reason)}${result.message ? `: ${result.message}` : ''}`}
-          </div>
-        )}
+        {result && <HostTestResult result={result} />}
       </div>
       <div className="host-actions">
         <button className="create-btn" onClick={onTest} disabled={testing}>

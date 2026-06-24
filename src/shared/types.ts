@@ -134,10 +134,21 @@ export interface Host {
 
 export type SshExitReason = 'auth-failed' | 'network' | 'dep-missing' | 'bind-unlink' | 'unknown'
 
+// One probed tool on a remote host and whether it was found on PATH.
+export interface DependencyStatus {
+  name: string
+  installed: boolean
+}
+
 export interface TestConnectionResult {
   ok: boolean
   reason?: SshExitReason
   message?: string
+  // Populated when the connection succeeds and the host could be probed.
+  // requiredDeps are the tools pewpew strictly needs (tmux, git, jq, socat);
+  // agentTools are the optional agent CLIs (claude, codex), shown for info.
+  requiredDeps?: DependencyStatus[]
+  agentTools?: DependencyStatus[]
 }
 
 export interface RemoteProject {
