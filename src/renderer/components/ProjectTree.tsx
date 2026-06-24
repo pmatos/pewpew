@@ -747,6 +747,7 @@ function useProjectTreeElement({ onOpenSession }: TreeProps) {
                 <select
                   className="create-input"
                   value={selectedIssueLabel}
+                  disabled={creating}
                   onChange={(e) => setUi({ selectedIssueLabel: e.target.value })}
                 >
                   <option value="">All open issues</option>
