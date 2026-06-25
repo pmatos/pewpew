@@ -1,6 +1,6 @@
 {
   "name": "pewpew",
-  "version": "0.2.2-pre.0",
+  "version": "0.2.2",
   "description": "Desktop GUI for launching and monitoring Claude Code sessions with embedded terminals",
   "author": {
     "name": "Paulo Matos",
