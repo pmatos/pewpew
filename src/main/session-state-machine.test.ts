@@ -144,7 +144,7 @@ describe('applyHookEvent — session.end', () => {
     expect(result.state.get('s1')).toEqual(session)
   })
 
-  it.each(['clear', 'resume', 'bypass_permissions_disabled', 'other', 'unrecognised'])(
+  it.each(['clear', 'resume'])(
     'does not emit promptCleanup when reason is %p (session still alive)',
     (reason) => {
       const session = makeSession({ id: 's1', status: 'running' })
@@ -162,22 +162,25 @@ describe('applyHookEvent — session.end', () => {
     }
   )
 
-  it('emits promptCleanup when reason is "logout"', () => {
-    const session = makeSession({ id: 's1', status: 'running' })
-    const result = applyHookEvent(
-      stateOf(session),
-      {
-        method: 'session.end',
-        params: { cwd: '/p/w', reason: 'logout' },
-        originHostId: null,
-      },
-      1
-    )
-    expect(result.matched).toBe(true)
-    expect(result.intents).toContainEqual({ kind: 'promptCleanup', sessionId: 's1' })
-  })
+  it.each(['logout', 'bypass_permissions_disabled', 'other', 'unrecognised'])(
+    'emits promptCleanup when reason is %p (agent process gone)',
+    (reason) => {
+      const session = makeSession({ id: 's1', status: 'running' })
+      const result = applyHookEvent(
+        stateOf(session),
+        {
+          method: 'session.end',
+          params: { cwd: '/p/w', reason },
+          originHostId: null,
+        },
+        1
+      )
+      expect(result.matched).toBe(true)
+      expect(result.intents).toContainEqual({ kind: 'promptCleanup', sessionId: 's1' })
+    }
+  )
 
-  it('does not emit promptCleanup when reason is absent (treat as ambiguous)', () => {
+  it('emits promptCleanup when reason is absent (treat as a real end)', () => {
     const session = makeSession({ id: 's1', status: 'running' })
     const result = applyHookEvent(
       stateOf(session),
@@ -185,7 +188,7 @@ describe('applyHookEvent — session.end', () => {
       1
     )
     expect(result.matched).toBe(true)
-    expect(result.intents).toEqual([])
+    expect(result.intents).toContainEqual({ kind: 'promptCleanup', sessionId: 's1' })
   })
 })
 
