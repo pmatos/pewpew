@@ -33,6 +33,7 @@ export interface AppConfig {
   defaultTool: AgentTool
   worktreeBase: WorktreeBase
   theme: Theme
+  bulkOpenConfirmThreshold: number
 }
 
 export const CONFIG_DIR = join(process.env.XDG_CONFIG_HOME || join(homedir(), '.config'), 'pewpew')
@@ -53,6 +54,7 @@ const DEFAULT_CONFIG: AppConfig = {
   defaultTool: 'claude',
   worktreeBase: 'local',
   theme: 'dark',
+  bulkOpenConfirmThreshold: 20,
 }
 
 export function shouldWarnGitignore(projectPath: string): boolean {

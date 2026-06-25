@@ -39,6 +39,14 @@ interface ProjectTreeUiState {
   pendingPrTool: AgentTool
   prNumberInput: string
   prError: string | null
+  pendingIssuePath: string | null
+  pendingIssueHostId: string | null
+  issueLabels: string[] | null
+  issueLabelsError: string | null
+  selectedIssueLabel: string
+  issueConfirmCount: number | null
+  issueError: string | null
+  bulkOpenConfirmThreshold: number
   toast: string | null
 }
 
@@ -77,6 +85,14 @@ function useProjectTreeElement({ onOpenSession }: TreeProps) {
     pendingPrTool: 'claude',
     prNumberInput: '',
     prError: null,
+    pendingIssuePath: null,
+    pendingIssueHostId: null,
+    issueLabels: null,
+    issueLabelsError: null,
+    selectedIssueLabel: '',
+    issueConfirmCount: null,
+    issueError: null,
+    bulkOpenConfirmThreshold: 20,
     toast: null,
   })
   const {
@@ -95,10 +111,21 @@ function useProjectTreeElement({ onOpenSession }: TreeProps) {
     pendingPrTool,
     prNumberInput,
     prError,
+    pendingIssuePath,
+    pendingIssueHostId,
+    issueLabels,
+    issueLabelsError,
+    selectedIssueLabel,
+    issueConfirmCount,
+    issueError,
+    bulkOpenConfirmThreshold,
     toast,
   } = ui
   const sessionNameInputRef = useRef<HTMLInputElement>(null)
   const prNumberInputRef = useRef<HTMLInputElement>(null)
+  // Monotonic token: bumped whenever the issue dialog opens or closes so an
+  // in-flight countOpenIssues can detect it was canceled/reopened mid-await.
+  const issueRequestRef = useRef(0)
 
   const showToast = (msg: string) => {
     setUi({ toast: msg })
@@ -119,6 +146,10 @@ function useProjectTreeElement({ onOpenSession }: TreeProps) {
       // defaultTool at click time. Mutating pendingTool from this async
       // callback would race against any user toggle made between the click
       // and getDefaultTool resolving.
+    })
+    window.api.getBulkOpenConfirmThreshold().then((n) => {
+      if (cancelled) return
+      setUi({ bulkOpenConfirmThreshold: n })
     })
     return () => {
       cancelled = true
@@ -246,17 +277,104 @@ function useProjectTreeElement({ onOpenSession }: TreeProps) {
     }
   }
 
-  const handleOpenAllIssues = async (projectPath: string, hostId: string | null) => {
+  const openIssuesDialog = (projectPath: string, hostId: string | null) => {
+    const token = (issueRequestRef.current += 1)
+    setUi({
+      pendingIssuePath: projectPath,
+      pendingIssueHostId: hostId,
+      issueLabels: null,
+      issueLabelsError: null,
+      selectedIssueLabel: '',
+      issueConfirmCount: null,
+      issueError: null,
+    })
+    window.api
+      .listRepoLabels(projectPath, hostId)
+      .then((result) => {
+        // Discard a response that resolved after the dialog was canceled or
+        // reopened (possibly for a different project).
+        if (issueRequestRef.current !== token) return
+        if (typeof result === 'string') {
+          setUi({ issueLabels: [], issueLabelsError: result })
+        } else {
+          setUi({ issueLabels: result })
+        }
+      })
+      .catch((err) => {
+        if (issueRequestRef.current !== token) return
+        setUi({ issueLabels: [], issueLabelsError: String(err) })
+      })
+  }
+
+  const closeIssuesDialog = () => {
+    // Bump the token first so any in-flight count bails instead of opening
+    // sessions, and clear `creating` so the menu isn't stuck disabled.
+    issueRequestRef.current += 1
+    setUi({
+      pendingIssuePath: null,
+      pendingIssueHostId: null,
+      issueLabels: null,
+      issueLabelsError: null,
+      selectedIssueLabel: '',
+      issueConfirmCount: null,
+      issueError: null,
+      creating: false,
+    })
+  }
+
+  const proceedOpenIssues = async (projectPath: string, hostId: string | null, label: string) => {
     if (creating) return
-    setUi({ creating: true })
+    setUi({ creating: true, issueError: null })
     try {
-      const result = await window.api.openSessionsForOpenIssues(projectPath, hostId)
+      const result = await window.api.openSessionsForOpenIssues(projectPath, hostId, label || null)
       showToast(typeof result === 'string' ? result : formatOpenAllSummary(result, 'issue'))
+      closeIssuesDialog()
     } catch (err) {
-      showToast(`Failed to open issue sessions: ${String(err)}`)
+      setUi({ issueError: `Failed to open issue sessions: ${String(err)}` })
     } finally {
       setUi({ creating: false })
     }
+  }
+
+  const handleSubmitIssues = async () => {
+    if (!pendingIssuePath || creating) return
+    const projectPath = pendingIssuePath
+    const hostId = pendingIssueHostId
+    const label = selectedIssueLabel
+    const token = issueRequestRef.current
+    setUi({ creating: true, issueError: null })
+    let count: number | string
+    try {
+      count = await window.api.countOpenIssues(projectPath, hostId, label || null)
+    } catch (err) {
+      if (issueRequestRef.current !== token) {
+        setUi({ creating: false })
+        return
+      }
+      setUi({ creating: false, issueError: `Failed to count open issues: ${String(err)}` })
+      return
+    }
+    // The dialog was canceled or reopened while the count was in flight —
+    // discard the result so we never open sessions for a dismissed dialog.
+    if (issueRequestRef.current !== token) {
+      setUi({ creating: false })
+      return
+    }
+    setUi({ creating: false })
+    if (typeof count === 'string') {
+      setUi({ issueError: count })
+      return
+    }
+    if (count === 0) {
+      showToast(label ? `No open issues match "${label}"` : 'No open issues to open')
+      closeIssuesDialog()
+      return
+    }
+    if (count > bulkOpenConfirmThreshold) {
+      setUi({ issueConfirmCount: count })
+      return
+    }
+    await proceedOpenIssues(projectPath, hostId, label)
   }
 
   const getMenuItems = (
@@ -285,9 +403,9 @@ function useProjectTreeElement({ onOpenSession }: TreeProps) {
         onClick: () => void handleOpenAllPrs(projectPath, hostId),
       })
       items.push({
-        label: 'Open sessions for all open issues',
+        label: 'Open sessions for all open issues…',
         disabled: creating,
-        onClick: () => void handleOpenAllIssues(projectPath, hostId),
+        onClick: () => openIssuesDialog(projectPath, hostId),
       })
       const remoteWts = remoteWorktreesCache[remoteWorktreeKey(hostId, projectPath)] ?? []
       const remoteUnmirrored = remoteWts.filter(
@@ -365,9 +483,9 @@ function useProjectTreeElement({ onOpenSession }: TreeProps) {
         onClick: () => void handleOpenAllPrs(projectPath, null),
       })
       items.push({
-        label: 'Open sessions for all open issues',
+        label: 'Open sessions for all open issues…',
         disabled: creating,
-        onClick: () => void handleOpenAllIssues(projectPath, null),
+        onClick: () => openIssuesDialog(projectPath, null),
       })
 
       const project = projects.find((p) => p.path === projectPath)
@@ -620,6 +738,73 @@ function useProjectTreeElement({ onOpenSession }: TreeProps) {
               Cancel
             </button>
           </div>
+        </div>
+      )}
+      {pendingIssuePath && (
+        <div className="session-name-dialog">
+          {issueConfirmCount === null ? (
+            <>
+              <div className="session-name-label">Label filter:</div>
+              {issueLabels === null ? (
+                <div className="session-name-label">Loading labels…</div>
+              ) : (
+                <select
+                  className="create-input"
+                  value={selectedIssueLabel}
+                  disabled={creating}
+                  onChange={(e) => setUi({ selectedIssueLabel: e.target.value })}
+                >
+                  <option value="">All open issues</option>
+                  {issueLabels.map((name) => (
+                    <option key={name} value={name}>
+                      {name}
+                    </option>
+                  ))}
+                </select>
+              )}
+              {issueLabelsError && (
+                <div className="pr-error">Could not load labels: {issueLabelsError}</div>
+              )}
+              {issueError && <div className="pr-error">{issueError}</div>}
+              <div className="create-actions">
+                <button
+                  type="button"
+                  className="create-btn"
+                  onClick={handleSubmitIssues}
+                  disabled={creating || issueLabels === null}
+                >
+                  {creating ? 'Working…' : 'Open sessions'}
+                </button>
+                <button type="button" className="create-btn cancel" onClick={closeIssuesDialog}>
+                  Cancel
+                </button>
+              </div>
+            </>
+          ) : (
+            <>
+              <div className="session-name-label">
+                This will open up to {issueConfirmCount} issue session
+                {issueConfirmCount === 1 ? '' : 's'}
+                {selectedIssueLabel ? ` labelled "${selectedIssueLabel}"` : ''}. Continue?
+              </div>
+              {issueError && <div className="pr-error">{issueError}</div>}
+              <div className="create-actions">
+                <button
+                  type="button"
+                  className="create-btn"
+                  onClick={() =>
+                    void proceedOpenIssues(pendingIssuePath, pendingIssueHostId, selectedIssueLabel)
+                  }
+                  disabled={creating}
+                >
+                  {creating ? 'Opening…' : `Open ${issueConfirmCount}`}
+                </button>
+                <button type="button" className="create-btn cancel" onClick={closeIssuesDialog}>
+                  Cancel
+                </button>
+              </div>
+            </>
+          )}
         </div>
       )}
       {displayProjects.map((project) => {

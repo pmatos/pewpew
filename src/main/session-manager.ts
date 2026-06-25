@@ -1822,11 +1822,12 @@ function describeGhError(err: unknown): string {
   return String(err)
 }
 
-export function ghApiOpenItemsArgs(kind: 'pr' | 'issue', repo: string): string[] {
+export function ghApiOpenItemsArgs(kind: 'pr' | 'issue', repo: string, label?: string): string[] {
+  const labelQuery = kind === 'issue' && label ? `&labels=${encodeURIComponent(label)}` : ''
   const endpoint =
     kind === 'pr'
       ? `repos/${repo}/pulls?state=open&per_page=100`
-      : `repos/${repo}/issues?state=open&per_page=100`
+      : `repos/${repo}/issues?state=open&per_page=100${labelQuery}`
   const jq = kind === 'pr' ? '.[].number' : '.[] | select(.pull_request | not) | .number'
   return ['api', '--paginate', endpoint, '--jq', jq]
 }
@@ -1845,9 +1846,17 @@ function parseNumberedGhLines(stdout: string, label: string): NumberedGhItem[] {
   return items
 }
 
+export function parseLabelLines(stdout: string): string[] {
+  return stdout
+    .split(/\r?\n/)
+    .map((line) => line.trim())
+    .filter((line) => line.length > 0)
+}
+
 async function listLocalOpenGhItems(
   projectPath: string,
-  kind: 'pr' | 'issue'
+  kind: 'pr' | 'issue',
+  label?: string
 ): Promise<NumberedGhItem[] | string> {
   try {
     const { stdout: repoStdout } = await execFileAsync(
@@ -1856,7 +1865,7 @@ async function listLocalOpenGhItems(
       { cwd: projectPath, timeout: 30000 }
     )
     const repo = String(repoStdout).trim()
-    const { stdout } = await execFileAsync('gh', ghApiOpenItemsArgs(kind, repo), {
+    const { stdout } = await execFileAsync('gh', ghApiOpenItemsArgs(kind, repo, label), {
       cwd: projectPath,
       timeout: 30000,
     })
@@ -1869,12 +1878,14 @@ async function listLocalOpenGhItems(
 async function listRemoteOpenGhItems(
   projectPath: string,
   hostId: string,
-  kind: 'pr' | 'issue'
+  kind: 'pr' | 'issue',
+  label?: string
 ): Promise<NumberedGhItem[] | string> {
   const host = getRequiredHost(hostId)
   const ghProbe = await probeRemoteGh(host)
   if (!ghProbe.ok) return ghProbe.error
 
+  const labelQuery = kind === 'issue' && label ? `&labels=${encodeURIComponent(label)}` : ''
   try {
     const stdout = await expectRemoteOk(
       host,
@@ -1888,12 +1899,13 @@ async function listRemoteOpenGhItems(
           'if [ "$2" = pr ]; then',
           '  gh api --paginate "repos/$repo/pulls?state=open&per_page=100" --jq ".[].number"',
           'else',
-          '  gh api --paginate "repos/$repo/issues?state=open&per_page=100" --jq ".[] | select(.pull_request | not) | .number"',
+          '  gh api --paginate "repos/$repo/issues?state=open&per_page=100$3" --jq ".[] | select(.pull_request | not) | .number"',
           'fi',
         ].join('\n'),
         '_',
         projectPath,
         kind,
+        labelQuery,
       ],
       'gh failed'
     )
@@ -1914,11 +1926,78 @@ async function listOpenPrs(
 
 async function listOpenIssues(
   projectPath: string,
-  hostId: string | null
+  hostId: string | null,
+  label?: string
 ): Promise<NumberedGhItem[] | string> {
   return hostId === null
-    ? listLocalOpenGhItems(projectPath, 'issue')
-    : listRemoteOpenGhItems(projectPath, hostId, 'issue')
+    ? listLocalOpenGhItems(projectPath, 'issue', label)
+    : listRemoteOpenGhItems(projectPath, hostId, 'issue', label)
+}
+
+export async function countOpenIssues(
+  projectPath: string,
+  hostId: string | null = null,
+  label?: string,
+  deps: { listIssues?: ListNumberedItems } = {}
+): Promise<number | string> {
+  const list = deps.listIssues ?? ((p: string, h: string | null) => listOpenIssues(p, h, label))
+  try {
+    const items = await list(projectPath, hostId)
+    if (typeof items === 'string') return items
+    return items.length
+  } catch (err) {
+    return describeGhError(err)
+  }
+}
+
+export async function listRepoLabels(
+  projectPath: string,
+  hostId: string | null = null
+): Promise<string[] | string> {
+  if (hostId === null) {
+    try {
+      const { stdout: repoStdout } = await execFileAsync(
+        'gh',
+        ['repo', 'view', '--json', 'nameWithOwner', '--jq', '.nameWithOwner'],
+        { cwd: projectPath, timeout: 30000 }
+      )
+      const repo = String(repoStdout).trim()
+      const { stdout } = await execFileAsync(
+        'gh',
+        ['api', '--paginate', `repos/${repo}/labels?per_page=100`, '--jq', '.[].name'],
+        { cwd: projectPath, timeout: 30000 }
+      )
+      return parseLabelLines(String(stdout))
+    } catch (err) {
+      return `Failed to list labels: ${describeGhError(err)}`
+    }
+  }
+
+  const host = getRequiredHost(hostId)
+  const ghProbe = await probeRemoteGh(host)
+  if (!ghProbe.ok) return ghProbe.error
+
+  try {
+    const stdout = await expectRemoteOk(
+      host,
+      [
+        'sh',
+        '-c',
+        [
+          'set -e',
+          'cd "$1"',
+          'repo=$(gh repo view --json nameWithOwner --jq .nameWithOwner)',
+          'gh api --paginate "repos/$repo/labels?per_page=100" --jq ".[].name"',
+        ].join('\n'),
+        '_',
+        projectPath,
+      ],
+      'gh failed'
+    )
+    return parseLabelLines(stdout)
+  } catch (err) {
+    return `Failed to list labels: ${describeGhError(err)}`
+  }
 }
 
 function findSessionByBranch(
@@ -2425,13 +2504,14 @@ export async function openSessionsForOpenPrs(
 export async function openSessionsForOpenIssues(
   projectPath: string,
   hostId: string | null = null,
+  label?: string,
   deps: OpenSessionsDeps = {}
 ): Promise<OpenSessionsSummary | string> {
   return openSessionsForNumberedItems(
     projectPath,
     hostId,
     'issueNumber',
-    deps.listIssues ?? listOpenIssues,
+    deps.listIssues ?? ((p, h) => listOpenIssues(p, h, label)),
     deps.createIssueSession ?? createIssueSession
   )
 }

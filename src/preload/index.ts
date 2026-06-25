@@ -34,8 +34,12 @@ contextBridge.exposeInMainWorld('api', {
   ) => ipcRenderer.invoke('sessions:create-prs', projectPath, prNumbers, hostId ?? null, options),
   openSessionsForOpenPrs: (projectPath: string, hostId?: string | null) =>
     ipcRenderer.invoke('sessions:open-all-prs', projectPath, hostId ?? null),
-  openSessionsForOpenIssues: (projectPath: string, hostId?: string | null) =>
-    ipcRenderer.invoke('sessions:open-all-issues', projectPath, hostId ?? null),
+  openSessionsForOpenIssues: (projectPath: string, hostId?: string | null, label?: string | null) =>
+    ipcRenderer.invoke('sessions:open-all-issues', projectPath, hostId ?? null, label ?? null),
+  countOpenIssues: (projectPath: string, hostId?: string | null, label?: string | null) =>
+    ipcRenderer.invoke('sessions:count-open-issues', projectPath, hostId ?? null, label ?? null),
+  listRepoLabels: (projectPath: string, hostId?: string | null) =>
+    ipcRenderer.invoke('repo:list-labels', projectPath, hostId ?? null),
   mirrorWorktree: (projectPath: string, worktreePath: string, hostId?: string | null) =>
     ipcRenderer.invoke('sessions:mirror', projectPath, worktreePath, hostId ?? null),
   mirrorAllWorktrees: (projectPath: string, hostId?: string | null) =>
@@ -71,6 +75,8 @@ contextBridge.exposeInMainWorld('api', {
   saveSidebarWidth: (width: number) => ipcRenderer.invoke('config:save-sidebar-width', width),
   getUiScale: () => ipcRenderer.invoke('config:get-ui-scale'),
   getDefaultTool: () => ipcRenderer.invoke('config:get-default-tool') as Promise<AgentTool>,
+  getBulkOpenConfirmThreshold: () =>
+    ipcRenderer.invoke('config:get-bulk-open-confirm-threshold') as Promise<number>,
   getWorktreeBase: () => ipcRenderer.invoke('config:get-worktree-base'),
   getTheme: () => ipcRenderer.invoke('config:get-theme') as Promise<Theme>,
   saveTheme: (theme: Theme) => ipcRenderer.invoke('config:save-theme', theme),

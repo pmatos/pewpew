@@ -38,6 +38,8 @@ import {
   createPrSessions,
   openSessionsForOpenPrs,
   openSessionsForOpenIssues,
+  countOpenIssues,
+  listRepoLabels,
   getSession,
   getSessions,
   restoreSessions,
@@ -361,8 +363,22 @@ app.whenReady().then(async () => {
 
   ipcMain.handle(
     'sessions:open-all-issues',
+    async (_event, projectPath: string, hostId?: string | null, label?: string | null) => {
+      return openSessionsForOpenIssues(projectPath, hostId ?? null, label ?? undefined)
+    }
+  )
+
+  ipcMain.handle(
+    'sessions:count-open-issues',
+    async (_event, projectPath: string, hostId?: string | null, label?: string | null) => {
+      return countOpenIssues(projectPath, hostId ?? null, label ?? undefined)
+    }
+  )
+
+  ipcMain.handle(
+    'repo:list-labels',
     async (_event, projectPath: string, hostId?: string | null) => {
-      return openSessionsForOpenIssues(projectPath, hostId ?? null)
+      return listRepoLabels(projectPath, hostId ?? null)
     }
   )
 
@@ -684,6 +700,10 @@ app.whenReady().then(async () => {
 
   ipcMain.handle('config:get-default-tool', () => {
     return getConfig().defaultTool
+  })
+
+  ipcMain.handle('config:get-bulk-open-confirm-threshold', () => {
+    return getConfig().bulkOpenConfirmThreshold
   })
 
   ipcMain.handle('config:get-worktree-base', () => {
