@@ -63,12 +63,17 @@ export function applyHookEvent(
       if (event.originHostId) next.connectionState = 'live'
       break
     case 'session.end': {
-      // Claude Code fires SessionEnd for several reasons, not all of which mean
-      // the user is done with the worktree. /clear, --continue/--resume, and
-      // bypass_permissions_disabled all fire SessionEnd while the session
-      // remains alive — treating them as "user wants cleanup" produces a
-      // disruptive false-positive dialog. Only fire on reasons that genuinely
-      // mean the agent process is gone.
+      // Claude Code fires SessionEnd for several reasons, only some of which
+      // mean the user is done with the worktree. `clear` (/clear resets context)
+      // and `resume` (--continue/--resume hands off to a fresh process) both
+      // fire while the session remains alive — prompting cleanup for those
+      // produces a disruptive false-positive dialog. Every other reason
+      // (prompt_input_exit, logout, bypass_permissions_disabled, other, or an
+      // absent/unrecognised reason) means the agent process is gone, so we
+      // prompt. Using a denylist of the two "still alive" reasons keeps the
+      // catch-all `other` — the common real-termination value — triggering
+      // cleanup, which an allowlist of {prompt_input_exit, logout} silently
+      // dropped (the 0.2.1 regression).
       // https://code.claude.com/docs/en/hooks (SessionEnd matcher values).
       const reason = typeof event.params.reason === 'string' ? event.params.reason : undefined
       // JSON.stringify escapes control characters and the slice caps length so a
@@ -78,8 +83,8 @@ export function applyHookEvent(
       // that keeps the diagnostic value of seeing the actual reason string.
       const safeReason = reason === undefined ? '<absent>' : JSON.stringify(reason).slice(0, 64)
       console.info(`[session.end] sessionId=${target.id} reason=${safeReason}`)
-      const triggersCleanup = reason === 'prompt_input_exit' || reason === 'logout'
-      if (!triggersCleanup) {
+      const sessionStillAlive = reason === 'clear' || reason === 'resume'
+      if (sessionStillAlive) {
         return { state, intents: [], matched: true }
       }
       return {
