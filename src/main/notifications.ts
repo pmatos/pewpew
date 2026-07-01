@@ -1,6 +1,6 @@
 import { BrowserWindow, Notification } from 'electron'
 import { randomUUID } from 'crypto'
-import { getMainWindow } from './window-registry'
+import { getMainWindow, safeSend } from './window-registry'
 import type { Session, ToastEvent } from '../shared/types'
 
 export function notifyNeedsInput(session: Session): void {
@@ -33,7 +33,6 @@ export function emitToast(event: Omit<ToastEvent, 'id'> & { id?: string }): void
     hostLabel: event.hostLabel,
   }
   for (const win of BrowserWindow.getAllWindows()) {
-    if (win.isDestroyed()) continue
-    win.webContents.send('toast:show', payload)
+    safeSend(win, 'toast:show', payload)
   }
 }

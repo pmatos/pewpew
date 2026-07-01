@@ -17,7 +17,7 @@ import { scanProjects } from './project-scanner'
 import { installHooks, isSettingsGitignored } from './hook-installer'
 import { startHookServer, stopHookServer } from './hook-server'
 import { createTray } from './tray'
-import { registerWindow, broadcastToAll } from './window-registry'
+import { registerWindow, broadcastToAll, safeSend } from './window-registry'
 import {
   initPtyManager,
   stopPtyManager,
@@ -191,6 +191,35 @@ function installNotifyScript(): void {
   chmodSync(dest, 0o755)
 }
 
+// Tracks the last auto-reload per window so a renderer that crashes again right
+// after we reload it doesn't get hammered into a tight reload loop.
+const lastRendererReload = new WeakMap<BrowserWindow, number>()
+
+// Recovers a window whose renderer process died (the "white window"). The main
+// process owns the node-pty/tmux state, so a reload re-feeds the terminals from
+// their buffers + tmux capture rather than losing the session.
+function attachRendererCrashHandlers(win: BrowserWindow, label: string): void {
+  win.webContents.on('render-process-gone', (_event, details) => {
+    console.error(
+      `[renderer] ${label} render process gone: reason=${details.reason} exitCode=${details.exitCode}`
+    )
+    if (details.reason === 'clean-exit' || win.isDestroyed()) return
+    const now = Date.now()
+    const prev = lastRendererReload.get(win) ?? 0
+    if (now - prev < 5000) {
+      console.error(
+        `[renderer] ${label} crashed again within 5s of a reload; not auto-reloading to avoid a crash loop`
+      )
+      return
+    }
+    lastRendererReload.set(win, now)
+    win.reload()
+  })
+  win.webContents.on('unresponsive', () => {
+    console.error(`[renderer] ${label} renderer became unresponsive`)
+  })
+}
+
 function createWindow(): BrowserWindow {
   const config = getConfig()
   const ws = config.windowState
@@ -219,6 +248,8 @@ function createWindow(): BrowserWindow {
     cfg.windowState = { ...bounds, maximized }
     saveConfig(cfg)
   })
+
+  attachRendererCrashHandlers(mainWindow, 'main')
 
   if (process.env.ELECTRON_RENDERER_URL) {
     mainWindow.loadURL(process.env.ELECTRON_RENDERER_URL)
@@ -722,9 +753,7 @@ app.whenReady().then(async () => {
     // pick up the new theme without needing to reload. The sender no-ops
     // on its own broadcast because state.theme already matches.
     for (const win of BrowserWindow.getAllWindows()) {
-      if (!win.isDestroyed()) {
-        win.webContents.send('theme:changed', theme)
-      }
+      safeSend(win, 'theme:changed', theme)
     }
   })
 
@@ -741,6 +770,7 @@ app.whenReady().then(async () => {
     })
 
     registerWindow(swimWindow)
+    attachRendererCrashHandlers(swimWindow, 'swim-lanes')
 
     const query = `?sessions=${sessionIds.join(',')}`
     if (process.env.ELECTRON_RENDERER_URL) {
