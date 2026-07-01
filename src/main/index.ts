@@ -53,6 +53,7 @@ import {
   removeSessionsForHost,
   relocateProject,
   updateLastKnownStatesBatch,
+  stopSessionManager,
 } from './session-manager'
 import { parseDiff, synthesizeUntrackedFile } from './diff-parser'
 import { listHosts, addHost, updateHost, deleteHost, getHost } from './host-registry'
@@ -854,6 +855,7 @@ app.whenReady().then(async () => {
     event.preventDefault()
     clearInterval(thumbInterval)
     stopPtyManager()
+    stopSessionManager()
     stopHookServer()
     void (async () => {
       // Bound teardown so an unreachable host can't wedge shutdown.

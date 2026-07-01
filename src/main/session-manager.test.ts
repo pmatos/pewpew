@@ -54,6 +54,11 @@ const state = vi.hoisted(() => ({
   // When set, delays next ensureHostConnection resolution (used for idempotency
   // and cascade tests).
   ensureHostConnectionGate: null as null | Promise<void>,
+  // Auto-reconnect config surfaced via getReconnectConfig; mutable per test.
+  reconnectConfig: { enabled: true, initialDelayMs: 1000, maxDelayMs: 30000 },
+  // Captured emitToast payloads for assertion.
+  toasts: [] as { severity: string; title: string; detail?: string }[],
+  hasPtyResult: new Set<string>(),
 }))
 
 vi.mock('./config', () => ({
@@ -73,6 +78,7 @@ vi.mock('./config', () => ({
     defaultTool: state.defaultTool,
     worktreeBase: state.worktreeBase,
   }),
+  getReconnectConfig: () => state.reconnectConfig,
   saveConfig: vi.fn(),
 }))
 
@@ -90,7 +96,9 @@ vi.mock('./tray', () => ({
 
 vi.mock('./notifications', () => ({
   notifyNeedsInput: vi.fn(),
-  emitToast: vi.fn(),
+  emitToast: (event: { severity: string; title: string; detail?: string }) => {
+    state.toasts.push(event)
+  },
 }))
 
 vi.mock('electron', () => ({
@@ -155,7 +163,7 @@ vi.mock('./pty-manager', () => ({
   },
   destroyPty: vi.fn(),
   destroyRemotePty: vi.fn(async () => undefined),
-  hasPty: vi.fn(() => false),
+  hasPty: vi.fn((sessionId: string) => state.hasPtyResult.has(sessionId)),
   hasTmuxSession: vi.fn(() => false),
   hasRemoteTmuxSession: vi.fn(async (sessionId: string) => {
     return state.hasRemoteTmuxResult.get(sessionId) ?? false
@@ -337,6 +345,9 @@ beforeEach(() => {
   state.ensureHostConnectionThrows = null
   state.ensureHostConnectionGate = null
   state.unexpectedExitListener = null
+  state.reconnectConfig = { enabled: true, initialDelayMs: 1000, maxDelayMs: 30000 }
+  state.toasts = []
+  state.hasPtyResult = new Set()
 })
 
 afterEach(() => {
@@ -1791,8 +1802,8 @@ describe('unexpected pty exit listener', () => {
     expect(sm.getSessions()[0].status).toBe('dead')
   })
 
-  it('does not touch remote sessions (their connection state machinery owns recovery)', async () => {
-    const remote = baseRemoteSession({ id: 'r1', status: 'idle' })
+  it('remote drop with reconnect enabled → connecting + drop toast', async () => {
+    const remote = baseRemoteSession({ id: 'r1', status: 'running' })
     writeSessionsJson([remote])
     const sm = await loadSessionManager()
     sm.restoreSessions()
@@ -1800,7 +1811,38 @@ describe('unexpected pty exit listener', () => {
 
     state.unexpectedExitListener?.('r1')
 
-    expect(sm.getSessions()[0].status).toBe('idle')
+    expect(sm.getSessions()[0].connectionState).toBe('connecting')
+    expect(state.toasts).toEqual([
+      { severity: 'warning', title: 'Connection to Dev lost — reconnecting…' },
+    ])
+    sm.stopSessionManager() // cancel the armed backoff timer
+  })
+
+  it('remote drop with reconnect disabled → offline overlay, no toast', async () => {
+    state.reconnectConfig = { enabled: false, initialDelayMs: 1000, maxDelayMs: 30000 }
+    const remote = baseRemoteSession({ id: 'r1', status: 'running' })
+    writeSessionsJson([remote])
+    const sm = await loadSessionManager()
+    sm.restoreSessions()
+    sm.initSessionManager()
+
+    state.unexpectedExitListener?.('r1')
+
+    expect(sm.getSessions()[0].connectionState).toBe('offline')
+    expect(state.toasts).toEqual([])
+  })
+
+  it('does not auto-reconnect an already-dead remote session', async () => {
+    const remote = baseRemoteSession({ id: 'r1', status: 'dead' })
+    writeSessionsJson([remote])
+    const sm = await loadSessionManager()
+    sm.restoreSessions()
+    sm.initSessionManager()
+
+    state.unexpectedExitListener?.('r1')
+
+    expect(state.toasts).toEqual([])
+    expect(sm.getSessions()[0].connectionState).not.toBe('connecting')
   })
 
   it('is a no-op for unknown ids and already-dead sessions', async () => {
@@ -2990,5 +3032,110 @@ describe('createPrSessions', () => {
     expect(started).toEqual([8, 9])
     expect(result.created.map((s) => s.prNumber)).toEqual([8, 9])
     expect(result.failed).toEqual([])
+  })
+})
+
+describe('attemptAutoReconnect', () => {
+  it('present → recovered, reattaches, marks live, toasts recovery', async () => {
+    writeSessionsJson([baseRemoteSession({ id: 'r1', status: 'idle' })])
+    state.hasRemoteTmuxResult.set('r1', true)
+    const sm = await loadSessionManager()
+    sm.restoreSessions()
+
+    const outcome = await sm.attemptAutoReconnect('r1')
+
+    expect(outcome).toBe('recovered')
+    expect(sm.getSessions()[0].connectionState).toBe('live')
+    expect(state.reattachRemotePtyCalls).toEqual([{ sessionId: 'r1', hostId: 'h1' }])
+    expect(state.toasts).toEqual([{ severity: 'info', title: 'Reconnected to Dev' }])
+  })
+
+  it('tmux gone → gave-up, marks dead, toasts session-ended', async () => {
+    writeSessionsJson([baseRemoteSession({ id: 'r1', status: 'idle' })])
+    state.hasRemoteTmuxResult.set('r1', false)
+    const sm = await loadSessionManager()
+    sm.restoreSessions()
+
+    const outcome = await sm.attemptAutoReconnect('r1')
+
+    expect(outcome).toBe('gave-up')
+    expect(sm.getSessions()[0].status).toBe('dead')
+    expect(state.toasts).toEqual([{ severity: 'error', title: 'Dev: remote session ended' }])
+  })
+
+  it('auth-failed → gave-up (no retry)', async () => {
+    writeSessionsJson([baseRemoteSession({ id: 'r1', status: 'idle' })])
+    state.ensureHostConnectionThrows = {
+      message: 'Permission denied (publickey)',
+      runtimeStateAfter: 'auth-failed',
+    }
+    const sm = await loadSessionManager()
+    sm.restoreSessions()
+
+    const outcome = await sm.attemptAutoReconnect('r1')
+
+    expect(outcome).toBe('gave-up')
+    expect(sm.getSessions()[0].connectionState).toBe('auth-failed')
+    expect(state.toasts.map((t) => t.severity)).toEqual(['error'])
+  })
+
+  it('network unreachable → retry', async () => {
+    writeSessionsJson([baseRemoteSession({ id: 'r1', status: 'idle' })])
+    state.ensureHostConnectionThrows = {
+      message: 'Connection refused',
+      runtimeStateAfter: 'unreachable',
+    }
+    const sm = await loadSessionManager()
+    sm.restoreSessions()
+
+    const outcome = await sm.attemptAutoReconnect('r1')
+
+    expect(outcome).toBe('retry')
+    expect(sm.getSessions()[0].connectionState).toBe('unreachable')
+  })
+
+  it('skips the attempt (silent recovered) when a manual reconnect already reattached', async () => {
+    writeSessionsJson([baseRemoteSession({ id: 'r1', status: 'idle' })])
+    state.hasRemoteTmuxResult.set('r1', true)
+    const sm = await loadSessionManager()
+    sm.restoreSessions()
+    await sm.reconnectRemoteSession('r1') // manual reconnect → live
+    state.reattachRemotePtyCalls = []
+    state.hasPtyResult.add('r1')
+    state.toasts = []
+
+    const outcome = await sm.attemptAutoReconnect('r1')
+
+    expect(outcome).toBe('recovered')
+    expect(state.reattachRemotePtyCalls).toEqual([])
+    expect(state.toasts).toEqual([])
+  })
+
+  it('gave-up when the session no longer exists', async () => {
+    const sm = await loadSessionManager()
+    expect(await sm.attemptAutoReconnect('nope')).toBe('gave-up')
+  })
+})
+
+describe('auto-reconnect cancellation', () => {
+  beforeEach(() => vi.useFakeTimers())
+  afterEach(() => vi.useRealTimers())
+
+  it('killSession cancels a scheduled auto-reconnect (no resurrection)', async () => {
+    state.hasRemoteTmuxResult.set('r1', true)
+    writeSessionsJson([baseRemoteSession({ id: 'r1', status: 'running' })])
+    const sm = await loadSessionManager()
+    sm.restoreSessions()
+    sm.initSessionManager()
+
+    state.unexpectedExitListener?.('r1') // drop → schedules a reconnect
+    await sm.killSession('r1')
+    state.reattachRemotePtyCalls = []
+
+    await vi.advanceTimersByTimeAsync(60000)
+
+    // The pending backoff timer must have been canceled — no reattach fired.
+    expect(state.reattachRemotePtyCalls).toEqual([])
+    expect(sm.getSessions()[0].status).toBe('dead')
   })
 })
