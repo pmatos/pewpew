@@ -439,6 +439,15 @@ export function initSessionManager(): void {
       return
     }
 
+    // A normally-ended remote session (agent exited → session.end hook →
+    // promptCleanup) must not be auto-reconnected: its remote tmux is gone, so a
+    // probe would flip it to 'dead' with a misleading "remote session ended"
+    // toast and could clobber a user-chosen 'completed'. Terminal statuses and
+    // an in-flight cleanup both mark a genuine end — a network drop delivers no
+    // session.end hook, so it never trips these.
+    if (entry.session.status === 'completed' || entry.session.status === 'error') return
+    if (cleanupInProgress.has(sessionId)) return
+
     const host = getHost(entry.session.hostId)
     const label = host?.label || host?.alias || entry.session.hostId
     if (getReconnectConfig().enabled) {
@@ -1441,6 +1450,9 @@ export async function attemptAutoReconnect(id: string): Promise<AttemptOutcome> 
   if (!entry) return 'gave-up'
   const session = entry.session
   if (!session.hostId) return 'gave-up'
+  // The session ended normally (completed/error) between scheduling and now —
+  // don't probe/reattach, which would flip it to 'dead' with a bogus toast.
+  if (session.status === 'completed' || session.status === 'error') return 'gave-up'
   const host = getHost(session.hostId)
   const label = host?.label || host?.alias || session.hostId
 
@@ -1792,6 +1804,10 @@ const cleanupInProgress = new Set<string>()
 async function promptCleanup(id: string): Promise<void> {
   if (cleanupInProgress.has(id)) return
   cleanupInProgress.add(id)
+  // The agent ended normally (this fires from the session.end hook, which only
+  // arrives over a live connection). Cancel any auto-reconnect a racing PTY
+  // exit scheduled so it can't flip the session to 'dead' mid-cleanup.
+  reconnectScheduler.cancel(id)
   try {
     const entry = sessions.get(id)
     if (!entry) return

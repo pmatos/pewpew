@@ -3139,3 +3139,71 @@ describe('auto-reconnect cancellation', () => {
     expect(sm.getSessions()[0].status).toBe('dead')
   })
 })
+
+describe('auto-reconnect skips normally-ended remote sessions', () => {
+  it('listener does not schedule/toast for a completed remote session', async () => {
+    writeSessionsJson([baseRemoteSession({ id: 'r1', status: 'completed' })])
+    const sm = await loadSessionManager()
+    sm.restoreSessions()
+    sm.initSessionManager()
+
+    state.unexpectedExitListener?.('r1')
+
+    expect(state.toasts).toEqual([])
+    expect(sm.getSessions()[0].connectionState).not.toBe('connecting')
+    expect(sm.getSessions()[0].status).toBe('completed')
+  })
+
+  it('listener does not schedule/toast for an errored remote session', async () => {
+    writeSessionsJson([baseRemoteSession({ id: 'r1', status: 'error' })])
+    const sm = await loadSessionManager()
+    sm.restoreSessions()
+    sm.initSessionManager()
+
+    state.unexpectedExitListener?.('r1')
+
+    expect(state.toasts).toEqual([])
+    expect(sm.getSessions()[0].connectionState).not.toBe('connecting')
+  })
+
+  it('attemptAutoReconnect gives up on a completed session without probing', async () => {
+    writeSessionsJson([baseRemoteSession({ id: 'r1', status: 'completed' })])
+    state.hasRemoteTmuxResult.set('r1', true) // even if tmux is "present", must not reattach
+    const sm = await loadSessionManager()
+    sm.restoreSessions()
+
+    const outcome = await sm.attemptAutoReconnect('r1')
+
+    expect(outcome).toBe('gave-up')
+    expect(state.reattachRemotePtyCalls).toEqual([])
+    expect(state.ensureHostConnectionCalls).toEqual([])
+    expect(state.toasts).toEqual([])
+  })
+
+  it('a normal session-end cancels a scheduled auto-reconnect (stays completed, no dead-flip)', async () => {
+    vi.useFakeTimers()
+    try {
+      const remote = baseRemoteSession({ id: 'r1', status: 'running' })
+      writeSessionsJson([remote])
+      const sm = await loadSessionManager()
+      sm.restoreSessions()
+      sm.initSessionManager()
+
+      // PTY drop schedules a reconnect (status is active at this point)...
+      state.unexpectedExitListener?.('r1')
+      // ...then the agent's session.end hook arrives over the live tunnel →
+      // promptCleanup → cancel + (dialog "Keep") completed.
+      sm.handleHookEvent('session.end', { cwd: remote.worktreePath }, 'h1')
+      await vi.advanceTimersByTimeAsync(0) // flush the promptCleanup dialog
+      state.reattachRemotePtyCalls = []
+      state.toasts = []
+
+      await vi.advanceTimersByTimeAsync(60000)
+
+      expect(state.reattachRemotePtyCalls).toEqual([])
+      expect(sm.getSessions()[0].status).toBe('completed')
+    } finally {
+      vi.useRealTimers()
+    }
+  })
+})
