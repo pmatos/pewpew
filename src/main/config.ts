@@ -17,6 +17,12 @@ export interface WindowState {
   maximized: boolean
 }
 
+export interface ReconnectConfig {
+  enabled: boolean
+  initialDelayMs: number
+  maxDelayMs: number
+}
+
 export interface AppConfig {
   scanDirs: string[]
   pinnedPaths: string[]
@@ -34,6 +40,7 @@ export interface AppConfig {
   worktreeBase: WorktreeBase
   theme: Theme
   bulkOpenConfirmThreshold: number
+  reconnect: ReconnectConfig
 }
 
 export const CONFIG_DIR = join(process.env.XDG_CONFIG_HOME || join(homedir(), '.config'), 'pewpew')
@@ -55,6 +62,7 @@ const DEFAULT_CONFIG: AppConfig = {
   worktreeBase: 'local',
   theme: 'dark',
   bulkOpenConfirmThreshold: 20,
+  reconnect: { enabled: true, initialDelayMs: 1000, maxDelayMs: 30000 },
 }
 
 export function shouldWarnGitignore(projectPath: string): boolean {
@@ -89,6 +97,13 @@ export function getConfig(): AppConfig {
   } catch {
     return DEFAULT_CONFIG
   }
+}
+
+// getConfig is a shallow merge over DEFAULT_CONFIG, so a hand-edited partial
+// `reconnect` object in config.json would clobber the sibling defaults. Fill
+// per-field so the scheduler never sees an undefined tunable.
+export function getReconnectConfig(): ReconnectConfig {
+  return { ...DEFAULT_CONFIG.reconnect, ...(getConfig().reconnect ?? {}) }
 }
 
 export function saveConfig(config: AppConfig): void {

@@ -7,9 +7,10 @@ import { homedir } from 'os'
 import { randomUUID } from 'crypto'
 import { dialog, shell } from 'electron'
 import { broadcastToAll, getMainWindow } from './window-registry'
-import { CONFIG_DIR, getConfig, saveConfig } from './config'
+import { CONFIG_DIR, getConfig, getReconnectConfig, saveConfig } from './config'
 import { updateTray } from './tray'
-import { notifyNeedsInput } from './notifications'
+import { notifyNeedsInput, emitToast } from './notifications'
+import { createReconnectScheduler, type AttemptOutcome } from './reconnect-scheduler'
 import {
   createPty,
   detachPty,
@@ -421,17 +422,43 @@ export function initSessionManager(): void {
     }
   }, PR_REFRESH_INTERVAL_MS).unref()
 
-  // When a local pty dies on its own (e.g. `claude --continue` exits with
-  // "No conversation found to continue" and the tmux session collapses), flip
-  // the session back to 'dead' so the renderer shows the "Restart terminal"
-  // overlay instead of a permanently empty xterm. Remote sessions are skipped:
-  // an SSH drop kills the local pty but the remote tmux session can still be
-  // alive, and reconnectRemoteSession already drives that flow.
+  // When a pty dies on its own we react by kind:
+  //  - Local (`claude --continue` exits, tmux collapses): flip to 'dead' so the
+  //    renderer shows the "Restart terminal" overlay instead of an empty xterm.
+  //  - Remote (an SSH drop kills the local pty, but the remote tmux likely
+  //    survives): auto-reconnect if enabled — mark 'connecting' and schedule a
+  //    backoff-driven reattach. If disabled, mark 'offline' so the manual
+  //    "Reconnect" overlay surfaces rather than a frozen terminal.
   setUnexpectedExitListener((sessionId) => {
     const entry = sessions.get(sessionId)
-    if (!entry || entry.session.hostId) return
+    if (!entry) return
     if (entry.session.status === 'dead') return
-    updateSession(sessionId, 'dead')
+
+    if (!entry.session.hostId) {
+      updateSession(sessionId, 'dead')
+      return
+    }
+
+    // A normally-ended remote session (agent exited → session.end hook →
+    // promptCleanup) must not be auto-reconnected: its remote tmux is gone, so a
+    // probe would flip it to 'dead' with a misleading "remote session ended"
+    // toast and could clobber a user-chosen 'completed'. Terminal statuses and
+    // an in-flight cleanup both mark a genuine end — a network drop delivers no
+    // session.end hook, so it never trips these.
+    if (entry.session.status === 'completed' || entry.session.status === 'error') return
+    if (cleanupInProgress.has(sessionId)) return
+
+    const host = getHost(entry.session.hostId)
+    const label = host?.label || host?.alias || entry.session.hostId
+    if (getReconnectConfig().enabled) {
+      emitToast({ severity: 'warning', title: `Connection to ${label} lost — reconnecting…` })
+      entry.session.connectionState = 'connecting'
+      onSessionsChanged()
+      reconnectScheduler.schedule(sessionId)
+    } else {
+      entry.session.connectionState = 'offline'
+      onSessionsChanged()
+    }
   })
 }
 
@@ -1254,6 +1281,7 @@ export function handleHookEvent(
 export async function killSession(id: string): Promise<void> {
   const entry = sessions.get(id)
   if (!entry) return
+  reconnectScheduler.cancel(id)
   if (entry.session.hostId) {
     const host = getRequiredHost(entry.session.hostId)
     await destroyRemotePty(id, host)
@@ -1413,6 +1441,60 @@ async function doReconnectRemoteSession(id: string): Promise<ReconnectOutcome> {
   return { state: finalState, lease }
 }
 
+// One auto-reconnect attempt for a remote session that dropped. Delegates to
+// the manual reconnect (so we inherit its probe/reattach, concurrency
+// coalescing, sibling batch, and auth classification) and maps the resulting
+// session state to a scheduler outcome. The scheduler owns the backoff loop.
+export async function attemptAutoReconnect(id: string): Promise<AttemptOutcome> {
+  const entry = sessions.get(id)
+  if (!entry) return 'gave-up'
+  const session = entry.session
+  if (!session.hostId) return 'gave-up'
+  // The session ended normally (completed/error) between scheduling and now —
+  // don't probe/reattach, which would flip it to 'dead' with a bogus toast.
+  if (session.status === 'completed' || session.status === 'error') return 'gave-up'
+  const host = getHost(session.hostId)
+  const label = host?.label || host?.alias || session.hostId
+
+  // A manual reconnect (or the user's Retry click) may have already reattached
+  // between the drop and this tick. Detect a genuine live attach via the pty —
+  // connectionState alone is stale ('live' is never reset on a bare drop).
+  if (session.connectionState === 'live' && hasPty(id)) return 'recovered'
+
+  try {
+    await reconnectRemoteSession(id)
+  } catch {
+    // connectionState set inside doReconnectRemoteSession is authoritative.
+  }
+
+  const after = sessions.get(id)?.session
+  if (!after) return 'gave-up'
+
+  if (after.connectionState === 'live') {
+    emitToast({ severity: 'info', title: `Reconnected to ${label}` })
+    return 'recovered'
+  }
+  if (after.status === 'dead') {
+    // Remote tmux confirmed gone — retrying is futile.
+    emitToast({ severity: 'error', title: `${label}: remote session ended` })
+    return 'gave-up'
+  }
+  if (after.connectionState === 'auth-failed') {
+    emitToast({ severity: 'error', title: `SSH authentication failed on ${label}` })
+    return 'gave-up'
+  }
+  return 'retry'
+}
+
+const reconnectScheduler = createReconnectScheduler({
+  attempt: attemptAutoReconnect,
+  config: getReconnectConfig,
+})
+
+export function stopSessionManager(): void {
+  reconnectScheduler.shutdown()
+}
+
 // Eager batch probe for remaining `pending` sessions on a host that just
 // became live. Runs `tmux has-session` per sibling over the live ControlMaster
 // (no new SSH handshakes). If the runtime state is `auth-failed` /
@@ -1511,6 +1593,7 @@ async function doProbePendingSessionsOnHost(
 export async function reviveSession(id: string): Promise<void> {
   const entry = sessions.get(id)
   if (!entry) throw new Error(`Session ${id} not found`)
+  reconnectScheduler.cancel(id)
 
   const session = entry.session
   if (session.status !== 'dead')
@@ -1686,6 +1769,7 @@ export async function removeWorktree(id: string): Promise<void> {
 
 export async function removeSession(id: string): Promise<void> {
   const entry = sessions.get(id)
+  reconnectScheduler.cancel(id)
   if (entry?.session.hostId) {
     const host = getRequiredHost(entry.session.hostId)
     await destroyRemotePty(id, host)
@@ -1707,6 +1791,7 @@ export function removeSessionsForHost(hostId: string): void {
   let removed = false
   for (const [id, entry] of sessions) {
     if (entry.session.hostId !== hostId) continue
+    reconnectScheduler.cancel(id)
     detachPty(id)
     sessions.delete(id)
     removed = true
@@ -1719,6 +1804,10 @@ const cleanupInProgress = new Set<string>()
 async function promptCleanup(id: string): Promise<void> {
   if (cleanupInProgress.has(id)) return
   cleanupInProgress.add(id)
+  // The agent ended normally (this fires from the session.end hook, which only
+  // arrives over a live connection). Cancel any auto-reconnect a racing PTY
+  // exit scheduled so it can't flip the session to 'dead' mid-cleanup.
+  reconnectScheduler.cancel(id)
   try {
     const entry = sessions.get(id)
     if (!entry) return
