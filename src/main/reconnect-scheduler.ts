@@ -35,6 +35,12 @@ interface Entry {
   handle: TimerHandle
   attemptNo: number
   canceled: boolean
+  // True only while the awaited attempt is in flight. A fresh schedule() during
+  // that window can't arm a new timer (the entry still occupies the map), so it
+  // records `rearm` and fire() restarts the backoff once the attempt resolves —
+  // otherwise a re-drop mid-reconnect would be silently lost.
+  running: boolean
+  rearm: boolean
 }
 
 export function createReconnectScheduler(deps: ReconnectSchedulerDeps): ReconnectScheduler {
@@ -58,24 +64,34 @@ export function createReconnectScheduler(deps: ReconnectSchedulerDeps): Reconnec
     const ms = delayFor(attemptNo, deps.config())
     const handle = setTimer(() => void fire(sessionId), ms)
     handle.unref?.()
-    entries.set(sessionId, { handle, attemptNo, canceled: false })
+    entries.set(sessionId, { handle, attemptNo, canceled: false, running: false, rearm: false })
   }
 
   async function fire(sessionId: string): Promise<void> {
     const entry = entries.get(sessionId)
     if (!entry || stopped) return
 
+    entry.running = true
     let outcome: AttemptOutcome
     try {
       outcome = await deps.attempt(sessionId)
     } catch {
       outcome = 'retry'
     }
+    entry.running = false
 
     // Drop the result if we were canceled or shut down while the attempt was
     // in flight, or if a fresh schedule replaced this entry.
     if (stopped || entry.canceled) return
     if (entries.get(sessionId) !== entry) return
+
+    // A fresh drop arrived while this attempt was in flight (e.g. the reattached
+    // PTY died again). Restart the backoff so that disconnect isn't lost, even
+    // if this attempt "succeeded" — the session is down again.
+    if (entry.rearm) {
+      arm(sessionId, 0)
+      return
+    }
 
     if (outcome === 'retry') {
       arm(sessionId, entry.attemptNo + 1)
@@ -104,7 +120,14 @@ export function createReconnectScheduler(deps: ReconnectSchedulerDeps): Reconnec
     schedule(sessionId) {
       if (stopped) return
       if (!deps.config().enabled) return
-      if (entries.has(sessionId)) return // idempotent — don't stack timers
+      const existing = entries.get(sessionId)
+      if (existing) {
+        // A timer is pending or an attempt is in flight. A merely-pending timer
+        // already covers this drop; but if an attempt is in flight, record the
+        // fresh drop so fire() re-arms afterward instead of silently losing it.
+        if (existing.running) existing.rearm = true
+        return
+      }
       arm(sessionId, 0)
     },
     cancel,

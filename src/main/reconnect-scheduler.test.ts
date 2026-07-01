@@ -185,6 +185,43 @@ describe('reconnect-scheduler', () => {
     expect(timers.timers).toHaveLength(0)
   })
 
+  it('re-arms when a fresh schedule arrives during an in-flight attempt', async () => {
+    const timers = fakeTimers()
+    let resolveAttempt!: (o: AttemptOutcome) => void
+    const attempt = vi.fn().mockImplementation(
+      () =>
+        new Promise<AttemptOutcome>((r) => {
+          resolveAttempt = r
+        })
+    )
+    const scheduler = createReconnectScheduler({
+      attempt,
+      config: config(),
+      setTimer: timers.setTimer,
+      clearTimer: timers.clearTimer,
+      random: () => 0,
+    })
+
+    scheduler.schedule('s1')
+    timers.last().fn() // fire → attempt is now in flight (pending)
+    await flush()
+    expect(attempt).toHaveBeenCalledTimes(1)
+    expect(timers.timers).toHaveLength(1)
+
+    // A fresh drop arrives WHILE the attempt is in flight (e.g. the reattached
+    // PTY died again). It must not be swallowed by the idempotency guard.
+    scheduler.schedule('s1')
+    expect(timers.timers).toHaveLength(1) // still in flight, no new timer yet
+
+    // The attempt reports success — normally it would stop. The mid-flight drop
+    // must force a fresh re-arm so the new disconnect isn't lost.
+    resolveAttempt('recovered')
+    await flush()
+
+    expect(timers.timers).toHaveLength(2)
+    expect(timers.last().ms).toBe(500) // fresh backoff at attempt 0
+  })
+
   it('shutdown cancels all timers and makes further scheduling a no-op', () => {
     const timers = fakeTimers()
     const scheduler = createReconnectScheduler({
