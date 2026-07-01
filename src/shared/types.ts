@@ -1,11 +1,6 @@
 export type SessionStatus = 'running' | 'needs_input' | 'idle' | 'completed' | 'error' | 'dead'
 export type ConnectionState =
-  | 'connecting'
-  | 'live'
-  | 'offline'
-  | 'pending'
-  | 'auth-failed'
-  | 'unreachable'
+  'connecting' | 'live' | 'offline' | 'pending' | 'auth-failed' | 'unreachable'
 
 export interface LastKnownState {
   text: string
@@ -159,11 +154,7 @@ export interface RemoteProject {
 }
 
 export type ValidateRemoteRepoReason =
-  | 'not-a-git-repo'
-  | 'auth-failed'
-  | 'network'
-  | 'dep-missing'
-  | 'unknown'
+  'not-a-git-repo' | 'auth-failed' | 'network' | 'dep-missing' | 'unknown'
 
 export interface ValidateRemoteRepoResult {
   ok: boolean
