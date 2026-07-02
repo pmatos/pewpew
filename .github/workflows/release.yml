@@ -41,8 +41,10 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:
-      - name: Checkout (full history for tagging)
-        uses: actions/checkout@v7
+      # This job pushes the version bump commit + tag, so checkout credentials
+      # must persist for the later `git push` steps — artipacked is expected here.
+      - name: Checkout (full history for tagging) # zizmor: ignore[artipacked]
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
         with:
           fetch-depth: 0
           token: ${{ secrets.GITHUB_TOKEN }}
@@ -54,7 +56,7 @@ jobs:
             exit 1
           fi
 
-      - uses: actions/setup-node@v6
+      - uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e # v6.4.0
         with:
           node-version: 20
           cache: npm
@@ -82,12 +84,15 @@ jobs:
 
       - name: Bump version
         id: bump
+        env:
+          VERSION: ${{ inputs.version }}
+          BUMP: ${{ inputs.bump }}
         run: |
           set -euo pipefail
-          if [ -n "${{ inputs.version }}" ]; then
-            NEW_VERSION="$(npm version "${{ inputs.version }}" --no-git-tag-version)"
+          if [ -n "$VERSION" ]; then
+            NEW_VERSION="$(npm version "$VERSION" --no-git-tag-version)"
           else
-            NEW_VERSION="$(npm version "${{ inputs.bump }}" --no-git-tag-version)"
+            NEW_VERSION="$(npm version "$BUMP" --no-git-tag-version)"
           fi
           # `npm version` returns the new version prefixed with `v`
           echo "version=${NEW_VERSION#v}" >> "$GITHUB_OUTPUT"
@@ -95,10 +100,12 @@ jobs:
           echo "Bumped to ${NEW_VERSION}"
 
       - name: Commit + tag
+        env:
+          TAG: ${{ steps.bump.outputs.tag }}
         run: |
           git add package.json package-lock.json
-          git commit -m "chore(release): ${{ steps.bump.outputs.tag }}"
-          git tag -a "${{ steps.bump.outputs.tag }}" -m "Release ${{ steps.bump.outputs.tag }}"
+          git commit -m "chore(release): $TAG"
+          git tag -a "$TAG" -m "Release $TAG"
 
       - name: Build Linux artifacts (AppImage + deb)
         env:
@@ -116,23 +123,28 @@ jobs:
           for f in release/*.AppImage release/*.deb release/latest-linux.yml; do
             cp "$f" ./release-upload/
           done
-          (cd ./release-upload && sha256sum * > SHA256SUMS.txt)
+          (cd ./release-upload && sha256sum -- * > SHA256SUMS.txt)
           ls -la ./release-upload
 
       - name: Push version bump + tag
+        env:
+          TAG: ${{ steps.bump.outputs.tag }}
         run: |
           git push origin "HEAD:${GITHUB_REF_NAME}"
-          git push origin "${{ steps.bump.outputs.tag }}"
+          git push origin "$TAG"
 
       - name: Create GitHub Release
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ steps.bump.outputs.tag }}
+          DRAFT: ${{ inputs.draft }}
+          PRERELEASE: ${{ inputs.prerelease }}
         run: |
           set -euo pipefail
-          args=(--generate-notes --title "${{ steps.bump.outputs.tag }}")
-          if [ "${{ inputs.draft }}" = "true" ]; then args+=(--draft); fi
-          if [ "${{ inputs.prerelease }}" = "true" ]; then args+=(--prerelease); fi
-          gh release create "${{ steps.bump.outputs.tag }}" \
+          args=(--generate-notes --title "$TAG")
+          if [ "$DRAFT" = "true" ]; then args+=(--draft); fi
+          if [ "$PRERELEASE" = "true" ]; then args+=(--prerelease); fi
+          gh release create "$TAG" \
             "${args[@]}" \
             ./release-upload/*
 
@@ -147,7 +159,7 @@ jobs:
 
       - name: Upload build artifacts (for debugging / reruns)
         if: always()
-        uses: actions/upload-artifact@v7
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: linux-artifacts-${{ steps.bump.outputs.tag }}
           path: release-upload/
