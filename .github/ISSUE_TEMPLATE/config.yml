@@ -1,0 +1,2 @@
+# Keep blank issues enabled so maintainers can file free-form tracking issues.
+blank_issues_enabled: true

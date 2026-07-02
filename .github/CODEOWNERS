@@ -1,0 +1,5 @@
+# Code owners for pewpew. The owner is auto-requested for review on PRs that
+# touch matching paths. See https://docs.github.com/articles/about-code-owners
+#
+# Default owner for everything in the repository.
+* @pmatos
