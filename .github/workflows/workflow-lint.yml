@@ -1,0 +1,45 @@
+name: Workflow Lint
+
+on:
+  pull_request:
+    paths:
+      - '.github/workflows/**'
+      - '.github/actionlint.yaml'
+      - '.github/zizmor.yml'
+  push:
+    branches: [main]
+    paths:
+      - '.github/workflows/**'
+  workflow_dispatch:
+
+concurrency:
+  group: workflow-lint-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+permissions:
+  contents: read
+
+jobs:
+  lint:
+    name: actionlint + zizmor
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false
+
+      # actionlint (with the bundled shellcheck) validates workflow syntax,
+      # expression typos, and `run:` shell scripts. Pinned by image digest.
+      - name: actionlint
+        run: |
+          docker run --rm -v "$GITHUB_WORKSPACE:/repo:ro" --workdir /repo \
+            rhysd/actionlint@sha256:b1934ee5f1c509618f2508e6eb47ee0d3520686341fec936f3b79331f9315667 \
+            -color
+
+      # zizmor audits workflows for supply-chain / injection issues. Pinned by
+      # version; GH_TOKEN lets it resolve action pinning metadata.
+      - name: zizmor
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: pipx run --spec zizmor==1.26.1 zizmor --persona=regular --min-severity=low .github/workflows
