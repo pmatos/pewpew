@@ -29,63 +29,22 @@ pewpew is a desktop GUI (Electron + TypeScript + React) for launching, monitorin
 
 ## Testing with Chrome DevTools Protocol
 
-`npm run dev:debug` builds and launches with `--remote-debugging-port=9229`. This enables CDP-based testing:
+`npm run dev:debug` builds and launches the app with `--remote-debugging-port=9229`, exposing a CDP endpoint at `http://127.0.0.1:9229`.
 
-To take a screenshot and view it:
+A committed `.mcp.json` wires the [`chrome-devtools-mcp`](https://github.com/ChromeDevTools/chrome-devtools-mcp) server to that endpoint, so Claude Code gets first-class browser tools (`take_screenshot`, `click`, `evaluate_script`, `list_pages`, …) instead of hand-rolled CDP scripts.
 
-```bash
-node -e "
-const ws = require('ws');
-const fs = require('fs');
-const pageId = JSON.parse(require('child_process').execSync('curl -s http://127.0.0.1:9229/json/list'))[0].id;
-const socket = new ws('ws://127.0.0.1:9229/devtools/page/' + pageId);
-socket.on('open', () => socket.send(JSON.stringify({id:1, method:'Page.captureScreenshot', params:{format:'png'}})));
-socket.on('message', (d) => { const m = JSON.parse(d.toString()); if(m.result?.data) { fs.writeFileSync('/tmp/pewpew-screenshot.png', Buffer.from(m.result.data,'base64')); socket.close(); }});
-"
-```
+Workflow:
 
-Then `Read /tmp/pewpew-screenshot.png` to view the UI visually.
+1. Start the debug build and leave it running: `npm run dev:debug`.
+2. Drive the renderer through the `chrome-devtools` MCP tools — screenshot the canvas, query/inspect the DOM, click session cards — and verify visual changes yourself rather than asking the user to test manually.
 
-### Automated UI debugging workflow
-
-Port 9229 may conflict with pewpew's own tmux server. If so, use a different port:
+The committed config targets port 9229. If that conflicts with pewpew's own tmux server, launch on another port and update the `--browserUrl` arg in `.mcp.json` to match:
 
 ```bash
 npx electron-vite build && npx electron --remote-debugging-port=9333 .
 ```
 
-To interact with the app via CDP (click elements, take timed screenshots):
-
-```js
-const WebSocket = require('ws')
-const fs = require('fs')
-const WS_URL = 'ws://127.0.0.1:9333/devtools/page/<PAGE_ID>'
-const socket = new WebSocket(WS_URL)
-let id = 0
-const pending = {}
-function send(method, params) {
-  const i = ++id
-  return new Promise((resolve) => {
-    pending[i] = resolve
-    socket.send(JSON.stringify({ id: i, method, params }))
-  })
-}
-socket.on('message', (d) => {
-  const m = JSON.parse(d.toString())
-  if (pending[m.id]) {
-    pending[m.id](m)
-    delete pending[m.id]
-  }
-})
-```
-
-Useful CDP methods:
-
-- `Runtime.evaluate` — run JS in the page (query DOM, check state)
-- `Page.captureScreenshot` — take PNG screenshot
-- `Input.dispatchMouseEvent` — click at coordinates (send mousePressed + mouseReleased)
-
-When debugging visual issues, **always use this approach first** rather than asking the user to test manually. Build, launch with CDP, take screenshots at key moments, and verify the fix yourself. Use `Runtime.evaluate` to query DOM element positions, then `Input.dispatchMouseEvent` to click them.
+When debugging visual issues, **always drive the running app yourself first**: build, launch with CDP, screenshot at key moments, and confirm the fix.
 
 ## Code Style
 
