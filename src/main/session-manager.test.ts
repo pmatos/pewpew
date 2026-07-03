@@ -2112,55 +2112,6 @@ describe('selectNumbersToOpen', () => {
   })
 })
 
-describe('ghApiOpenItemsArgs', () => {
-  it('uses paginated REST calls for PR numbers', async () => {
-    const sm = await loadSessionManager()
-    expect(sm.ghApiOpenItemsArgs('pr', 'owner/repo')).toEqual([
-      'api',
-      '--paginate',
-      'repos/owner/repo/pulls?state=open&per_page=100',
-      '--jq',
-      '.[].number',
-    ])
-  })
-
-  it('uses paginated REST calls for issue numbers without including PRs', async () => {
-    const sm = await loadSessionManager()
-    expect(sm.ghApiOpenItemsArgs('issue', 'owner/repo')).toEqual([
-      'api',
-      '--paginate',
-      'repos/owner/repo/issues?state=open&per_page=100',
-      '--jq',
-      '.[] | select(.pull_request | not) | .number',
-    ])
-  })
-
-  it('appends an encoded labels filter for issues when a label is given', async () => {
-    const sm = await loadSessionManager()
-    expect(sm.ghApiOpenItemsArgs('issue', 'owner/repo', 'bug')).toEqual([
-      'api',
-      '--paginate',
-      'repos/owner/repo/issues?state=open&per_page=100&labels=bug',
-      '--jq',
-      '.[] | select(.pull_request | not) | .number',
-    ])
-  })
-
-  it('url-encodes labels containing spaces', async () => {
-    const sm = await loadSessionManager()
-    expect(sm.ghApiOpenItemsArgs('issue', 'owner/repo', 'good first issue')[2]).toBe(
-      'repos/owner/repo/issues?state=open&per_page=100&labels=good%20first%20issue'
-    )
-  })
-
-  it('ignores the label for PRs', async () => {
-    const sm = await loadSessionManager()
-    expect(sm.ghApiOpenItemsArgs('pr', 'owner/repo', 'bug')[2]).toBe(
-      'repos/owner/repo/pulls?state=open&per_page=100'
-    )
-  })
-})
-
 describe('openSessionsForOpenPrs', () => {
   it('lists open PRs, skips ones that already have a session, creates the rest', async () => {
     const sm = await loadSessionManager()
@@ -2302,17 +2253,6 @@ describe('countOpenIssues', () => {
       listIssues: async () => 'Failed to list open issues: gh auth failed',
     })
     expect(result).toBe('Failed to list open issues: gh auth failed')
-  })
-})
-
-describe('parseLabelLines', () => {
-  it('splits, trims, and drops blank lines', async () => {
-    const sm = await loadSessionManager()
-    expect(sm.parseLabelLines('bug\nenhancement\n\n  good first issue ')).toEqual([
-      'bug',
-      'enhancement',
-      'good first issue',
-    ])
   })
 })
 

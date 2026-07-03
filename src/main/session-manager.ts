@@ -45,6 +45,19 @@ import { classifySshExit } from './ssh-exit-parser'
 import { applyHookEvent, type SideEffectIntent } from './session-state-machine'
 import { exec as execRemote, runtimeStateFor, type HostConnectionState } from './host-connection'
 import { remoteHostRuntime, type PreparedRemoteHostLease } from './remote-host-runtime'
+import {
+  createPrLookup,
+  describeGhError,
+  describePrLookupFailure,
+  forkFieldsFromPr,
+  ghApiOpenItemsArgs,
+  parseLabelLines,
+  parseNumberedGhLines,
+  parseOwnerFromRemoteUrl,
+  PR_VIEW_FIELDS,
+  type NumberedGhItem,
+  type PrViewInfo,
+} from './github'
 import type {
   AgentTool,
   CreateSessionOptions,
@@ -190,8 +203,7 @@ function getOriginOwner(projectPath: string): string | undefined {
       encoding: 'utf-8',
       timeout: 5000,
     }).trim()
-    const m = url.match(/(?:[:/])([^/:]+)\/[^/]+?(?:\.git)?\/?$/)
-    return m?.[1]
+    return parseOwnerFromRemoteUrl(url)
   } catch {
     return undefined
   }
@@ -271,56 +283,17 @@ async function remoteBranchExists(
   }
 }
 
-// Positive hits are cached forever; negative hits (no PR yet / gh transient
-// error) are retained only for NEGATIVE_CACHE_TTL_MS so a PR opened after the
-// session was created can be picked up without requiring an app restart.
-const NEGATIVE_CACHE_TTL_MS = 5 * 60 * 1000
-const prLookupCache = new Map<string, { value: number | null; checkedAt: number }>()
-
-async function lookupPrForBranch(projectPath: string, branch: string): Promise<number | undefined> {
-  const key = `${projectPath}::${branch}`
-  const cached = prLookupCache.get(key)
-  if (cached) {
-    if (cached.value !== null) return cached.value
-    if (Date.now() - cached.checkedAt < NEGATIVE_CACHE_TTL_MS) return undefined
-  }
-  try {
-    const { stdout } = await execFileAsync(
-      'gh',
-      [
-        'pr',
-        'list',
-        '--head',
-        branch,
-        '--state',
-        'open',
-        '--json',
-        'number,headRepositoryOwner',
-        '--limit',
-        '10',
-      ],
-      { cwd: projectPath }
-    )
-    const parsed = JSON.parse(stdout) as {
-      number: number
-      headRepositoryOwner?: { login?: string } | null
-    }[]
-    // `gh pr list --head <branch>` filters by branch name only (owner:branch
-    // isn't supported), so in repos that accept fork PRs a common branch name
-    // like `main` or `fix` can return an unrelated PR. Prefer the entry whose
-    // head repo owner matches the local origin's owner; fall back to the top
-    // result so upstream clones tracking a contributor's branch (where the
-    // head owner differs from origin) still get a PR number.
-    const owner = getOriginOwner(projectPath)
-    const match = (owner && parsed.find((p) => p.headRepositoryOwner?.login === owner)) || parsed[0]
-    const num = match?.number
-    prLookupCache.set(key, { value: num ?? null, checkedAt: Date.now() })
-    return num
-  } catch {
-    // Don't cache transient gh failures — next call retries immediately.
-    return undefined
-  }
-}
+// Resolve a branch to its open PR number via `gh`, with origin-owner
+// disambiguation and a TTL cache. The gateway itself lives in ./github; here we
+// wire it to the real `gh` binary and wall clock.
+const prLookup = createPrLookup({
+  runGh: async (args, cwd) => {
+    const { stdout } = await execFileAsync('gh', args, { cwd })
+    return { stdout: String(stdout) }
+  },
+  resolveOwner: getOriginOwner,
+  now: () => Date.now(),
+})
 
 function resolvePrNumberAsync(sessionId: string): void {
   const entry = sessions.get(sessionId)
@@ -328,7 +301,7 @@ function resolvePrNumberAsync(sessionId: string): void {
   if (entry.session.hostId) return
   const { projectPath, branch } = entry.session
   if (!branch) return
-  lookupPrForBranch(projectPath, branch).then((num) => {
+  prLookup.lookup(projectPath, branch).then((num) => {
     if (num === undefined) return
     const current = sessions.get(sessionId)
     if (!current || current.session.prNumber !== undefined) return
@@ -973,42 +946,6 @@ async function createRemoteSession(
 // Fields gh returns for a PR. Beyond head branch/state/title we read the
 // cross-repository flag and the head repo identity so a fork PR can be both
 // checked out (via refs/pull/<n>/head) and marked as such on the session.
-interface PrViewInfo {
-  headRefName: string
-  state: string
-  title: string
-  isCrossRepository?: boolean
-  headRepositoryOwner?: { login?: string } | null
-  headRepository?: { name?: string } | null
-}
-
-const PR_VIEW_FIELDS =
-  'headRefName,state,title,isCrossRepository,headRepositoryOwner,headRepository'
-
-function forkFieldsFromPr(prInfo: PrViewInfo): { prIsFork?: boolean; prHeadRepo?: string } {
-  if (prInfo.isCrossRepository !== true) return {}
-  const owner = prInfo.headRepositoryOwner?.login
-  const name = prInfo.headRepository?.name
-  return { prIsFork: true, prHeadRepo: owner && name ? `${owner}/${name}` : undefined }
-}
-
-// `gh pr view` fails for many reasons beyond the PR genuinely not existing —
-// rate limiting, auth, network, or gh resolving the wrong default repo. Only
-// report "not found" when gh actually said the PR couldn't be resolved;
-// otherwise surface the real error so a rate-limit or auth failure isn't
-// misreported as a missing PR (which sends the user hunting for a PR that's
-// right there on GitHub).
-function describePrLookupFailure(prNumber: number, detail: string): string {
-  const trimmed = detail.trim()
-  const genuinelyMissing =
-    /could not resolve to a (pull ?request|issue)/i.test(trimmed) ||
-    /no pull requests? found/i.test(trimmed)
-  if (!trimmed || genuinelyMissing) {
-    return `PR #${prNumber} not found in this repository.`
-  }
-  return `Failed to look up PR #${prNumber}: ${trimmed}`
-}
-
 async function localBranchExists(runGit: GitRunner, branch: string): Promise<boolean> {
   try {
     await runGit(['rev-parse', '--verify', '--quiet', `refs/heads/${branch}`])
@@ -1859,7 +1796,6 @@ export function selectNumbersToOpen<T extends { number: number }>(
   return { toCreate, toSkip }
 }
 
-type NumberedGhItem = { number: number }
 type ListNumberedItems = (
   projectPath: string,
   hostId: string | null
@@ -1899,47 +1835,6 @@ interface CreatePrSessionDeps {
     label?: string,
     tool?: AgentTool
   ) => Promise<Session>
-}
-
-function describeGhError(err: unknown): string {
-  const detail =
-    typeof err === 'object' && err !== null && 'stderr' in err
-      ? String((err as { stderr?: unknown }).stderr ?? '').trim()
-      : ''
-  if (detail) return detail
-  if (err instanceof Error) return err.message.replace(/^Error:\s*/, '')
-  return String(err)
-}
-
-export function ghApiOpenItemsArgs(kind: 'pr' | 'issue', repo: string, label?: string): string[] {
-  const labelQuery = kind === 'issue' && label ? `&labels=${encodeURIComponent(label)}` : ''
-  const endpoint =
-    kind === 'pr'
-      ? `repos/${repo}/pulls?state=open&per_page=100`
-      : `repos/${repo}/issues?state=open&per_page=100${labelQuery}`
-  const jq = kind === 'pr' ? '.[].number' : '.[] | select(.pull_request | not) | .number'
-  return ['api', '--paginate', endpoint, '--jq', jq]
-}
-
-function parseNumberedGhLines(stdout: string, label: string): NumberedGhItem[] {
-  const items: NumberedGhItem[] = []
-  for (const raw of stdout.split(/\r?\n/)) {
-    const line = raw.trim()
-    if (!line) continue
-    const number = Number(line)
-    if (!Number.isInteger(number) || number <= 0) {
-      throw new Error(`Expected ${label} number, got ${JSON.stringify(line)}.`)
-    }
-    items.push({ number })
-  }
-  return items
-}
-
-export function parseLabelLines(stdout: string): string[] {
-  return stdout
-    .split(/\r?\n/)
-    .map((line) => line.trim())
-    .filter((line) => line.length > 0)
 }
 
 async function listLocalOpenGhItems(
