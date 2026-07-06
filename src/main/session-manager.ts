@@ -43,6 +43,7 @@ import { getHost } from './host-registry'
 import { listRemoteProjects } from './remote-project-registry'
 import { classifySshExit } from './ssh-exit-parser'
 import { applyHookEvent, type SideEffectIntent } from './session-state-machine'
+import { deriveRestoredState } from './restore-planner'
 import { exec as execRemote, runtimeStateFor, type HostConnectionState } from './host-connection'
 import { remoteHostRuntime, type PreparedRemoteHostLease } from './remote-host-runtime'
 import type {
@@ -2769,67 +2770,27 @@ export function restoreSessions(): void {
 
     for (const session of data) {
       session.hostId = session.hostId ?? null
+
+      // Pure decision core: given the persisted status and local environment,
+      // derive the restored status/connectionState. See restore-planner.ts.
+      // The `existsSync` probe is guarded to local sessions — a remote worktree
+      // path must never be stat'd on the host running the app.
+      const derived = deriveRestoredState(session, {
+        hasLiveTmux: liveTmuxIds.has(session.id),
+        worktreeExists: !session.hostId && existsSync(session.worktreePath),
+        tmuxAvailable,
+      })
+      session.status = derived.status
+      session.connectionState = derived.connectionState
+      if (derived.outcome === 'defer') deferredCount++
+      if (derived.outcome === 'dead-no-tmux') skippedForNoTmux++
+
       if (session.hostId) {
-        // Lazy restore: a remote session materializes in `pending` until the
-        // user's first click (or reconnectRemoteSession) opens the host's SSH
-        // control connection and probes tmux. No network I/O here.
-        // `running` → `idle` matches the local "resumedStatus" mapping; a
-        // persisted status of `dead` means the remote tmux is confirmed gone
-        // and there is nothing to reconnect to, so leave connectionState unset.
-        if (session.status === 'running') {
-          session.status = 'idle'
-        }
-        if (session.status !== 'dead') {
-          session.connectionState = 'pending'
-        }
         backfillDerivedFields(session)
         sessions.set(session.id, { session })
         continue
       }
 
-      // Drop any persisted `connectionState`; the lazy-restore branch below
-      // will set it back to 'pending'. Without this, a session that ended up
-      // 'dead' on a later run (worktree gone, tmux unavailable, or completed/
-      // error with no live tmux) would still carry the previous run's
-      // 'pending', causing the renderer mount effects + attachLocalSession to
-      // try to materialize an entry that's supposed to stay terminated.
-      session.connectionState = undefined
-
-      if (
-        session.status === 'running' ||
-        session.status === 'idle' ||
-        session.status === 'needs_input'
-      ) {
-        // Preserve `needs_input` so the tray/status-bar attention signals
-        // (tray.ts, StatusBar.tsx) survive a restart — claude --continue
-        // resumes mid-wait, so the user still needs to answer.
-        const resumedStatus: SessionStatus =
-          session.status === 'needs_input' ? 'needs_input' : 'idle'
-        if (liveTmuxIds.has(session.id)) {
-          session.status = resumedStatus
-        } else if (!existsSync(session.worktreePath)) {
-          session.status = 'dead'
-        } else if (!tmuxAvailable) {
-          session.status = 'dead'
-          skippedForNoTmux++
-        } else {
-          // Lazy restore (mirrors the remote arm above): mark the session
-          // 'pending' and defer the tmux + agent spawn until the user opens
-          // the card. Spawning all persisted sessions up-front cost ~1 GB
-          // each (claude RSS) and OOM'd the box when many sessions existed.
-          // attachLocalSession() drives the on-demand spawn.
-          session.status = resumedStatus
-          session.connectionState = 'pending'
-          deferredCount++
-        }
-      } else if (session.status === 'completed' || session.status === 'error') {
-        // Terminal states: if the tmux session is gone, the card shouldn't
-        // claim the session is still alive. Don't auto-recover — the
-        // conversation already ended.
-        if (!liveTmuxIds.has(session.id)) {
-          session.status = 'dead'
-        }
-      }
       // Migrate legacy symlink-form paths to canonical so renderer matches work.
       session.worktreePath = canonicalPath(session.worktreePath)
       backfillDerivedFields(session)
