@@ -52,8 +52,17 @@ import {
 } from './github-items'
 import { applyHookEvent, type SideEffectIntent } from './session-state-machine'
 import { deriveRestoredState } from './restore-planner'
+import { planIssueWorktree } from './worktree-plan'
+import {
+  PR_VIEW_FIELDS,
+  describePrLookupFailure,
+  forkPullRefUnavailableMessage,
+  planPrWorktree,
+  type PrViewInfo,
+} from './pr-worktree-planner'
 import { exec as execRemote, runtimeStateFor, type HostConnectionState } from './host-connection'
 import { remoteHostRuntime, type PreparedRemoteHostLease } from './remote-host-runtime'
+import { createPrLookup, parseOwnerFromRemoteUrl } from './github'
 import type {
   AgentTool,
   CreateSessionOptions,
@@ -199,8 +208,7 @@ function getOriginOwner(projectPath: string): string | undefined {
       encoding: 'utf-8',
       timeout: 5000,
     }).trim()
-    const m = url.match(/(?:[:/])([^/:]+)\/[^/]+?(?:\.git)?\/?$/)
-    return m?.[1]
+    return parseOwnerFromRemoteUrl(url)
   } catch {
     return undefined
   }
@@ -265,56 +273,17 @@ async function remoteBranchExists(
   }
 }
 
-// Positive hits are cached forever; negative hits (no PR yet / gh transient
-// error) are retained only for NEGATIVE_CACHE_TTL_MS so a PR opened after the
-// session was created can be picked up without requiring an app restart.
-const NEGATIVE_CACHE_TTL_MS = 5 * 60 * 1000
-const prLookupCache = new Map<string, { value: number | null; checkedAt: number }>()
-
-async function lookupPrForBranch(projectPath: string, branch: string): Promise<number | undefined> {
-  const key = `${projectPath}::${branch}`
-  const cached = prLookupCache.get(key)
-  if (cached) {
-    if (cached.value !== null) return cached.value
-    if (Date.now() - cached.checkedAt < NEGATIVE_CACHE_TTL_MS) return undefined
-  }
-  try {
-    const { stdout } = await execFileAsync(
-      'gh',
-      [
-        'pr',
-        'list',
-        '--head',
-        branch,
-        '--state',
-        'open',
-        '--json',
-        'number,headRepositoryOwner',
-        '--limit',
-        '10',
-      ],
-      { cwd: projectPath }
-    )
-    const parsed = JSON.parse(stdout) as {
-      number: number
-      headRepositoryOwner?: { login?: string } | null
-    }[]
-    // `gh pr list --head <branch>` filters by branch name only (owner:branch
-    // isn't supported), so in repos that accept fork PRs a common branch name
-    // like `main` or `fix` can return an unrelated PR. Prefer the entry whose
-    // head repo owner matches the local origin's owner; fall back to the top
-    // result so upstream clones tracking a contributor's branch (where the
-    // head owner differs from origin) still get a PR number.
-    const owner = getOriginOwner(projectPath)
-    const match = (owner && parsed.find((p) => p.headRepositoryOwner?.login === owner)) || parsed[0]
-    const num = match?.number
-    prLookupCache.set(key, { value: num ?? null, checkedAt: Date.now() })
-    return num
-  } catch {
-    // Don't cache transient gh failures — next call retries immediately.
-    return undefined
-  }
-}
+// Resolve a branch to its open PR number via `gh`, with origin-owner
+// disambiguation and a TTL cache. The gateway itself lives in ./github; here we
+// wire it to the real `gh` binary and wall clock.
+const prLookup = createPrLookup({
+  runGh: async (args, cwd) => {
+    const { stdout } = await execFileAsync('gh', args, { cwd })
+    return { stdout: String(stdout) }
+  },
+  resolveOwner: getOriginOwner,
+  now: () => Date.now(),
+})
 
 function resolvePrNumberAsync(sessionId: string): void {
   const entry = sessions.get(sessionId)
@@ -322,7 +291,7 @@ function resolvePrNumberAsync(sessionId: string): void {
   if (entry.session.hostId) return
   const { projectPath, branch } = entry.session
   if (!branch) return
-  lookupPrForBranch(projectPath, branch).then((num) => {
+  prLookup.lookup(projectPath, branch).then((num) => {
     if (num === undefined) return
     const current = sessions.get(sessionId)
     if (!current || current.session.prNumber !== undefined) return
@@ -964,58 +933,11 @@ async function createRemoteSession(
   return session
 }
 
-// Fields gh returns for a PR. Beyond head branch/state/title we read the
-// cross-repository flag and the head repo identity so a fork PR can be both
-// checked out (via refs/pull/<n>/head) and marked as such on the session.
-interface PrViewInfo {
-  headRefName: string
-  state: string
-  title: string
-  isCrossRepository?: boolean
-  headRepositoryOwner?: { login?: string } | null
-  headRepository?: { name?: string } | null
-}
-
-const PR_VIEW_FIELDS =
-  'headRefName,state,title,isCrossRepository,headRepositoryOwner,headRepository'
-
 // `gh pr view` args for a PR, targeting an explicit repo (a fork's upstream)
 // when given so gh doesn't resolve the wrong default repo.
 export function ghPrViewArgs(prNumber: number, repo?: string | null): string[] {
   const args = ['pr', 'view', String(prNumber), '--json', PR_VIEW_FIELDS]
   return repo ? [...args, '--repo', repo] : args
-}
-
-// Where to fetch a PR head's refs/pull/<n>/head from. With no override the head
-// lives on origin; an override (the PR's own repo, e.g. a fork's upstream)
-// exposes the pull ref on its own GitHub URL, which we fetch directly so we
-// don't need a named remote for it.
-export function prHeadFetchRemote(repo?: string | null): string {
-  return repo ? `https://github.com/${repo}.git` : 'origin'
-}
-
-function forkFieldsFromPr(prInfo: PrViewInfo): { prIsFork?: boolean; prHeadRepo?: string } {
-  if (prInfo.isCrossRepository !== true) return {}
-  const owner = prInfo.headRepositoryOwner?.login
-  const name = prInfo.headRepository?.name
-  return { prIsFork: true, prHeadRepo: owner && name ? `${owner}/${name}` : undefined }
-}
-
-// `gh pr view` fails for many reasons beyond the PR genuinely not existing —
-// rate limiting, auth, network, or gh resolving the wrong default repo. Only
-// report "not found" when gh actually said the PR couldn't be resolved;
-// otherwise surface the real error so a rate-limit or auth failure isn't
-// misreported as a missing PR (which sends the user hunting for a PR that's
-// right there on GitHub).
-function describePrLookupFailure(prNumber: number, detail: string): string {
-  const trimmed = detail.trim()
-  const genuinelyMissing =
-    /could not resolve to a (pull ?request|issue)/i.test(trimmed) ||
-    /no pull requests? found/i.test(trimmed)
-  if (!trimmed || genuinelyMissing) {
-    return `PR #${prNumber} not found in this repository.`
-  }
-  return `Failed to look up PR #${prNumber}: ${trimmed}`
 }
 
 async function localBranchExists(runGit: GitRunner, branch: string): Promise<boolean> {
@@ -1076,9 +998,9 @@ async function createRemotePrSession(
       return `Failed to parse PR metadata for #${prNumber}.`
     }
 
-    if (prInfo.state !== 'OPEN') {
-      return `PR #${prNumber} is ${prInfo.state.toLowerCase()}, not open.`
-    }
+    const planResult = planPrWorktree(prNumber, prInfo, externalRepo)
+    if (!planResult.ok) return planResult.message
+    const { branch, localBranch, isFork, forkFields, fetchRemote, fetchRefspec } = planResult.plan
 
     const effectiveTool: AgentTool = options.tool ?? getConfig().defaultTool
     const agentPath = agentPaths[effectiveTool]
@@ -1086,64 +1008,30 @@ async function createRemotePrSession(
       return `${effectiveTool} is not installed on host ${host.label || host.alias}.`
     }
 
-    const branch = prInfo.headRefName
-    const forkFields = forkFieldsFromPr(prInfo)
-    // The PR head lives outside our origin when it's a cross-repo (fork) PR OR
-    // when we target a different repo than origin (a fork opening its upstream's
-    // PR). Both need the pull-ref checkout into a namespaced branch, fetched
-    // from the repo the PR belongs to.
-    const headElsewhere = forkFields.prIsFork === true || externalRepo !== undefined
-    const headFields = {
-      ...(headElsewhere ? { prIsFork: true } : {}),
-      ...((forkFields.prHeadRepo ?? externalRepo)
-        ? { prHeadRepo: forkFields.prHeadRepo ?? externalRepo }
-        : {}),
-    }
     const id = randomUUID().slice(0, 8)
     const tmuxSession = `pewpew-${id}`
 
-    // A head-elsewhere PR's branch name isn't ours to own, so check it out under
-    // a PR-scoped local branch namespaced under `pewpew/` — both to avoid
-    // colliding with a branch that shares the name and so the forced fetch below
-    // can't clobber an unrelated user branch named `pr-<n>`. Same-repo PRs keep
-    // the real branch name so pushes update the PR via origin/<branch>.
-    const localBranch = headElsewhere ? `pewpew/${worktreeName}` : branch
-
-    // Fetch the PR head into the local branch we'll check out. A head-elsewhere
-    // PR head is ONLY authoritative via GitHub's refs/pull/<n>/head, fetched
-    // from the repo the PR belongs to (origin, or a fork's upstream when
-    // overridden): never fetch origin/<branch>, because if that branch name
-    // also exists on origin the fetch would succeed and we'd check out the wrong
-    // commits. A same-repo PR head lives on origin/<branch>, so fetch that.
-    if (headElsewhere) {
-      // Forced refspec (`+`): a removed session can leave the pewpew/ branch
-      // behind, and a later PR force-push makes a non-forced fetch reject as
-      // non-fast-forward, so remoteBranchExists would see the stale branch and
-      // the worktree would check out old commits. The pewpew/ branch is
-      // pewpew-owned and must track the current PR head.
-      await execRemote(host, [
-        'git',
-        '-C',
-        projectPath,
-        'fetch',
-        prHeadFetchRemote(externalRepo),
-        `+pull/${prNumber}/head:${localBranch}`,
-      ]).catch(() => undefined)
-    } else {
-      await execRemote(host, ['git', '-C', projectPath, 'fetch', 'origin', branch]).catch(
-        () => undefined
-      )
-    }
+    // Fetch the PR head into the local branch we'll check out; planPrWorktree
+    // picked the remote (origin, or the overridden repo's URL when a fork clone
+    // opens an upstream PR) and the refspec (a head-elsewhere PR head is
+    // force-fetched from refs/pull/<n>/head into its pewpew-namespaced branch, a
+    // same-repo head from origin/<branch>). A failure is tolerated — the branch
+    // may already be present locally, and a head-elsewhere PR that genuinely
+    // couldn't fetch is caught by the probe below.
+    await execRemote(host, ['git', '-C', projectPath, 'fetch', fetchRemote, fetchRefspec]).catch(
+      () => undefined
+    )
 
     // Pick the worktree-add form by probing for the local branch first instead
     // of try-then-fallback. The fallback masked real failures (e.g. branch
     // already checked out in a stale worktree) by surfacing the second
     // attempt's misleading "branch already exists" error.
     const branchExistsLocally = await remoteBranchExists(host, projectPath, localBranch)
-    if (headElsewhere && !branchExistsLocally) {
-      // The pull-ref fetch should have created pr-<n>; if it didn't there's no
-      // valid origin fallback for a fork (origin/<branch> isn't the PR head).
-      return `Failed to create worktree for branch "${branch}": could not fetch refs/pull/${prNumber}/head`
+    if (isFork && !branchExistsLocally) {
+      // The pull-ref fetch should have created the pewpew/ branch; if it didn't
+      // there's no valid origin fallback for a head-elsewhere PR (origin/<branch>
+      // isn't the PR head).
+      return forkPullRefUnavailableMessage(branch, prNumber)
     }
     const addArgv = branchExistsLocally
       ? ['git', '-C', projectPath, 'worktree', 'add', worktreePath, localBranch]
@@ -1185,7 +1073,7 @@ async function createRemotePrSession(
       worktreePath,
       branch: resolvedBranch,
       prNumber,
-      ...headFields,
+      ...forkFields,
       issueNumber: parseIssueNumber(worktreeName, resolvedBranch, prInfo.title),
       pid: 0,
       tmuxSession,
@@ -1339,6 +1227,17 @@ const inflightReconnects = new Map<string, Promise<ReconnectOutcome>>()
 // `startRuntime` before ensureHostConnection rejects), so auth-failed vs.
 // network-unreachable get distinct UI states without re-parsing stderr.
 export async function reconnectRemoteSession(id: string): Promise<void> {
+  // A terminal session is done — never re-probe/reconnect it. attemptAutoReconnect
+  // already bails on 'completed'/'error' before calling; guard the manual/IPC entry
+  // point too, so triggering Reconnect on a kept ('completed') or errored session
+  // can't probe-and-flip it back to 'dead', silently undoing the user's Keep.
+  // Defense-in-depth: deriveRestoredState now restores terminal remotes as 'live'
+  // (not 'pending'), so the UI no longer offers Reconnect for them — but this keeps
+  // any other caller that reaches here with a stale non-live terminal session a
+  // no-op. Mirrors the status guard in attemptAutoReconnect.
+  const current = sessions.get(id)?.session
+  if (current && (current.status === 'completed' || current.status === 'error')) return
+
   const existing = inflightReconnects.get(id)
   if (existing) {
     await existing
@@ -1420,7 +1319,14 @@ async function doReconnectRemoteSession(id: string): Promise<ReconnectOutcome> {
   try {
     lease = await remoteHostRuntime.acquirePreparedHost(host)
     const probe = await probeRemoteTmuxSession(id, host)
-    if (probe === 'present') {
+    if (session.status === 'completed' || session.status === 'error') {
+      // The session resolved to a terminal state while this probe was in flight
+      // — e.g. a delayed session.end hook drove promptCleanup and the user chose
+      // Keep (status → 'completed', connectionState → 'live'). Applying the probe
+      // result now would clobber that decision ('absent' → 'dead'), re-exposing
+      // cleanup and risking deletion of the kept worktree. Leave it untouched;
+      // the lease is still returned below so the caller reconciles/releases it.
+    } else if (probe === 'present') {
       await reattachRemotePty(id, host)
       session.connectionState = 'live'
       if (session.status === 'running') session.status = 'idle'
@@ -1493,13 +1399,33 @@ export async function attemptAutoReconnect(id: string): Promise<AttemptOutcome> 
   const after = sessions.get(id)?.session
   if (!after) return 'gave-up'
 
+  // The session resolved to terminal (a concurrent session.end → promptCleanup →
+  // Keep) while our probe was in flight; doReconnectRemoteSession left it intact.
+  // Don't toast "Reconnected" or re-drive cleanup for a session that already ended.
+  if (after.status === 'completed' || after.status === 'error') return 'gave-up'
+
   if (after.connectionState === 'live') {
     emitToast({ severity: 'info', title: `Reconnected to ${label}` })
     return 'recovered'
   }
   if (after.status === 'dead') {
-    // Remote tmux confirmed gone — retrying is futile.
-    emitToast({ severity: 'error', title: `${label}: remote session ended` })
+    // Remote tmux confirmed gone: the agent ended. The session.end hook that
+    // drives promptCleanup for a live session is unreliable over a remote link
+    // (it races the ControlMaster/reverse-forward teardown as the PTY drops, so
+    // the message is often lost before it arrives), leaving remote sessions
+    // without the "Clean up worktree?" dialog local sessions get on exit. This
+    // probe result is the dependable "session ended" signal, so prompt the same
+    // cleanup here — otherwise the card is silently left dead and the user
+    // removes it by hand, deleting the worktree with no confirmation. Fire and
+    // forget (the dialog awaits user input); promptCleanup's own in-progress
+    // guard makes a late-arriving session.end hook a no-op.
+    void promptCleanup(id).catch((err) => {
+      console.error(`promptCleanup(${id}) failed:`, err)
+      // If the dialog itself failed (no window available, Electron dialog IPC
+      // error), still surface the "session ended" signal the old synchronous
+      // toast guaranteed — a dialog failure must not silently swallow it.
+      emitToast({ severity: 'error', title: `${label}: remote session ended` })
+    })
     return 'gave-up'
   }
   if (after.connectionState === 'auth-failed') {
@@ -1551,7 +1477,18 @@ async function doProbePendingSessionsOnHost(
 
   const pending: Session[] = []
   for (const entry of sessions.values()) {
-    if (entry.session.hostId === hostId && entry.session.connectionState === 'pending') {
+    // Skip terminal (completed/error) sessions from the pending pool: probing one
+    // would find its tmux gone and flip it to 'dead', silently reverting a session
+    // the user chose to keep. deriveRestoredState now restores terminal remotes as
+    // 'live' (not 'pending'), so they shouldn't reach here — this is defense-in-depth
+    // against any other path leaving a terminal session 'pending'. Mirrors the
+    // guards in attemptAutoReconnect and reconnectRemoteSession.
+    if (
+      entry.session.hostId === hostId &&
+      entry.session.connectionState === 'pending' &&
+      entry.session.status !== 'completed' &&
+      entry.session.status !== 'error'
+    ) {
       pending.push(entry.session)
     }
   }
@@ -1582,6 +1519,15 @@ async function doProbePendingSessionsOnHost(
     }
     try {
       const probe = await probeRemoteTmuxSession(s.id, reconnectHost)
+      // The session may have resolved to terminal (a concurrent session.end →
+      // promptCleanup → Keep) while this probe was in flight — the snapshot
+      // filter above only catches sessions already terminal at batch entry.
+      // Don't clobber that decision by applying the probe result; mirrors the
+      // post-await guard in doReconnectRemoteSession.
+      if (s.status === 'completed' || s.status === 'error') {
+        await reconnectNext(index + 1)
+        return
+      }
       if (probe === 'present') {
         await reattachRemotePty(s.id, reconnectHost)
         s.connectionState = 'live'
@@ -1836,6 +1782,18 @@ async function promptCleanup(id: string): Promise<void> {
     if (!entry) return
 
     const session = entry.session
+
+    // A terminal cleanup decision was already made for this session, so bail
+    // rather than prompt again. The Keep branches below are the only producer
+    // of 'completed', and Delete removes the entry outright — so reaching
+    // promptCleanup for a 'completed'/'error' session means a late remote
+    // session.end hook (or a second probe) raced in after the first decision
+    // cleared cleanupInProgress. Re-opening the dialog would show a duplicate
+    // prompt and let a Delete destroy a worktree the user just chose to keep.
+    // Mirrors the terminal-state guards in the unexpected-exit listener and
+    // attemptAutoReconnect.
+    if (session.status === 'completed' || session.status === 'error') return
+
     const parentWindow = getMainWindow()
 
     const options = {
@@ -1852,12 +1810,31 @@ async function promptCleanup(id: string): Promise<void> {
       : await dialog.showMessageBox(options)
 
     if (response === 0) {
-      await removeSession(id)
-    } else if (response === 1) {
+      try {
+        await removeSession(id)
+      } catch (err) {
+        // Surface a Delete failure (host config removed → getRequiredHost throws,
+        // or the remote SSH teardown fails) with its own accurate error. Letting
+        // it propagate to attemptAutoReconnect's `.catch` would mislabel it
+        // "remote session ended" and mask a worktree that's still there.
+        console.error(`removeSession(${id}) failed:`, err)
+        emitToast({
+          severity: 'error',
+          title: `Failed to remove worktree "${session.projectName}/${session.worktreeName}"`,
+        })
+      }
+    } else if (response === 1 || response === 2) {
+      // Keep (1) / Keep-and-open (2): the session is finished. The probe-absent
+      // path reaches here with connectionState 'offline' (the remote tmux is
+      // gone). Leaving it non-live would make SessionCard/DetailPane treat this
+      // kept session as a droppable remote and offer a Reconnect/Retry that
+      // silently reverts it to 'dead', undoing the Keep. Normalize to 'live' —
+      // the same terminal state a live-connection completion already lands in —
+      // so a kept remote session is uniformly terminal. (Local sessions have no
+      // hostId and keep connectionState undefined.)
+      if (session.hostId) session.connectionState = 'live'
       updateSession(id, 'completed')
-    } else if (response === 2) {
-      updateSession(id, 'completed')
-      shell.openPath(session.worktreePath)
+      if (response === 2) shell.openPath(session.worktreePath)
     }
   } finally {
     cleanupInProgress.delete(id)
@@ -2083,22 +2060,10 @@ export async function createPrSession(
     return describePrLookupFailure(prNumber, describeGhError(err))
   }
 
-  if (prInfo.state !== 'OPEN') {
-    return `PR #${prNumber} is ${prInfo.state.toLowerCase()}, not open.`
-  }
-
-  const branch = prInfo.headRefName
-  const forkFields = forkFieldsFromPr(prInfo)
-  // The PR's head lives outside our origin when it's a cross-repo (fork) PR OR
-  // when we're targeting a different repo than origin (e.g. a fork opening its
-  // upstream's PR). Both need the pull-ref checkout into a namespaced branch;
-  // both mean pushes from the worktree won't update the PR.
-  const externalRepo = options.repo || undefined
-  const headElsewhere = forkFields.prIsFork === true || externalRepo !== undefined
-  const prHeadRepo = forkFields.prHeadRepo ?? externalRepo
-  const prIsFork = headElsewhere ? true : undefined
-
-  const worktreeName = `pr-${prNumber}`
+  const planResult = planPrWorktree(prNumber, prInfo, options.repo)
+  if (!planResult.ok) return planResult.message
+  const { worktreeName, branch, localBranch, isFork, forkFields, fetchRemote, fetchRefspec } =
+    planResult.plan
 
   // Reuse an existing session for this PR. First match by PR number (the only
   // globally-unique key), then — for a same-repo PR whose head branch name
@@ -2108,15 +2073,15 @@ export async function createPrSession(
   // by branch: that would hijack a different fork's session.
   const existing =
     findSessionByPrNumber(projectPath, hostId, prNumber) ??
-    (headElsewhere ? undefined : findSessionByBranch(projectPath, hostId, branch))
+    (isFork ? undefined : findSessionByBranch(projectPath, hostId, branch))
   if (existing) {
     // `gh pr view <prNumber>` just confirmed this branch belongs to the
     // requested PR, so overwrite any stale prNumber rather than only filling
     // an empty one — otherwise the requested PR is reported as linked but the
     // session keeps a different number and the PR gets offered again.
     existing.prNumber = prNumber
-    existing.prIsFork = prIsFork
-    existing.prHeadRepo = prHeadRepo
+    existing.prIsFork = forkFields.prIsFork
+    existing.prHeadRepo = forkFields.prHeadRepo
     if (existing.issueNumber === undefined) {
       existing.issueNumber = parseIssueNumber(prInfo.title)
     }
@@ -2126,48 +2091,23 @@ export async function createPrSession(
 
   const worktreePath = join(projectPath, '.claude', 'worktrees', worktreeName)
 
-  // The local branch to check out. A head-elsewhere PR's branch name isn't ours
-  // to own, so give it a PR-scoped local branch namespaced under `pewpew/`
-  // (rather than a bare `pr-<n>`) so the forced fetch below can never clobber an
-  // unrelated user branch named `pr-<n>`. Same-repo PRs keep the real branch
-  // name so pushes from the worktree update the PR via origin/<branch>.
-  const localBranch = headElsewhere ? `pewpew/${worktreeName}` : branch
-
-  // Fetch the PR head into the local branch we'll check out. A head-elsewhere PR
-  // head is ONLY authoritative via GitHub's refs/pull/<n>/head, fetched from the
-  // repo the PR belongs to (origin, or a fork's upstream when overridden): we
-  // must not fetch origin/<branch>, because if that branch name also exists on
-  // origin the fetch would succeed and we'd check out the wrong commits. A
-  // same-repo PR head lives on origin/<branch>, so fetch that.
-  if (headElsewhere) {
-    // Forced refspec (`+`): a removed session leaves refs/heads/pewpew/pr-<n>
-    // behind, and a later PR force-push makes a non-forced fetch reject as
-    // non-fast-forward — silently reopening stale commits. The pewpew/ branch
-    // is pewpew-owned and must always track the current PR head, and same-PR
-    // reuse already returned above, so it isn't checked out here.
-    try {
-      await runGit([
-        'fetch',
-        prHeadFetchRemote(externalRepo),
-        `+pull/${prNumber}/head:${localBranch}`,
-      ])
-    } catch {
-      // Offline, or the namespaced branch is already present locally.
-    }
-    // The pull ref must have produced the local branch. If the fetch failed and
-    // it doesn't exist, do NOT run `git worktree add <path> <localBranch>`:
-    // with no local branch, git DWIMs the name to a remote-tracking
-    // origin/<localBranch> (if one exists) and silently checks out the wrong
-    // commits. Fail explicitly instead, mirroring the remote path.
-    if (!(await localBranchExists(runGit, localBranch))) {
-      return `Failed to create worktree for branch "${branch}": could not fetch refs/pull/${prNumber}/head`
-    }
-  } else {
-    try {
-      await runGit(['fetch', 'origin', branch])
-    } catch {
-      // May already be available locally.
-    }
+  // Fetch the PR head into the local branch we'll check out; planPrWorktree
+  // picked the remote (origin, or the overridden repo's URL when a fork clone
+  // opens an upstream PR) and the refspec (a head-elsewhere PR head is
+  // force-fetched from refs/pull/<n>/head into its pewpew-namespaced branch, a
+  // same-repo head from origin/<branch>).
+  try {
+    await runGit(['fetch', fetchRemote, fetchRefspec])
+  } catch {
+    // Offline, or the branch is already present locally.
+  }
+  // The pull ref must have produced the local branch. If the fetch failed and it
+  // doesn't exist, do NOT run `git worktree add <path> <localBranch>`: with no
+  // local branch, git DWIMs the name to a remote-tracking origin/<localBranch>
+  // (if one exists) and silently checks out the wrong commits. Fail explicitly
+  // instead, mirroring the remote path.
+  if (isFork && !(await localBranchExists(runGit, localBranch))) {
+    return forkPullRefUnavailableMessage(branch, prNumber)
   }
 
   // Create worktree from the PR branch
@@ -2176,7 +2116,7 @@ export async function createPrSession(
   } catch (err) {
     // A head-elsewhere PR has no valid origin fallback — origin/<branch> is not
     // its head.
-    if (headElsewhere) {
+    if (isFork) {
       return `Failed to create worktree for branch "${branch}": ${(err as Error).message}`
     }
     // Same-repo branch may not exist locally yet — create it tracking origin.
@@ -2191,8 +2131,8 @@ export async function createPrSession(
   // We already know the PR number; set it directly so it shows immediately
   // (the async lookup fired by adoptWorktree will no-op since prNumber is set).
   session.prNumber = prNumber
-  session.prIsFork = prIsFork
-  session.prHeadRepo = prHeadRepo
+  session.prIsFork = forkFields.prIsFork
+  session.prHeadRepo = forkFields.prHeadRepo
   // Prefer an issue number parsed from the PR title if the name/branch didn't yield one.
   if (session.issueNumber === undefined) {
     session.issueNumber = parseIssueNumber(prInfo.title)
@@ -2228,8 +2168,7 @@ export async function createIssueSession(
 ): Promise<Session | string> {
   if (hostId !== null) return createRemoteIssueSession(hostId, projectPath, issueNumber, options)
 
-  const branch = `issue-${issueNumber}`
-  const worktreeName = `issue-${issueNumber}`
+  const { worktreeName, branch } = planIssueWorktree(issueNumber)
   const worktreePath = join(projectPath, '.claude', 'worktrees', worktreeName)
 
   for (const e of sessions.values()) {
@@ -2288,8 +2227,7 @@ async function createRemoteIssueSession(
   const host = getRequiredHost(hostId)
   const remoteProject = getRemoteProject(hostId, projectPath)
 
-  const branch = `issue-${issueNumber}`
-  const worktreeName = `issue-${issueNumber}`
+  const { worktreeName, branch } = planIssueWorktree(issueNumber)
   const worktreePath = posix.join(projectPath, '.claude', 'worktrees', worktreeName)
 
   for (const e of sessions.values()) {

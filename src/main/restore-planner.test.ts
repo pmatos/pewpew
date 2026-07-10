@@ -29,12 +29,25 @@ describe('deriveRestoredState — remote sessions', () => {
     })
   })
 
-  it('keeps a non-running, non-dead remote status but marks it pending', () => {
-    for (const status of ['idle', 'needs_input', 'completed', 'error'] as SessionStatus[]) {
+  it('keeps a resumable non-dead remote status but marks it pending', () => {
+    for (const status of ['idle', 'needs_input'] as SessionStatus[]) {
       expect(deriveRestoredState({ ...REMOTE, status }, env())).toEqual({
         status,
         connectionState: 'pending',
         outcome: 'remote-pending',
+      })
+    }
+  })
+
+  it('restores a terminal (completed/error) remote session as live, not pending', () => {
+    // A finished remote session must not re-enter the lazy pending/reconnect path
+    // (which would show a stuck "Connecting…" overlay and let a first-open/batch
+    // probe flip it back to dead); it lands 'live', like an in-session completion.
+    for (const status of ['completed', 'error'] as SessionStatus[]) {
+      expect(deriveRestoredState({ ...REMOTE, status }, env())).toEqual({
+        status,
+        connectionState: 'live',
+        outcome: 'remote-terminal',
       })
     }
   })
