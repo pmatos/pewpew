@@ -85,6 +85,7 @@ function RepoPicker({
       <div className="session-name-label">Repository:</div>
       <select
         className="create-input"
+        aria-label="Repository"
         value={value}
         disabled={disabled}
         onChange={(e) => onChange(e.target.value)}
