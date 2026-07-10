@@ -59,6 +59,9 @@ const state = vi.hoisted(() => ({
   // Captured emitToast payloads for assertion.
   toasts: [] as { severity: string; title: string; detail?: string }[],
   hasPtyResult: new Set<string>(),
+  // Response returned by the mocked cleanup dialog: 0 = Delete worktree,
+  // 1 = Keep worktree, 2 = Keep and open in file manager.
+  dialogResponse: 1,
 }))
 
 vi.mock('./config', () => ({
@@ -103,7 +106,7 @@ vi.mock('./notifications', () => ({
 
 vi.mock('electron', () => ({
   dialog: {
-    showMessageBox: async () => ({ response: 1 }),
+    showMessageBox: async () => ({ response: state.dialogResponse }),
   },
   shell: {
     openPath: async () => '',
@@ -348,6 +351,7 @@ beforeEach(() => {
   state.reconnectConfig = { enabled: true, initialDelayMs: 1000, maxDelayMs: 30000 }
   state.toasts = []
   state.hasPtyResult = new Set()
+  state.dialogResponse = 1
 })
 
 afterEach(() => {
@@ -2957,17 +2961,51 @@ describe('attemptAutoReconnect', () => {
     expect(state.toasts).toEqual([{ severity: 'info', title: 'Reconnected to Dev' }])
   })
 
-  it('tmux gone → gave-up, marks dead, toasts session-ended', async () => {
+  it('tmux gone → gave-up, prompts cleanup; "Keep" leaves it completed with no silent removal', async () => {
     writeSessionsJson([baseRemoteSession({ id: 'r1', status: 'idle' })])
     state.hasRemoteTmuxResult.set('r1', false)
+    state.dialogResponse = 1 // Keep worktree
     const sm = await loadSessionManager()
     sm.restoreSessions()
 
     const outcome = await sm.attemptAutoReconnect('r1')
-
     expect(outcome).toBe('gave-up')
-    expect(sm.getSessions()[0].status).toBe('dead')
-    expect(state.toasts).toEqual([{ severity: 'error', title: 'Dev: remote session ended' }])
+
+    // A confirmed-gone remote session ended: it must get the same cleanup dialog
+    // a local session gets on exit (promptCleanup runs fire-and-forget, so the
+    // mocked dialog resolves on a later tick). Choosing "Keep" marks it completed
+    // and must not touch the worktree.
+    await vi.waitFor(() => expect(sm.getSessions()[0].status).toBe('completed'))
+    expect(
+      state.execRemoteCalls.some((c) => c.argv.includes('worktree') && c.argv.includes('remove'))
+    ).toBe(false)
+    // Parity with local: the dialog is the notification — no "session ended" toast.
+    expect(state.toasts).toEqual([])
+  })
+
+  it('tmux gone → cleanup dialog "Delete" removes the session and its remote worktree', async () => {
+    writeSessionsJson([baseRemoteSession({ id: 'r1', status: 'idle' })])
+    state.hasRemoteTmuxResult.set('r1', false)
+    state.dialogResponse = 0 // Delete worktree
+    const sm = await loadSessionManager()
+    sm.restoreSessions()
+
+    const outcome = await sm.attemptAutoReconnect('r1')
+    expect(outcome).toBe('gave-up')
+
+    await vi.waitFor(() => expect(sm.getSessions()).toHaveLength(0))
+    expect(state.execRemoteCalls).toContainEqual({
+      hostId: 'h1',
+      argv: [
+        'git',
+        '-C',
+        '/remote/proj',
+        'worktree',
+        'remove',
+        '/remote/proj/.claude/worktrees/feat',
+        '--force',
+      ],
+    })
   })
 
   it('auth-failed → gave-up (no retry)', async () => {

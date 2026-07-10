@@ -1469,8 +1469,19 @@ export async function attemptAutoReconnect(id: string): Promise<AttemptOutcome> 
     return 'recovered'
   }
   if (after.status === 'dead') {
-    // Remote tmux confirmed gone — retrying is futile.
-    emitToast({ severity: 'error', title: `${label}: remote session ended` })
+    // Remote tmux confirmed gone: the agent ended. The session.end hook that
+    // drives promptCleanup for a live session is unreliable over a remote link
+    // (it races the ControlMaster/reverse-forward teardown as the PTY drops, so
+    // the message is often lost before it arrives), leaving remote sessions
+    // without the "Clean up worktree?" dialog local sessions get on exit. This
+    // probe result is the dependable "session ended" signal, so prompt the same
+    // cleanup here — otherwise the card is silently left dead and the user
+    // removes it by hand, deleting the worktree with no confirmation. Fire and
+    // forget (the dialog awaits user input); promptCleanup's own in-progress
+    // guard makes a late-arriving session.end hook a no-op.
+    void promptCleanup(id).catch((err) => {
+      console.error(`promptCleanup(${id}) failed:`, err)
+    })
     return 'gave-up'
   }
   if (after.connectionState === 'auth-failed') {
