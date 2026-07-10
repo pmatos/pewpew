@@ -1310,6 +1310,17 @@ const inflightReconnects = new Map<string, Promise<ReconnectOutcome>>()
 // `startRuntime` before ensureHostConnection rejects), so auth-failed vs.
 // network-unreachable get distinct UI states without re-parsing stderr.
 export async function reconnectRemoteSession(id: string): Promise<void> {
+  // A terminal session is done — never re-probe/reconnect it. attemptAutoReconnect
+  // already bails on 'completed'/'error' before calling; guard the manual/IPC entry
+  // point too, so triggering Reconnect on a kept ('completed') or errored session
+  // can't probe-and-flip it back to 'dead', silently undoing the user's Keep. This
+  // matters beyond a stray call: on restart deriveRestoredState gives a kept remote
+  // session connectionState 'pending' (overwriting the 'live' promptCleanup set),
+  // which re-exposes the Reconnect affordance — this guard is what keeps clicking it
+  // a no-op. Mirrors the status guard in attemptAutoReconnect.
+  const current = sessions.get(id)?.session
+  if (current && (current.status === 'completed' || current.status === 'error')) return
+
   const existing = inflightReconnects.get(id)
   if (existing) {
     await existing

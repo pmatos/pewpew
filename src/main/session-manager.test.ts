@@ -1029,6 +1029,23 @@ describe('restoreSessions — remote lazy materialization', () => {
 })
 
 describe('reconnectRemoteSession', () => {
+  it('is a no-op for a terminal (completed) session', async () => {
+    // A kept remote session persists as 'completed'; deriveRestoredState brings it
+    // back with connectionState 'pending', which re-exposes the Reconnect affordance.
+    // Triggering reconnect must not probe-and-flip the completed session to 'dead'.
+    writeSessionsJson([baseRemoteSession({ id: 'r1', status: 'completed' })])
+    state.hasRemoteTmuxResult.set('r1', false) // would flip to dead if it probed
+    const sm = await loadSessionManager()
+    sm.restoreSessions()
+    expect(sm.getSessions()[0].status).toBe('completed')
+
+    await sm.reconnectRemoteSession('r1')
+
+    expect(sm.getSessions()[0].status).toBe('completed')
+    expect(state.ensureHostConnectionCalls).toEqual([])
+    expect(state.reattachRemotePtyCalls).toEqual([])
+  })
+
   it('tmux present → reattach and mark live', async () => {
     writeSessionsJson([baseRemoteSession({ id: 'r1', status: 'idle' })])
     state.hasRemoteTmuxResult.set('r1', true)
