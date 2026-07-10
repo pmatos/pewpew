@@ -52,9 +52,17 @@ import {
 } from './github-items'
 import { applyHookEvent, type SideEffectIntent } from './session-state-machine'
 import { deriveRestoredState } from './restore-planner'
-import { planIssueWorktree, planPrWorktree, PR_VIEW_FIELDS, type PrViewInfo } from './worktree-plan'
+import { planIssueWorktree } from './worktree-plan'
+import {
+  PR_VIEW_FIELDS,
+  describePrLookupFailure,
+  forkPullRefUnavailableMessage,
+  planPrWorktree,
+  type PrViewInfo,
+} from './pr-worktree-planner'
 import { exec as execRemote, runtimeStateFor, type HostConnectionState } from './host-connection'
 import { remoteHostRuntime, type PreparedRemoteHostLease } from './remote-host-runtime'
+import { createPrLookup, parseOwnerFromRemoteUrl } from './github'
 import type {
   AgentTool,
   CreateSessionOptions,
@@ -200,8 +208,7 @@ function getOriginOwner(projectPath: string): string | undefined {
       encoding: 'utf-8',
       timeout: 5000,
     }).trim()
-    const m = url.match(/(?:[:/])([^/:]+)\/[^/]+?(?:\.git)?\/?$/)
-    return m?.[1]
+    return parseOwnerFromRemoteUrl(url)
   } catch {
     return undefined
   }
@@ -266,56 +273,17 @@ async function remoteBranchExists(
   }
 }
 
-// Positive hits are cached forever; negative hits (no PR yet / gh transient
-// error) are retained only for NEGATIVE_CACHE_TTL_MS so a PR opened after the
-// session was created can be picked up without requiring an app restart.
-const NEGATIVE_CACHE_TTL_MS = 5 * 60 * 1000
-const prLookupCache = new Map<string, { value: number | null; checkedAt: number }>()
-
-async function lookupPrForBranch(projectPath: string, branch: string): Promise<number | undefined> {
-  const key = `${projectPath}::${branch}`
-  const cached = prLookupCache.get(key)
-  if (cached) {
-    if (cached.value !== null) return cached.value
-    if (Date.now() - cached.checkedAt < NEGATIVE_CACHE_TTL_MS) return undefined
-  }
-  try {
-    const { stdout } = await execFileAsync(
-      'gh',
-      [
-        'pr',
-        'list',
-        '--head',
-        branch,
-        '--state',
-        'open',
-        '--json',
-        'number,headRepositoryOwner',
-        '--limit',
-        '10',
-      ],
-      { cwd: projectPath }
-    )
-    const parsed = JSON.parse(stdout) as {
-      number: number
-      headRepositoryOwner?: { login?: string } | null
-    }[]
-    // `gh pr list --head <branch>` filters by branch name only (owner:branch
-    // isn't supported), so in repos that accept fork PRs a common branch name
-    // like `main` or `fix` can return an unrelated PR. Prefer the entry whose
-    // head repo owner matches the local origin's owner; fall back to the top
-    // result so upstream clones tracking a contributor's branch (where the
-    // head owner differs from origin) still get a PR number.
-    const owner = getOriginOwner(projectPath)
-    const match = (owner && parsed.find((p) => p.headRepositoryOwner?.login === owner)) || parsed[0]
-    const num = match?.number
-    prLookupCache.set(key, { value: num ?? null, checkedAt: Date.now() })
-    return num
-  } catch {
-    // Don't cache transient gh failures — next call retries immediately.
-    return undefined
-  }
-}
+// Resolve a branch to its open PR number via `gh`, with origin-owner
+// disambiguation and a TTL cache. The gateway itself lives in ./github; here we
+// wire it to the real `gh` binary and wall clock.
+const prLookup = createPrLookup({
+  runGh: async (args, cwd) => {
+    const { stdout } = await execFileAsync('gh', args, { cwd })
+    return { stdout: String(stdout) }
+  },
+  resolveOwner: getOriginOwner,
+  now: () => Date.now(),
+})
 
 function resolvePrNumberAsync(sessionId: string): void {
   const entry = sessions.get(sessionId)
@@ -323,7 +291,7 @@ function resolvePrNumberAsync(sessionId: string): void {
   if (entry.session.hostId) return
   const { projectPath, branch } = entry.session
   if (!branch) return
-  lookupPrForBranch(projectPath, branch).then((num) => {
+  prLookup.lookup(projectPath, branch).then((num) => {
     if (num === undefined) return
     const current = sessions.get(sessionId)
     if (!current || current.session.prNumber !== undefined) return
@@ -965,23 +933,6 @@ async function createRemoteSession(
   return session
 }
 
-// `gh pr view` fails for many reasons beyond the PR genuinely not existing —
-// rate limiting, auth, network, or gh resolving the wrong default repo. Only
-// report "not found" when gh actually said the PR couldn't be resolved;
-// otherwise surface the real error so a rate-limit or auth failure isn't
-// misreported as a missing PR (which sends the user hunting for a PR that's
-// right there on GitHub).
-function describePrLookupFailure(prNumber: number, detail: string): string {
-  const trimmed = detail.trim()
-  const genuinelyMissing =
-    /could not resolve to a (pull ?request|issue)/i.test(trimmed) ||
-    /no pull requests? found/i.test(trimmed)
-  if (!trimmed || genuinelyMissing) {
-    return `PR #${prNumber} not found in this repository.`
-  }
-  return `Failed to look up PR #${prNumber}: ${trimmed}`
-}
-
 async function localBranchExists(runGit: GitRunner, branch: string): Promise<boolean> {
   try {
     await runGit(['rev-parse', '--verify', '--quiet', `refs/heads/${branch}`])
@@ -1035,9 +986,9 @@ async function createRemotePrSession(
       return `Failed to parse PR metadata for #${prNumber}.`
     }
 
-    if (prInfo.state !== 'OPEN') {
-      return `PR #${prNumber} is ${prInfo.state.toLowerCase()}, not open.`
-    }
+    const planResult = planPrWorktree(prNumber, prInfo)
+    if (!planResult.ok) return planResult.message
+    const { branch, localBranch, isFork, forkFields, fetchRefspec } = planResult.plan
 
     const effectiveTool: AgentTool = options.tool ?? getConfig().defaultTool
     const agentPath = agentPaths[effectiveTool]
@@ -1045,21 +996,17 @@ async function createRemotePrSession(
       return `${effectiveTool} is not installed on host ${host.label || host.alias}.`
     }
 
-    const {
-      headBranch: branch,
-      forkFields,
-      isFork,
-      localBranch,
-      fetchArgv,
-    } = planPrWorktree(prNumber, prInfo)
     const id = randomUUID().slice(0, 8)
     const tmuxSession = `pewpew-${id}`
 
-    // planPrWorktree owns the fork-aware local branch and fetch-refspec
-    // decision (see that module for why a fork uses refs/pull/<n>/head and a
-    // same-repo PR uses origin/<branch>); here we only run the fetch it
-    // prescribes. Best-effort: the branch may already be present locally.
-    await execRemote(host, ['git', '-C', projectPath, ...fetchArgv]).catch(() => undefined)
+    // Fetch the PR head into the local branch we'll check out; planPrWorktree
+    // picked the refspec (a fork's head is force-fetched from refs/pull/<n>/head
+    // into its pewpew-namespaced branch, a same-repo head from origin/<branch>).
+    // A failure is tolerated — the branch may already be present locally, and a
+    // fork that genuinely couldn't fetch is caught by the probe below.
+    await execRemote(host, ['git', '-C', projectPath, 'fetch', 'origin', fetchRefspec]).catch(
+      () => undefined
+    )
 
     // Pick the worktree-add form by probing for the local branch first instead
     // of try-then-fallback. The fallback masked real failures (e.g. branch
@@ -1067,9 +1014,10 @@ async function createRemotePrSession(
     // attempt's misleading "branch already exists" error.
     const branchExistsLocally = await remoteBranchExists(host, projectPath, localBranch)
     if (isFork && !branchExistsLocally) {
-      // The pull-ref fetch should have created pr-<n>; if it didn't there's no
-      // valid origin fallback for a fork (origin/<branch> isn't the PR head).
-      return `Failed to create worktree for branch "${branch}": could not fetch refs/pull/${prNumber}/head`
+      // The pull-ref fetch should have created the pewpew/ branch; if it didn't
+      // there's no valid origin fallback for a fork (origin/<branch> isn't the
+      // PR head).
+      return forkPullRefUnavailableMessage(branch, prNumber)
     }
     const addArgv = branchExistsLocally
       ? ['git', '-C', projectPath, 'worktree', 'add', worktreePath, localBranch]
@@ -2011,18 +1959,9 @@ export async function createPrSession(
     return describePrLookupFailure(prNumber, describeGhError(err))
   }
 
-  if (prInfo.state !== 'OPEN') {
-    return `PR #${prNumber} is ${prInfo.state.toLowerCase()}, not open.`
-  }
-
-  const {
-    worktreeName,
-    headBranch: branch,
-    forkFields,
-    isFork,
-    localBranch,
-    fetchArgv,
-  } = planPrWorktree(prNumber, prInfo)
+  const planResult = planPrWorktree(prNumber, prInfo)
+  if (!planResult.ok) return planResult.message
+  const { worktreeName, branch, localBranch, isFork, forkFields, fetchRefspec } = planResult.plan
 
   // Reuse an existing session for this PR. First match by PR number (the only
   // globally-unique key), then — for a same-repo PR whose head branch name
@@ -2050,21 +1989,21 @@ export async function createPrSession(
 
   const worktreePath = join(projectPath, '.claude', 'worktrees', worktreeName)
 
-  // planPrWorktree owns the fork-aware local branch and fetch-refspec decision
-  // (see that module for why a fork uses refs/pull/<n>/head and a same-repo PR
-  // uses origin/<branch>); here we only run the fetch it prescribes.
+  // Fetch the PR head into the local branch we'll check out; planPrWorktree
+  // picked the refspec (a fork's head is force-fetched from refs/pull/<n>/head
+  // into its pewpew-namespaced branch, a same-repo head from origin/<branch>).
   try {
-    await runGit(fetchArgv)
+    await runGit(['fetch', 'origin', fetchRefspec])
   } catch {
     // Offline, or the branch is already present locally.
   }
-  // A fork's pull-ref fetch must have produced the PR-scoped local branch. If it
-  // didn't, do NOT run `git worktree add <path> <localBranch>`: with no local
-  // branch git DWIMs the name to a remote-tracking origin/<localBranch> (if one
-  // exists) and silently checks out the wrong commits. Fail explicitly instead,
-  // mirroring the remote path.
+  // The pull ref must have produced the fork's local branch. If the fetch failed
+  // and it doesn't exist, do NOT run `git worktree add <path> <localBranch>`:
+  // with no local branch, git DWIMs the name to a remote-tracking
+  // origin/<localBranch> (if one exists) and silently checks out the wrong
+  // commits. Fail explicitly instead, mirroring the remote path.
   if (isFork && !(await localBranchExists(runGit, localBranch))) {
-    return `Failed to create worktree for branch "${branch}": could not fetch refs/pull/${prNumber}/head`
+    return forkPullRefUnavailableMessage(branch, prNumber)
   }
 
   // Create worktree from the PR branch

@@ -9,7 +9,8 @@ export interface HookEventInput {
 }
 
 export type SideEffectIntent =
-  { kind: 'notifyNeedsInput'; sessionId: string } | { kind: 'promptCleanup'; sessionId: string }
+  | { kind: 'notifyNeedsInput'; sessionId: string }
+  | { kind: 'promptCleanup'; sessionId: string }
 
 export interface ApplyResult {
   state: SessionsState
