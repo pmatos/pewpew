@@ -38,8 +38,6 @@ import {
   createPrSessions,
   openSessionsForOpenPrs,
   openSessionsForOpenIssues,
-  countOpenIssues,
-  listRepoLabels,
   getSession,
   getSessions,
   restoreSessions,
@@ -55,6 +53,7 @@ import {
   updateLastKnownStatesBatch,
   stopSessionManager,
 } from './session-manager'
+import { countOpenIssues, listRepoLabels } from './github-items'
 import { parseDiff, synthesizeUntrackedFile } from './diff-parser'
 import { listHosts, addHost, updateHost, deleteHost, getHost } from './host-registry'
 import {

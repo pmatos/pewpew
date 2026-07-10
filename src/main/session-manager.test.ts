@@ -2238,39 +2238,6 @@ describe('openSessionsForOpenIssues', () => {
   })
 })
 
-describe('countOpenIssues', () => {
-  it('returns the number of matched open issues', async () => {
-    const sm = await loadSessionManager()
-    const listIssues = vi.fn(async () => [{ number: 1 }, { number: 2 }, { number: 3 }])
-    const result = await sm.countOpenIssues('/proj', null, 'bug', { listIssues })
-    expect(result).toBe(3)
-    expect(listIssues).toHaveBeenCalledWith('/proj', null)
-  })
-
-  it('passes through gh list errors as a string', async () => {
-    const sm = await loadSessionManager()
-    const result = await sm.countOpenIssues('/proj', null, undefined, {
-      listIssues: async () => 'Failed to list open issues: gh auth failed',
-    })
-    expect(result).toBe('Failed to list open issues: gh auth failed')
-  })
-})
-
-describe('listRepoLabels', () => {
-  it('surfaces a remote gh probe failure instead of attempting to list', async () => {
-    const sm = await loadSessionManager()
-    state.execRemoteResults.set('sh -c command -v gh >/dev/null 2>&1', {
-      stdout: '',
-      stderr: 'Permission denied (publickey).\n',
-      code: 255,
-      timedOut: false,
-    })
-
-    const result = await sm.listRepoLabels('/remote/proj', 'h1')
-    expect(result).toBe('SSH authentication failed on Dev: Permission denied (publickey).')
-  })
-})
-
 describe('createPrSession lookup failures', () => {
   it('surfaces the real gh error (e.g. rate limit) instead of reporting "not found"', async () => {
     const sm = await loadSessionManager()

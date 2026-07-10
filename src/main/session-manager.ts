@@ -41,21 +41,25 @@ import {
 } from './hook-installer'
 import { getHost } from './host-registry'
 import { listRemoteProjects } from './remote-project-registry'
-import { classifySshExit } from './ssh-exit-parser'
+import { getRequiredHost, expectRemoteOk } from './remote-command'
+import {
+  describeGhError,
+  listOpenPrs,
+  listOpenIssues,
+  probeRemoteGh,
+  type NumberedGhItem,
+  type ListNumberedItems,
+} from './github-items'
 import { applyHookEvent, type SideEffectIntent } from './session-state-machine'
+import { deriveRestoredState } from './restore-planner'
 import { exec as execRemote, runtimeStateFor, type HostConnectionState } from './host-connection'
 import { remoteHostRuntime, type PreparedRemoteHostLease } from './remote-host-runtime'
 import {
   createPrLookup,
-  describeGhError,
   describePrLookupFailure,
   forkFieldsFromPr,
-  ghApiOpenItemsArgs,
-  parseLabelLines,
-  parseNumberedGhLines,
   parseOwnerFromRemoteUrl,
   PR_VIEW_FIELDS,
-  type NumberedGhItem,
   type PrViewInfo,
 } from './github'
 import type {
@@ -219,21 +223,6 @@ function getRemoteProject(hostId: string, projectPath: string): RemoteProject {
   const project = listRemoteProjects().find((p) => p.hostId === hostId && p.path === projectPath)
   if (!project) throw new Error('Remote project is not registered')
   return project
-}
-
-function getRequiredHost(hostId: string): Host {
-  const host = getHost(hostId)
-  if (!host) throw new Error('Unknown host')
-  return host
-}
-
-async function expectRemoteOk(host: Host, argv: string[], message: string): Promise<string> {
-  const result = await execRemote(host, argv)
-  if (result.timedOut || result.code !== 0) {
-    const detail = result.stderr.trim() || result.stdout.trim() || `exit ${result.code}`
-    throw new Error(`${message}: ${detail}`)
-  }
-  return result.stdout
 }
 
 // Lists the worktrees of a remote project over SSH. Remote paths are always
@@ -1796,17 +1785,12 @@ export function selectNumbersToOpen<T extends { number: number }>(
   return { toCreate, toSkip }
 }
 
-type ListNumberedItems = (
-  projectPath: string,
-  hostId: string | null
-) => Promise<NumberedGhItem[] | string>
 type CreateNumberedSession = (
   projectPath: string,
   number: number,
   hostId: string | null,
   options?: CreateSessionOptions
 ) => Promise<Session | string>
-type RemoteGhProbe = { ok: true } | { ok: false; error: string }
 
 interface OpenSessionsDeps {
   listPrs?: ListNumberedItems
@@ -1835,153 +1819,6 @@ interface CreatePrSessionDeps {
     label?: string,
     tool?: AgentTool
   ) => Promise<Session>
-}
-
-async function listLocalOpenGhItems(
-  projectPath: string,
-  kind: 'pr' | 'issue',
-  label?: string
-): Promise<NumberedGhItem[] | string> {
-  try {
-    const { stdout: repoStdout } = await execFileAsync(
-      'gh',
-      ['repo', 'view', '--json', 'nameWithOwner', '--jq', '.nameWithOwner'],
-      { cwd: projectPath, timeout: 30000 }
-    )
-    const repo = String(repoStdout).trim()
-    const { stdout } = await execFileAsync('gh', ghApiOpenItemsArgs(kind, repo, label), {
-      cwd: projectPath,
-      timeout: 30000,
-    })
-    return parseNumberedGhLines(String(stdout), kind === 'pr' ? 'PR' : 'issue')
-  } catch (err) {
-    return `Failed to list open ${kind === 'pr' ? 'PRs' : 'issues'}: ${describeGhError(err)}`
-  }
-}
-
-async function listRemoteOpenGhItems(
-  projectPath: string,
-  hostId: string,
-  kind: 'pr' | 'issue',
-  label?: string
-): Promise<NumberedGhItem[] | string> {
-  const host = getRequiredHost(hostId)
-  const ghProbe = await probeRemoteGh(host)
-  if (!ghProbe.ok) return ghProbe.error
-
-  const labelQuery = kind === 'issue' && label ? `&labels=${encodeURIComponent(label)}` : ''
-  try {
-    const stdout = await expectRemoteOk(
-      host,
-      [
-        'sh',
-        '-c',
-        [
-          'set -e',
-          'cd "$1"',
-          'repo=$(gh repo view --json nameWithOwner --jq .nameWithOwner)',
-          'if [ "$2" = pr ]; then',
-          '  gh api --paginate "repos/$repo/pulls?state=open&per_page=100" --jq ".[].number"',
-          'else',
-          '  gh api --paginate "repos/$repo/issues?state=open&per_page=100$3" --jq ".[] | select(.pull_request | not) | .number"',
-          'fi',
-        ].join('\n'),
-        '_',
-        projectPath,
-        kind,
-        labelQuery,
-      ],
-      'gh failed'
-    )
-    return parseNumberedGhLines(stdout, kind === 'pr' ? 'PR' : 'issue')
-  } catch (err) {
-    return `Failed to list open ${kind === 'pr' ? 'PRs' : 'issues'}: ${describeGhError(err)}`
-  }
-}
-
-async function listOpenPrs(
-  projectPath: string,
-  hostId: string | null
-): Promise<NumberedGhItem[] | string> {
-  return hostId === null
-    ? listLocalOpenGhItems(projectPath, 'pr')
-    : listRemoteOpenGhItems(projectPath, hostId, 'pr')
-}
-
-async function listOpenIssues(
-  projectPath: string,
-  hostId: string | null,
-  label?: string
-): Promise<NumberedGhItem[] | string> {
-  return hostId === null
-    ? listLocalOpenGhItems(projectPath, 'issue', label)
-    : listRemoteOpenGhItems(projectPath, hostId, 'issue', label)
-}
-
-export async function countOpenIssues(
-  projectPath: string,
-  hostId: string | null = null,
-  label?: string,
-  deps: { listIssues?: ListNumberedItems } = {}
-): Promise<number | string> {
-  const list = deps.listIssues ?? ((p: string, h: string | null) => listOpenIssues(p, h, label))
-  try {
-    const items = await list(projectPath, hostId)
-    if (typeof items === 'string') return items
-    return items.length
-  } catch (err) {
-    return describeGhError(err)
-  }
-}
-
-export async function listRepoLabels(
-  projectPath: string,
-  hostId: string | null = null
-): Promise<string[] | string> {
-  if (hostId === null) {
-    try {
-      const { stdout: repoStdout } = await execFileAsync(
-        'gh',
-        ['repo', 'view', '--json', 'nameWithOwner', '--jq', '.nameWithOwner'],
-        { cwd: projectPath, timeout: 30000 }
-      )
-      const repo = String(repoStdout).trim()
-      const { stdout } = await execFileAsync(
-        'gh',
-        ['api', '--paginate', `repos/${repo}/labels?per_page=100`, '--jq', '.[].name'],
-        { cwd: projectPath, timeout: 30000 }
-      )
-      return parseLabelLines(String(stdout))
-    } catch (err) {
-      return `Failed to list labels: ${describeGhError(err)}`
-    }
-  }
-
-  const host = getRequiredHost(hostId)
-  const ghProbe = await probeRemoteGh(host)
-  if (!ghProbe.ok) return ghProbe.error
-
-  try {
-    const stdout = await expectRemoteOk(
-      host,
-      [
-        'sh',
-        '-c',
-        [
-          'set -e',
-          'cd "$1"',
-          'repo=$(gh repo view --json nameWithOwner --jq .nameWithOwner)',
-          'gh api --paginate "repos/$repo/labels?per_page=100" --jq ".[].name"',
-        ].join('\n'),
-        '_',
-        projectPath,
-      ],
-      'gh failed'
-    )
-    return parseLabelLines(stdout)
-  } catch (err) {
-    return `Failed to list labels: ${describeGhError(err)}`
-  }
 }
 
 function findSessionByBranch(
@@ -2114,30 +1951,6 @@ async function openSessionsForNumberedItems(
     items.map((i) => i.number),
     createSession
   )
-}
-
-function describeRemoteGhProbeFailure(
-  host: Host,
-  result: { code: number; stderr: string; timedOut: boolean }
-): string {
-  const label = host.label || host.alias
-  if (result.timedOut) return `Cannot reach ${label}: ssh timed out while checking for gh.`
-
-  const { reason, message } = classifySshExit({ exitCode: result.code, stderr: result.stderr })
-  if (reason === 'auth-failed') return `SSH authentication failed on ${label}: ${message}`
-  if (reason === 'network') return `Cannot reach ${label}: ${message}`
-  if (reason === 'bind-unlink') {
-    return `${label}: remote sshd needs StreamLocalBindUnlink yes: ${message}`
-  }
-  if (reason === 'dep-missing') return `${label}: remote shell dependency missing: ${message}`
-
-  return `gh CLI is not installed on host ${label}.`
-}
-
-async function probeRemoteGh(host: Host): Promise<RemoteGhProbe> {
-  const result = await execRemote(host, ['sh', '-c', 'command -v gh >/dev/null 2>&1'])
-  if (result.code === 0 && !result.timedOut) return { ok: true }
-  return { ok: false, error: describeRemoteGhProbeFailure(host, result) }
 }
 
 export async function createPrSession(
@@ -2664,67 +2477,27 @@ export function restoreSessions(): void {
 
     for (const session of data) {
       session.hostId = session.hostId ?? null
+
+      // Pure decision core: given the persisted status and local environment,
+      // derive the restored status/connectionState. See restore-planner.ts.
+      // The `existsSync` probe is guarded to local sessions — a remote worktree
+      // path must never be stat'd on the host running the app.
+      const derived = deriveRestoredState(session, {
+        hasLiveTmux: liveTmuxIds.has(session.id),
+        worktreeExists: !session.hostId && existsSync(session.worktreePath),
+        tmuxAvailable,
+      })
+      session.status = derived.status
+      session.connectionState = derived.connectionState
+      if (derived.outcome === 'defer') deferredCount++
+      if (derived.outcome === 'dead-no-tmux') skippedForNoTmux++
+
       if (session.hostId) {
-        // Lazy restore: a remote session materializes in `pending` until the
-        // user's first click (or reconnectRemoteSession) opens the host's SSH
-        // control connection and probes tmux. No network I/O here.
-        // `running` → `idle` matches the local "resumedStatus" mapping; a
-        // persisted status of `dead` means the remote tmux is confirmed gone
-        // and there is nothing to reconnect to, so leave connectionState unset.
-        if (session.status === 'running') {
-          session.status = 'idle'
-        }
-        if (session.status !== 'dead') {
-          session.connectionState = 'pending'
-        }
         backfillDerivedFields(session)
         sessions.set(session.id, { session })
         continue
       }
 
-      // Drop any persisted `connectionState`; the lazy-restore branch below
-      // will set it back to 'pending'. Without this, a session that ended up
-      // 'dead' on a later run (worktree gone, tmux unavailable, or completed/
-      // error with no live tmux) would still carry the previous run's
-      // 'pending', causing the renderer mount effects + attachLocalSession to
-      // try to materialize an entry that's supposed to stay terminated.
-      session.connectionState = undefined
-
-      if (
-        session.status === 'running' ||
-        session.status === 'idle' ||
-        session.status === 'needs_input'
-      ) {
-        // Preserve `needs_input` so the tray/status-bar attention signals
-        // (tray.ts, StatusBar.tsx) survive a restart — claude --continue
-        // resumes mid-wait, so the user still needs to answer.
-        const resumedStatus: SessionStatus =
-          session.status === 'needs_input' ? 'needs_input' : 'idle'
-        if (liveTmuxIds.has(session.id)) {
-          session.status = resumedStatus
-        } else if (!existsSync(session.worktreePath)) {
-          session.status = 'dead'
-        } else if (!tmuxAvailable) {
-          session.status = 'dead'
-          skippedForNoTmux++
-        } else {
-          // Lazy restore (mirrors the remote arm above): mark the session
-          // 'pending' and defer the tmux + agent spawn until the user opens
-          // the card. Spawning all persisted sessions up-front cost ~1 GB
-          // each (claude RSS) and OOM'd the box when many sessions existed.
-          // attachLocalSession() drives the on-demand spawn.
-          session.status = resumedStatus
-          session.connectionState = 'pending'
-          deferredCount++
-        }
-      } else if (session.status === 'completed' || session.status === 'error') {
-        // Terminal states: if the tmux session is gone, the card shouldn't
-        // claim the session is still alive. Don't auto-recover — the
-        // conversation already ended.
-        if (!liveTmuxIds.has(session.id)) {
-          session.status = 'dead'
-        }
-      }
       // Migrate legacy symlink-form paths to canonical so renderer matches work.
       session.worktreePath = canonicalPath(session.worktreePath)
       backfillDerivedFields(session)
