@@ -52,6 +52,7 @@ import {
 } from './github-items'
 import { applyHookEvent, type SideEffectIntent } from './session-state-machine'
 import { deriveRestoredState } from './restore-planner'
+import { planIssueWorktree } from './worktree-plan'
 import {
   PR_VIEW_FIELDS,
   describePrLookupFailure,
@@ -61,14 +62,7 @@ import {
 } from './pr-worktree-planner'
 import { exec as execRemote, runtimeStateFor, type HostConnectionState } from './host-connection'
 import { remoteHostRuntime, type PreparedRemoteHostLease } from './remote-host-runtime'
-import {
-  createPrLookup,
-  describePrLookupFailure,
-  forkFieldsFromPr,
-  parseOwnerFromRemoteUrl,
-  PR_VIEW_FIELDS,
-  type PrViewInfo,
-} from './github'
+import { createPrLookup, parseOwnerFromRemoteUrl } from './github'
 import type {
   AgentTool,
   CreateSessionOptions,
@@ -2069,8 +2063,7 @@ export async function createIssueSession(
 ): Promise<Session | string> {
   if (hostId !== null) return createRemoteIssueSession(hostId, projectPath, issueNumber, options)
 
-  const branch = `issue-${issueNumber}`
-  const worktreeName = `issue-${issueNumber}`
+  const { worktreeName, branch } = planIssueWorktree(issueNumber)
   const worktreePath = join(projectPath, '.claude', 'worktrees', worktreeName)
 
   for (const e of sessions.values()) {
@@ -2129,8 +2122,7 @@ async function createRemoteIssueSession(
   const host = getRequiredHost(hostId)
   const remoteProject = getRemoteProject(hostId, projectPath)
 
-  const branch = `issue-${issueNumber}`
-  const worktreeName = `issue-${issueNumber}`
+  const { worktreeName, branch } = planIssueWorktree(issueNumber)
   const worktreePath = posix.join(projectPath, '.claude', 'worktrees', worktreeName)
 
   for (const e of sessions.values()) {
