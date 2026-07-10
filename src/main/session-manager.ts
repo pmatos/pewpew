@@ -54,6 +54,14 @@ import { applyHookEvent, type SideEffectIntent } from './session-state-machine'
 import { deriveRestoredState } from './restore-planner'
 import { exec as execRemote, runtimeStateFor, type HostConnectionState } from './host-connection'
 import { remoteHostRuntime, type PreparedRemoteHostLease } from './remote-host-runtime'
+import {
+  createPrLookup,
+  describePrLookupFailure,
+  forkFieldsFromPr,
+  parseOwnerFromRemoteUrl,
+  PR_VIEW_FIELDS,
+  type PrViewInfo,
+} from './github'
 import type {
   AgentTool,
   CreateSessionOptions,
@@ -199,8 +207,7 @@ function getOriginOwner(projectPath: string): string | undefined {
       encoding: 'utf-8',
       timeout: 5000,
     }).trim()
-    const m = url.match(/(?:[:/])([^/:]+)\/[^/]+?(?:\.git)?\/?$/)
-    return m?.[1]
+    return parseOwnerFromRemoteUrl(url)
   } catch {
     return undefined
   }
@@ -265,56 +272,17 @@ async function remoteBranchExists(
   }
 }
 
-// Positive hits are cached forever; negative hits (no PR yet / gh transient
-// error) are retained only for NEGATIVE_CACHE_TTL_MS so a PR opened after the
-// session was created can be picked up without requiring an app restart.
-const NEGATIVE_CACHE_TTL_MS = 5 * 60 * 1000
-const prLookupCache = new Map<string, { value: number | null; checkedAt: number }>()
-
-async function lookupPrForBranch(projectPath: string, branch: string): Promise<number | undefined> {
-  const key = `${projectPath}::${branch}`
-  const cached = prLookupCache.get(key)
-  if (cached) {
-    if (cached.value !== null) return cached.value
-    if (Date.now() - cached.checkedAt < NEGATIVE_CACHE_TTL_MS) return undefined
-  }
-  try {
-    const { stdout } = await execFileAsync(
-      'gh',
-      [
-        'pr',
-        'list',
-        '--head',
-        branch,
-        '--state',
-        'open',
-        '--json',
-        'number,headRepositoryOwner',
-        '--limit',
-        '10',
-      ],
-      { cwd: projectPath }
-    )
-    const parsed = JSON.parse(stdout) as {
-      number: number
-      headRepositoryOwner?: { login?: string } | null
-    }[]
-    // `gh pr list --head <branch>` filters by branch name only (owner:branch
-    // isn't supported), so in repos that accept fork PRs a common branch name
-    // like `main` or `fix` can return an unrelated PR. Prefer the entry whose
-    // head repo owner matches the local origin's owner; fall back to the top
-    // result so upstream clones tracking a contributor's branch (where the
-    // head owner differs from origin) still get a PR number.
-    const owner = getOriginOwner(projectPath)
-    const match = (owner && parsed.find((p) => p.headRepositoryOwner?.login === owner)) || parsed[0]
-    const num = match?.number
-    prLookupCache.set(key, { value: num ?? null, checkedAt: Date.now() })
-    return num
-  } catch {
-    // Don't cache transient gh failures — next call retries immediately.
-    return undefined
-  }
-}
+// Resolve a branch to its open PR number via `gh`, with origin-owner
+// disambiguation and a TTL cache. The gateway itself lives in ./github; here we
+// wire it to the real `gh` binary and wall clock.
+const prLookup = createPrLookup({
+  runGh: async (args, cwd) => {
+    const { stdout } = await execFileAsync('gh', args, { cwd })
+    return { stdout: String(stdout) }
+  },
+  resolveOwner: getOriginOwner,
+  now: () => Date.now(),
+})
 
 function resolvePrNumberAsync(sessionId: string): void {
   const entry = sessions.get(sessionId)
@@ -322,7 +290,7 @@ function resolvePrNumberAsync(sessionId: string): void {
   if (entry.session.hostId) return
   const { projectPath, branch } = entry.session
   if (!branch) return
-  lookupPrForBranch(projectPath, branch).then((num) => {
+  prLookup.lookup(projectPath, branch).then((num) => {
     if (num === undefined) return
     const current = sessions.get(sessionId)
     if (!current || current.session.prNumber !== undefined) return
@@ -962,45 +930,6 @@ async function createRemoteSession(
   sessions.set(id, { session })
   onSessionsChanged()
   return session
-}
-
-// Fields gh returns for a PR. Beyond head branch/state/title we read the
-// cross-repository flag and the head repo identity so a fork PR can be both
-// checked out (via refs/pull/<n>/head) and marked as such on the session.
-interface PrViewInfo {
-  headRefName: string
-  state: string
-  title: string
-  isCrossRepository?: boolean
-  headRepositoryOwner?: { login?: string } | null
-  headRepository?: { name?: string } | null
-}
-
-const PR_VIEW_FIELDS =
-  'headRefName,state,title,isCrossRepository,headRepositoryOwner,headRepository'
-
-function forkFieldsFromPr(prInfo: PrViewInfo): { prIsFork?: boolean; prHeadRepo?: string } {
-  if (prInfo.isCrossRepository !== true) return {}
-  const owner = prInfo.headRepositoryOwner?.login
-  const name = prInfo.headRepository?.name
-  return { prIsFork: true, prHeadRepo: owner && name ? `${owner}/${name}` : undefined }
-}
-
-// `gh pr view` fails for many reasons beyond the PR genuinely not existing —
-// rate limiting, auth, network, or gh resolving the wrong default repo. Only
-// report "not found" when gh actually said the PR couldn't be resolved;
-// otherwise surface the real error so a rate-limit or auth failure isn't
-// misreported as a missing PR (which sends the user hunting for a PR that's
-// right there on GitHub).
-function describePrLookupFailure(prNumber: number, detail: string): string {
-  const trimmed = detail.trim()
-  const genuinelyMissing =
-    /could not resolve to a (pull ?request|issue)/i.test(trimmed) ||
-    /no pull requests? found/i.test(trimmed)
-  if (!trimmed || genuinelyMissing) {
-    return `PR #${prNumber} not found in this repository.`
-  }
-  return `Failed to look up PR #${prNumber}: ${trimmed}`
 }
 
 async function localBranchExists(runGit: GitRunner, branch: string): Promise<boolean> {
