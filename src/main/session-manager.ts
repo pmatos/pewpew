@@ -1847,11 +1847,18 @@ async function promptCleanup(id: string): Promise<void> {
 
     if (response === 0) {
       await removeSession(id)
-    } else if (response === 1) {
+    } else if (response === 1 || response === 2) {
+      // Keep (1) / Keep-and-open (2): the session is finished. The probe-absent
+      // path reaches here with connectionState 'offline' (the remote tmux is
+      // gone). Leaving it non-live would make SessionCard/DetailPane treat this
+      // kept session as a droppable remote and offer a Reconnect/Retry that
+      // silently reverts it to 'dead', undoing the Keep. Normalize to 'live' —
+      // the same terminal state a live-connection completion already lands in —
+      // so a kept remote session is uniformly terminal. (Local sessions have no
+      // hostId and keep connectionState undefined.)
+      if (session.hostId) session.connectionState = 'live'
       updateSession(id, 'completed')
-    } else if (response === 2) {
-      updateSession(id, 'completed')
-      shell.openPath(session.worktreePath)
+      if (response === 2) shell.openPath(session.worktreePath)
     }
   } finally {
     cleanupInProgress.delete(id)

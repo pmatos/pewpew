@@ -2976,6 +2976,9 @@ describe('attemptAutoReconnect', () => {
     // mocked dialog resolves on a later tick). Choosing "Keep" marks it completed
     // and must not touch the worktree.
     await vi.waitFor(() => expect(sm.getSessions()[0].status).toBe('completed'))
+    // Normalize connectionState to 'live' so a kept remote session is uniformly
+    // terminal — SessionCard/DetailPane must not offer a Reconnect that reverts it.
+    expect(sm.getSessions()[0].connectionState).toBe('live')
     expect(
       state.execRemoteCalls.some((c) => c.argv.includes('worktree') && c.argv.includes('remove'))
     ).toBe(false)
