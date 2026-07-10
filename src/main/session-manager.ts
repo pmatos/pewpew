@@ -932,9 +932,6 @@ async function createRemoteSession(
   return session
 }
 
-// Fields gh returns for a PR. Beyond head branch/state/title we read the
-// cross-repository flag and the head repo identity so a fork PR can be both
-// checked out (via refs/pull/<n>/head) and marked as such on the session.
 async function localBranchExists(runGit: GitRunner, branch: string): Promise<boolean> {
   try {
     await runGit(['rev-parse', '--verify', '--quiet', `refs/heads/${branch}`])

@@ -3,6 +3,9 @@
 // open PR number (with a TTL cache). Kept free of session state, disk I/O, and
 // Electron so it can be exercised directly through injected runners.
 
+// Fields gh returns for a PR. Beyond head branch/state/title we read the
+// cross-repository flag and the head repo identity so a fork PR can be both
+// checked out (via refs/pull/<n>/head) and marked as such on the session.
 export interface PrViewInfo {
   headRefName: string
   state: string
