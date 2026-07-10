@@ -19,6 +19,9 @@ export type RestoreOutcome =
   | 'remote-pending'
   // Remote session left dead — the remote tmux is confirmed gone.
   | 'remote-dead'
+  // Remote terminal (completed/error) session — finished, restored as 'live' so
+  // it isn't lazily reconnected/probed (which would flip it back to 'dead').
+  | 'remote-terminal'
   // Local session with a live tmux — reattach its pty in place.
   | 'reattach'
   // Local session deferred to lazy restore (pending) to avoid up-front spawn cost.
@@ -58,6 +61,15 @@ export function deriveRestoredState(
     const status = session.status === 'running' ? 'idle' : session.status
     if (status === 'dead') {
       return { status, connectionState: session.connectionState, outcome: 'remote-dead' }
+    }
+    if (status === 'completed' || status === 'error') {
+      // A finished remote session (e.g. one kept via promptCleanup) must not be
+      // lazily restored as 'pending': that renders DetailPane's "Connecting…"
+      // overlay and invites the first-open/batch reconnect probe to flip it back
+      // to 'dead', silently undoing Keep. Restore it 'live' — the terminal state
+      // an in-session completion lands in — so it reads as done and offers no
+      // reconnect affordance.
+      return { status, connectionState: 'live', outcome: 'remote-terminal' }
     }
     return { status, connectionState: 'pending', outcome: 'remote-pending' }
   }
