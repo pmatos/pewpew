@@ -61,14 +61,7 @@ import {
 } from './pr-worktree-planner'
 import { exec as execRemote, runtimeStateFor, type HostConnectionState } from './host-connection'
 import { remoteHostRuntime, type PreparedRemoteHostLease } from './remote-host-runtime'
-import {
-  createPrLookup,
-  describePrLookupFailure,
-  forkFieldsFromPr,
-  parseOwnerFromRemoteUrl,
-  PR_VIEW_FIELDS,
-  type PrViewInfo,
-} from './github'
+import { createPrLookup, parseOwnerFromRemoteUrl } from './github'
 import type {
   AgentTool,
   CreateSessionOptions,
