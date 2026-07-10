@@ -62,6 +62,9 @@ const state = vi.hoisted(() => ({
   // Response returned by the mocked cleanup dialog: 0 = Delete worktree,
   // 1 = Keep worktree, 2 = Keep and open in file manager.
   dialogResponse: 1,
+  // When true, the mocked cleanup dialog rejects (simulates showMessageBox
+  // failing — no window / IPC error) so the toast fallback can be exercised.
+  dialogThrows: false,
 }))
 
 vi.mock('./config', () => ({
@@ -106,7 +109,10 @@ vi.mock('./notifications', () => ({
 
 vi.mock('electron', () => ({
   dialog: {
-    showMessageBox: async () => ({ response: state.dialogResponse }),
+    showMessageBox: async () => {
+      if (state.dialogThrows) throw new Error('dialog failed')
+      return { response: state.dialogResponse }
+    },
   },
   shell: {
     openPath: async () => '',
@@ -352,6 +358,7 @@ beforeEach(() => {
   state.toasts = []
   state.hasPtyResult = new Set()
   state.dialogResponse = 1
+  state.dialogThrows = false
 })
 
 afterEach(() => {
@@ -3075,6 +3082,23 @@ describe('attemptAutoReconnect', () => {
     expect(
       state.execRemoteCalls.some((c) => c.argv.includes('worktree') && c.argv.includes('remove'))
     ).toBe(false)
+  })
+
+  it('falls back to a toast when the cleanup dialog fails', async () => {
+    // If showMessageBox rejects (no window / IPC error), promptCleanup rejects and
+    // the user would otherwise get neither a dialog nor a notification. The dead
+    // branch's .catch must still surface the "session ended" toast.
+    writeSessionsJson([baseRemoteSession({ id: 'r1', status: 'idle' })])
+    state.hasRemoteTmuxResult.set('r1', false)
+    state.dialogThrows = true
+    const sm = await loadSessionManager()
+    sm.restoreSessions()
+
+    await sm.attemptAutoReconnect('r1')
+
+    await vi.waitFor(() =>
+      expect(state.toasts).toContainEqual({ severity: 'error', title: 'Dev: remote session ended' })
+    )
   })
 
   it('auth-failed → gave-up (no retry)', async () => {

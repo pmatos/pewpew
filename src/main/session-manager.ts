@@ -1492,6 +1492,10 @@ export async function attemptAutoReconnect(id: string): Promise<AttemptOutcome> 
     // guard makes a late-arriving session.end hook a no-op.
     void promptCleanup(id).catch((err) => {
       console.error(`promptCleanup(${id}) failed:`, err)
+      // If the dialog itself failed (no window available, Electron dialog IPC
+      // error), still surface the "session ended" signal the old synchronous
+      // toast guaranteed — a dialog failure must not silently swallow it.
+      emitToast({ severity: 'error', title: `${label}: remote session ended` })
     })
     return 'gave-up'
   }
