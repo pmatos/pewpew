@@ -1215,11 +1215,11 @@ export async function reconnectRemoteSession(id: string): Promise<void> {
   // A terminal session is done — never re-probe/reconnect it. attemptAutoReconnect
   // already bails on 'completed'/'error' before calling; guard the manual/IPC entry
   // point too, so triggering Reconnect on a kept ('completed') or errored session
-  // can't probe-and-flip it back to 'dead', silently undoing the user's Keep. This
-  // matters beyond a stray call: on restart deriveRestoredState gives a kept remote
-  // session connectionState 'pending' (overwriting the 'live' promptCleanup set),
-  // which re-exposes the Reconnect affordance — this guard is what keeps clicking it
-  // a no-op. Mirrors the status guard in attemptAutoReconnect.
+  // can't probe-and-flip it back to 'dead', silently undoing the user's Keep.
+  // Defense-in-depth: deriveRestoredState now restores terminal remotes as 'live'
+  // (not 'pending'), so the UI no longer offers Reconnect for them — but this keeps
+  // any other caller that reaches here with a stale non-live terminal session a
+  // no-op. Mirrors the status guard in attemptAutoReconnect.
   const current = sessions.get(id)?.session
   if (current && (current.status === 'completed' || current.status === 'error')) return
 
@@ -1462,12 +1462,12 @@ async function doProbePendingSessionsOnHost(
 
   const pending: Session[] = []
   for (const entry of sessions.values()) {
-    // Skip terminal (completed/error) sessions even when restore left them
-    // 'pending' — deriveRestoredState lazily marks every non-dead remote session
-    // pending, including a kept 'completed' one. Probing it would find its tmux
-    // gone and flip it to 'dead', silently reverting a session the user chose to
-    // keep. Mirrors the terminal-state guards in attemptAutoReconnect and
-    // reconnectRemoteSession, closing the last reconnect entry point.
+    // Skip terminal (completed/error) sessions from the pending pool: probing one
+    // would find its tmux gone and flip it to 'dead', silently reverting a session
+    // the user chose to keep. deriveRestoredState now restores terminal remotes as
+    // 'live' (not 'pending'), so they shouldn't reach here — this is defense-in-depth
+    // against any other path leaving a terminal session 'pending'. Mirrors the
+    // guards in attemptAutoReconnect and reconnectRemoteSession.
     if (
       entry.session.hostId === hostId &&
       entry.session.connectionState === 'pending' &&
@@ -1786,7 +1786,19 @@ async function promptCleanup(id: string): Promise<void> {
       : await dialog.showMessageBox(options)
 
     if (response === 0) {
-      await removeSession(id)
+      try {
+        await removeSession(id)
+      } catch (err) {
+        // Surface a Delete failure (host config removed → getRequiredHost throws,
+        // or the remote SSH teardown fails) with its own accurate error. Letting
+        // it propagate to attemptAutoReconnect's `.catch` would mislabel it
+        // "remote session ended" and mask a worktree that's still there.
+        console.error(`removeSession(${id}) failed:`, err)
+        emitToast({
+          severity: 'error',
+          title: `Failed to remove worktree "${session.projectName}/${session.worktreeName}"`,
+        })
+      }
     } else if (response === 1 || response === 2) {
       // Keep (1) / Keep-and-open (2): the session is finished. The probe-absent
       // path reaches here with connectionState 'offline' (the remote tmux is
