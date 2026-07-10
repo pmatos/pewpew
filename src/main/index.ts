@@ -1,7 +1,6 @@
 import { app, BrowserWindow, ipcMain, shell, dialog } from 'electron'
 import { join, resolve } from 'path'
 import { copyFileSync, mkdirSync, chmodSync } from 'fs'
-import { open as openFile } from 'fs/promises'
 import { execFile } from 'child_process'
 import { promisify } from 'util'
 import {
@@ -38,8 +37,6 @@ import {
   createPrSessions,
   openSessionsForOpenPrs,
   openSessionsForOpenIssues,
-  countOpenIssues,
-  listRepoLabels,
   getSession,
   getSessions,
   restoreSessions,
@@ -55,7 +52,14 @@ import {
   updateLastKnownStatesBatch,
   stopSessionManager,
 } from './session-manager'
-import { parseDiff, synthesizeUntrackedFile } from './diff-parser'
+import { countOpenIssues, listRepoLabels } from './github-items'
+import {
+  collectReviewDiff,
+  listReviewBranches,
+  resolveReviewDefaultBranch,
+  readTextFileUnderLimit,
+  type GitRunner,
+} from './review'
 import { listHosts, addHost, updateHost, deleteHost, getHost } from './host-registry'
 import {
   testConnection,
@@ -85,39 +89,17 @@ import type {
 } from '../shared/types'
 
 const execFileAsync = promisify(execFile)
-const UNTRACKED_FILE_READ_CONCURRENCY = 16
 
-async function mapWithConcurrency<T, Result>(
-  items: T[],
-  concurrency: number,
-  mapper: (item: T, index: number) => Promise<Result>
-): Promise<Result[]> {
-  const results = new Array<Result>(items.length)
-  let nextIndex = 0
-  const runNext = async (): Promise<void> => {
-    const index = nextIndex
-    nextIndex += 1
-    if (index >= items.length) return
-    results[index] = await mapper(items[index], index)
-    return runNext()
-  }
+// Largest untracked file that gets synthesized into the review diff; bigger or
+// binary files are skipped so the review view stays responsive.
+const MAX_UNTRACKED_FILE_SIZE = 1_000_000
 
-  await Promise.all(Array.from({ length: Math.min(concurrency, items.length) }, () => runNext()))
-  return results
-}
-
-async function readTextFileUnderLimit(path: string, maxBytes: number): Promise<string | null> {
-  const file = await openFile(path, 'r')
-  try {
-    const fileStat = await file.stat()
-    if (!fileStat.isFile() || fileStat.size > maxBytes) return null
-
-    const content = await file.readFile('utf-8')
-    return Buffer.byteLength(content, 'utf-8') > maxBytes ? null : content
-  } finally {
-    await file.close()
-  }
-}
+// A GitRunner (review.ts seam) bound to a session's worktree. The generous
+// maxBuffer covers large diffs and long file/branch listings.
+const reviewGit =
+  (cwd: string): GitRunner =>
+  (argv) =>
+    execFileAsync('git', argv, { cwd, maxBuffer: 10_000_000 })
 
 // Use native Wayland rendering when available (avoids Xwayland scaling artifacts)
 app.commandLine.appendSwitch('ozone-platform-hint', 'auto')
@@ -592,62 +574,9 @@ app.whenReady().then(async () => {
         return { ok: false, reason: 'remote-unsupported' }
       }
       const cwd = session.worktreePath || session.projectPath
-
-      let diffArgs: string[]
-      switch (mode) {
-        case 'uncommitted': {
-          // Check if HEAD exists — new repos with no commits have no HEAD
-          try {
-            await execFileAsync('git', ['rev-parse', 'HEAD'], { cwd })
-            diffArgs = ['diff', 'HEAD']
-          } catch {
-            // No HEAD: diff staged+unstaged against the empty tree
-            const { stdout: emptyTree } = await execFileAsync(
-              'git',
-              ['hash-object', '-t', 'tree', '/dev/null'],
-              { cwd }
-            )
-            diffArgs = ['diff', emptyTree.trim()]
-          }
-          break
-        }
-        case 'unpushed':
-          diffArgs = ['diff', '@{upstream}']
-          break
-        case 'branch':
-          diffArgs = ['diff', `${baseBranch ?? 'main'}...`]
-          break
-      }
-
-      const { stdout: rawDiff } = await execFileAsync('git', diffArgs, {
-        cwd,
-        maxBuffer: 10_000_000,
-      })
-      const files = parseDiff(rawDiff)
-
-      if (mode === 'uncommitted') {
-        const { stdout: untrackedRaw } = await execFileAsync(
-          'git',
-          ['ls-files', '--others', '--exclude-standard'],
-          { cwd }
-        )
-        const untrackedPaths = untrackedRaw.split('\n').filter(Boolean)
-        const MAX_FILE_SIZE = 1_000_000 // 1MB
-        const untrackedFiles = await mapWithConcurrency(
-          untrackedPaths,
-          UNTRACKED_FILE_READ_CONCURRENCY,
-          async (filePath) => {
-            const fullPath = join(cwd, filePath)
-            const content = await readTextFileUnderLimit(fullPath, MAX_FILE_SIZE).catch(() => null)
-            if (content === null) return null
-            return synthesizeUntrackedFile(filePath, content)
-          }
-        )
-        for (const file of untrackedFiles) {
-          if (file) files.push(file)
-        }
-      }
-
+      const files = await collectReviewDiff(reviewGit(cwd), mode, baseBranch, (relativePath) =>
+        readTextFileUnderLimit(join(cwd, relativePath), MAX_UNTRACKED_FILE_SIZE)
+      )
       return { ok: true, files }
     }
   )
@@ -661,10 +590,7 @@ app.whenReady().then(async () => {
         return { ok: false, reason: 'remote-unsupported' }
       }
       const cwd = session.worktreePath || session.projectPath
-      const { stdout } = await execFileAsync('git', ['branch', '-a', '--format=%(refname:short)'], {
-        cwd,
-      })
-      return { ok: true, branches: stdout.split('\n').filter(Boolean) }
+      return { ok: true, branches: await listReviewBranches(reviewGit(cwd)) }
     }
   )
 
@@ -677,19 +603,7 @@ app.whenReady().then(async () => {
         return { ok: false, reason: 'remote-unsupported' }
       }
       const cwd = session.worktreePath || session.projectPath
-      try {
-        const { stdout } = await execFileAsync(
-          'git',
-          ['symbolic-ref', 'refs/remotes/origin/HEAD'],
-          {
-            cwd,
-          }
-        )
-        const ref = stdout.trim()
-        return { ok: true, branch: ref.replace('refs/remotes/origin/', '') }
-      } catch {
-        return { ok: true, branch: 'main' }
-      }
+      return { ok: true, branch: await resolveReviewDefaultBranch(reviewGit(cwd)) }
     }
   )
 
