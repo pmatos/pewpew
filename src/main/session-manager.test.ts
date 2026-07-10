@@ -1439,6 +1439,34 @@ describe('probePendingSessionsOnHost', () => {
     expect(cReattaches).toBe(1)
   })
 
+  it('a Keep landing during a batch probe is not clobbered back to dead', async () => {
+    // Batch-path analogue of the in-flight-probe race: while 'kept' is inside its
+    // probe, a concurrent session.end → promptCleanup → Keep marks it completed.
+    // The probe's later 'absent' result must not overwrite that back to 'dead'.
+    writeSessionsJson([
+      baseRemoteSession({ id: 'a', hostId: 'h1', status: 'idle' }),
+      baseRemoteSession({ id: 'kept', hostId: 'h1', status: 'idle' }),
+    ] as Session[])
+    state.hasRemoteTmuxResult.set('a', true)
+    state.hasRemoteTmuxResult.set('kept', false) // probe → absent
+    state.runtimeStates.set('h1', 'live')
+    const sm = await loadSessionManager()
+    sm.restoreSessions()
+
+    // Simulate the Keep landing (status → completed) while 'kept' is being probed.
+    state.probeSideEffect.set('kept', () => {
+      const kept = sm.getSessions().find((s) => s.id === 'kept')!
+      kept.status = 'completed'
+      kept.connectionState = 'live'
+    })
+
+    await sm.probePendingSessionsOnHost('h1')
+
+    const byId = Object.fromEntries(sm.getSessions().map((s) => [s.id, s]))
+    expect(byId['kept'].status).toBe('completed') // Keep preserved, not clobbered
+    expect(byId['a'].connectionState).toBe('live') // live sibling still reconnected
+  })
+
   it('idempotency: concurrent batch probes coalesce', async () => {
     writeSessionsJson(threePendingOnH1())
     state.hasRemoteTmuxResult.set('a', true)

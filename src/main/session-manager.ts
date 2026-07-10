@@ -1504,6 +1504,15 @@ async function doProbePendingSessionsOnHost(
     }
     try {
       const probe = await probeRemoteTmuxSession(s.id, reconnectHost)
+      // The session may have resolved to terminal (a concurrent session.end →
+      // promptCleanup → Keep) while this probe was in flight — the snapshot
+      // filter above only catches sessions already terminal at batch entry.
+      // Don't clobber that decision by applying the probe result; mirrors the
+      // post-await guard in doReconnectRemoteSession.
+      if (s.status === 'completed' || s.status === 'error') {
+        await reconnectNext(index + 1)
+        return
+      }
       if (probe === 'present') {
         await reattachRemotePty(s.id, reconnectHost)
         s.connectionState = 'live'
