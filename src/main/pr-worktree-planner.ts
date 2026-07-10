@@ -71,8 +71,7 @@ export interface PrWorktreePlan {
 }
 
 export type PlanPrWorktreeResult =
-  | { ok: true; plan: PrWorktreePlan }
-  | { ok: false; message: string }
+  { ok: true; plan: PrWorktreePlan } | { ok: false; message: string }
 
 // Decide how to check out a PR from its gh metadata. Returns a user-facing
 // message (never throws) when the PR isn't open; otherwise a fully-resolved
