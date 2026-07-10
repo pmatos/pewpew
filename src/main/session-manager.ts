@@ -1018,9 +1018,21 @@ async function createRemotePrSession(
     // same-repo head from origin/<branch>). A failure is tolerated — the branch
     // may already be present locally, and a head-elsewhere PR that genuinely
     // couldn't fetch is caught by the probe below.
-    await execRemote(host, ['git', '-C', projectPath, 'fetch', fetchRemote, fetchRefspec]).catch(
-      () => undefined
-    )
+    const fetchResult = await execRemote(host, [
+      'git',
+      '-C',
+      projectPath,
+      'fetch',
+      fetchRemote,
+      fetchRefspec,
+    ]).catch(() => undefined)
+    // Keep the fetch's stderr: an override fetch runs over the upstream repo's
+    // URL (not origin), so an auth/transport failure surfaces here and would
+    // otherwise be lost behind the generic "could not fetch" message.
+    const fetchError =
+      fetchResult && fetchResult.code !== 0
+        ? fetchResult.stderr.trim() || `git fetch exited ${fetchResult.code}`
+        : undefined
 
     // Pick the worktree-add form by probing for the local branch first instead
     // of try-then-fallback. The fallback masked real failures (e.g. branch
@@ -1031,7 +1043,7 @@ async function createRemotePrSession(
       // The pull-ref fetch should have created the pewpew/ branch; if it didn't
       // there's no valid origin fallback for a head-elsewhere PR (origin/<branch>
       // isn't the PR head).
-      return forkPullRefUnavailableMessage(branch, prNumber)
+      return forkPullRefUnavailableMessage(branch, prNumber, fetchError)
     }
     const addArgv = branchExistsLocally
       ? ['git', '-C', projectPath, 'worktree', 'add', worktreePath, localBranch]
@@ -2096,10 +2108,15 @@ export async function createPrSession(
   // opens an upstream PR) and the refspec (a head-elsewhere PR head is
   // force-fetched from refs/pull/<n>/head into its pewpew-namespaced branch, a
   // same-repo head from origin/<branch>).
+  // Keep the fetch error: an override fetch runs over the upstream repo's URL
+  // (not origin), so an auth/transport failure surfaces here and would otherwise
+  // be lost behind the generic "could not fetch" message.
+  let fetchError: string | undefined
   try {
     await runGit(['fetch', fetchRemote, fetchRefspec])
-  } catch {
+  } catch (err) {
     // Offline, or the branch is already present locally.
+    fetchError = describeGhError(err)
   }
   // The pull ref must have produced the local branch. If the fetch failed and it
   // doesn't exist, do NOT run `git worktree add <path> <localBranch>`: with no
@@ -2107,7 +2124,7 @@ export async function createPrSession(
   // (if one exists) and silently checks out the wrong commits. Fail explicitly
   // instead, mirroring the remote path.
   if (isFork && !(await localBranchExists(runGit, localBranch))) {
-    return forkPullRefUnavailableMessage(branch, prNumber)
+    return forkPullRefUnavailableMessage(branch, prNumber, fetchError)
   }
 
   // Create worktree from the PR branch

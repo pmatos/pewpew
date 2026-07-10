@@ -2,6 +2,7 @@ import { describe, expect, it } from 'vitest'
 import {
   describePrLookupFailure,
   forkFieldsFromPr,
+  forkPullRefUnavailableMessage,
   planPrWorktree,
   prHeadFetchRemote,
   type PrViewInfo,
@@ -54,6 +55,32 @@ describe('forkFieldsFromPr', () => {
       prIsFork: true,
       prHeadRepo: undefined,
     })
+  })
+})
+
+describe('forkPullRefUnavailableMessage', () => {
+  it('names the pull ref that could not be fetched', () => {
+    expect(forkPullRefUnavailableMessage('feature-x', 42)).toBe(
+      'Failed to create worktree for branch "feature-x": could not fetch refs/pull/42/head'
+    )
+  })
+
+  it('appends the underlying git error so an upstream auth/transport failure is visible', () => {
+    expect(
+      forkPullRefUnavailableMessage(
+        'feature-x',
+        42,
+        'fatal: Authentication failed for https://github.com/up/stream.git'
+      )
+    ).toBe(
+      'Failed to create worktree for branch "feature-x": could not fetch refs/pull/42/head — fatal: Authentication failed for https://github.com/up/stream.git'
+    )
+  })
+
+  it('ignores a blank detail', () => {
+    expect(forkPullRefUnavailableMessage('feature-x', 42, '   ')).toBe(
+      'Failed to create worktree for branch "feature-x": could not fetch refs/pull/42/head'
+    )
   })
 })
 

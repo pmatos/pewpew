@@ -132,9 +132,20 @@ export function planPrWorktree(
   }
 }
 
-// The error surfaced when a fork PR's pull-ref fetch didn't produce the local
-// branch: there is no valid origin fallback for a fork (origin/<branch> is not
-// the PR head), so both call sites must fail explicitly with this message.
-export function forkPullRefUnavailableMessage(branch: string, prNumber: number): string {
-  return `Failed to create worktree for branch "${branch}": could not fetch refs/pull/${prNumber}/head`
+// The error surfaced when a head-elsewhere PR's pull-ref fetch didn't produce
+// the local branch: there is no valid origin fallback (origin/<branch> is not
+// the PR head), so both call sites must fail explicitly with this message. When
+// the fetch itself reported an error, `detail` carries it — an override fetch
+// runs over the upstream repo's own URL rather than the pre-configured `origin`,
+// so a private/SSH-only/GHES upstream can fail auth here even though `gh pr view`
+// succeeded, and the raw git error is what tells the user that (rather than
+// looking like the PR doesn't exist).
+export function forkPullRefUnavailableMessage(
+  branch: string,
+  prNumber: number,
+  detail?: string
+): string {
+  const base = `Failed to create worktree for branch "${branch}": could not fetch refs/pull/${prNumber}/head`
+  const trimmed = detail?.trim()
+  return trimmed ? `${base} — ${trimmed}` : base
 }
