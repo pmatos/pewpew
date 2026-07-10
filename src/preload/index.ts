@@ -32,14 +32,38 @@ contextBridge.exposeInMainWorld('api', {
     hostId?: string | null,
     options?: CreateSessionOptions
   ) => ipcRenderer.invoke('sessions:create-prs', projectPath, prNumbers, hostId ?? null, options),
-  openSessionsForOpenPrs: (projectPath: string, hostId?: string | null) =>
-    ipcRenderer.invoke('sessions:open-all-prs', projectPath, hostId ?? null),
-  openSessionsForOpenIssues: (projectPath: string, hostId?: string | null, label?: string | null) =>
-    ipcRenderer.invoke('sessions:open-all-issues', projectPath, hostId ?? null, label ?? null),
-  countOpenIssues: (projectPath: string, hostId?: string | null, label?: string | null) =>
-    ipcRenderer.invoke('sessions:count-open-issues', projectPath, hostId ?? null, label ?? null),
-  listRepoLabels: (projectPath: string, hostId?: string | null) =>
-    ipcRenderer.invoke('repo:list-labels', projectPath, hostId ?? null),
+  openSessionsForOpenPrs: (projectPath: string, hostId?: string | null, repo?: string | null) =>
+    ipcRenderer.invoke('sessions:open-all-prs', projectPath, hostId ?? null, repo ?? null),
+  openSessionsForOpenIssues: (
+    projectPath: string,
+    hostId?: string | null,
+    label?: string | null,
+    repo?: string | null
+  ) =>
+    ipcRenderer.invoke(
+      'sessions:open-all-issues',
+      projectPath,
+      hostId ?? null,
+      label ?? null,
+      repo ?? null
+    ),
+  countOpenIssues: (
+    projectPath: string,
+    hostId?: string | null,
+    label?: string | null,
+    repo?: string | null
+  ) =>
+    ipcRenderer.invoke(
+      'sessions:count-open-issues',
+      projectPath,
+      hostId ?? null,
+      label ?? null,
+      repo ?? null
+    ),
+  listRepoLabels: (projectPath: string, hostId?: string | null, repo?: string | null) =>
+    ipcRenderer.invoke('repo:list-labels', projectPath, hostId ?? null, repo ?? null),
+  getRepoChoices: (projectPath: string, hostId?: string | null) =>
+    ipcRenderer.invoke('repo:choices', projectPath, hostId ?? null),
   mirrorWorktree: (projectPath: string, worktreePath: string, hostId?: string | null) =>
     ipcRenderer.invoke('sessions:mirror', projectPath, worktreePath, hostId ?? null),
   mirrorAllWorktrees: (projectPath: string, hostId?: string | null) =>

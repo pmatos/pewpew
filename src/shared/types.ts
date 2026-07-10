@@ -1,6 +1,11 @@
 export type SessionStatus = 'running' | 'needs_input' | 'idle' | 'completed' | 'error' | 'dead'
 export type ConnectionState =
-  'connecting' | 'live' | 'offline' | 'pending' | 'auth-failed' | 'unreachable'
+  | 'connecting'
+  | 'live'
+  | 'offline'
+  | 'pending'
+  | 'auth-failed'
+  | 'unreachable'
 
 export interface LastKnownState {
   text: string
@@ -154,7 +159,11 @@ export interface RemoteProject {
 }
 
 export type ValidateRemoteRepoReason =
-  'not-a-git-repo' | 'auth-failed' | 'network' | 'dep-missing' | 'unknown'
+  | 'not-a-git-repo'
+  | 'auth-failed'
+  | 'network'
+  | 'dep-missing'
+  | 'unknown'
 
 export interface ValidateRemoteRepoResult {
   ok: boolean
@@ -168,6 +177,19 @@ export type WorktreeBase = 'local' | 'origin-default'
 export interface CreateSessionOptions {
   baseRef?: WorktreeBase
   tool?: AgentTool
+  // The repo a PR belongs to, as "owner/name". Set only when it differs from
+  // the project's origin (e.g. opening a session for a PR that lives in the
+  // fork's upstream parent). The PR head is then fetched from this repo rather
+  // than from origin. Omitted = use origin, the historical behavior.
+  repo?: string
+}
+
+// The repos a project's PRs/issues can be drawn from: its origin ("current")
+// and, when origin is a fork, the detected upstream ("parent"). Presented in
+// the New PR/issue dialogs so a fork clone can target its upstream.
+export interface RepoChoices {
+  current: string
+  parent: string | null
 }
 
 export interface ReviewDiffResult {

@@ -979,6 +979,21 @@ interface PrViewInfo {
 const PR_VIEW_FIELDS =
   'headRefName,state,title,isCrossRepository,headRepositoryOwner,headRepository'
 
+// `gh pr view` args for a PR, targeting an explicit repo (a fork's upstream)
+// when given so gh doesn't resolve the wrong default repo.
+export function ghPrViewArgs(prNumber: number, repo?: string | null): string[] {
+  const args = ['pr', 'view', String(prNumber), '--json', PR_VIEW_FIELDS]
+  return repo ? [...args, '--repo', repo] : args
+}
+
+// Where to fetch a PR head's refs/pull/<n>/head from. With no override the head
+// lives on origin; an override (the PR's own repo, e.g. a fork's upstream)
+// exposes the pull ref on its own GitHub URL, which we fetch directly so we
+// don't need a named remote for it.
+export function prHeadFetchRemote(repo?: string | null): string {
+  return repo ? `https://github.com/${repo}.git` : 'origin'
+}
+
 function forkFieldsFromPr(prInfo: PrViewInfo): { prIsFork?: boolean; prHeadRepo?: string } {
   if (prInfo.isCrossRepository !== true) return {}
   const owner = prInfo.headRepositoryOwner?.login
@@ -1036,14 +1051,19 @@ async function createRemotePrSession(
       return ghProbe.error
     }
 
+    // Target an explicit repo (a fork's upstream) when given so gh doesn't
+    // resolve the wrong default repo; the repo is passed as $3 and inlined only
+    // when present.
+    const externalRepo = options.repo || undefined
     let prInfo: PrViewInfo
     const viewResult = await execRemote(host, [
       'sh',
       '-c',
-      `cd "$1" && gh pr view "$2" --json ${PR_VIEW_FIELDS}`,
+      `cd "$1" && gh pr view "$2" --json ${PR_VIEW_FIELDS}${externalRepo ? ' --repo "$3"' : ''}`,
       '_',
       projectPath,
       String(prNumber),
+      externalRepo ?? '',
     ])
     if (viewResult.timedOut || viewResult.code !== 0) {
       const detail =
@@ -1068,25 +1088,34 @@ async function createRemotePrSession(
 
     const branch = prInfo.headRefName
     const forkFields = forkFieldsFromPr(prInfo)
-    const isFork = forkFields.prIsFork === true
+    // The PR head lives outside our origin when it's a cross-repo (fork) PR OR
+    // when we target a different repo than origin (a fork opening its upstream's
+    // PR). Both need the pull-ref checkout into a namespaced branch, fetched
+    // from the repo the PR belongs to.
+    const headElsewhere = forkFields.prIsFork === true || externalRepo !== undefined
+    const headFields = {
+      ...(headElsewhere ? { prIsFork: true } : {}),
+      ...((forkFields.prHeadRepo ?? externalRepo)
+        ? { prHeadRepo: forkFields.prHeadRepo ?? externalRepo }
+        : {}),
+    }
     const id = randomUUID().slice(0, 8)
     const tmuxSession = `pewpew-${id}`
 
-    // A fork PR's head branch name isn't unique across forks, so check it out
-    // under a PR-scoped local branch namespaced under `pewpew/` — both to avoid
-    // colliding with a different fork that shares the name and so the forced
-    // fetch below can't clobber an unrelated user branch named `pr-<n>`. Same-
-    // repo PRs keep the real branch name so pushes update the PR via
-    // origin/<branch>.
-    const localBranch = isFork ? `pewpew/${worktreeName}` : branch
+    // A head-elsewhere PR's branch name isn't ours to own, so check it out under
+    // a PR-scoped local branch namespaced under `pewpew/` — both to avoid
+    // colliding with a branch that shares the name and so the forced fetch below
+    // can't clobber an unrelated user branch named `pr-<n>`. Same-repo PRs keep
+    // the real branch name so pushes update the PR via origin/<branch>.
+    const localBranch = headElsewhere ? `pewpew/${worktreeName}` : branch
 
-    // Fetch the PR head into the local branch we'll check out. A fork PR head
-    // is ONLY authoritative via GitHub's refs/pull/<n>/head: never fetch
-    // origin/<branch>, because if the fork's head branch name also exists on
-    // the base repo (e.g. a fork whose head branch is `main`) that fetch would
-    // succeed and we'd check out the base repo's branch instead of the PR's
+    // Fetch the PR head into the local branch we'll check out. A head-elsewhere
+    // PR head is ONLY authoritative via GitHub's refs/pull/<n>/head, fetched
+    // from the repo the PR belongs to (origin, or a fork's upstream when
+    // overridden): never fetch origin/<branch>, because if that branch name
+    // also exists on origin the fetch would succeed and we'd check out the wrong
     // commits. A same-repo PR head lives on origin/<branch>, so fetch that.
-    if (isFork) {
+    if (headElsewhere) {
       // Forced refspec (`+`): a removed session can leave the pewpew/ branch
       // behind, and a later PR force-push makes a non-forced fetch reject as
       // non-fast-forward, so remoteBranchExists would see the stale branch and
@@ -1097,7 +1126,7 @@ async function createRemotePrSession(
         '-C',
         projectPath,
         'fetch',
-        'origin',
+        prHeadFetchRemote(externalRepo),
         `+pull/${prNumber}/head:${localBranch}`,
       ]).catch(() => undefined)
     } else {
@@ -1111,7 +1140,7 @@ async function createRemotePrSession(
     // already checked out in a stale worktree) by surfacing the second
     // attempt's misleading "branch already exists" error.
     const branchExistsLocally = await remoteBranchExists(host, projectPath, localBranch)
-    if (isFork && !branchExistsLocally) {
+    if (headElsewhere && !branchExistsLocally) {
       // The pull-ref fetch should have created pr-<n>; if it didn't there's no
       // valid origin fallback for a fork (origin/<branch> isn't the PR head).
       return `Failed to create worktree for branch "${branch}": could not fetch refs/pull/${prNumber}/head`
@@ -1156,7 +1185,7 @@ async function createRemotePrSession(
       worktreePath,
       branch: resolvedBranch,
       prNumber,
-      ...forkFields,
+      ...headFields,
       issueNumber: parseIssueNumber(worktreeName, resolvedBranch, prInfo.title),
       pid: 0,
       tmuxSession,
@@ -1880,7 +1909,7 @@ interface CreateIssueSessionDeps {
 
 interface CreatePrSessionDeps {
   runGit?: GitRunner
-  prView?: (projectPath: string, prNumber: number) => Promise<PrViewInfo>
+  prView?: (projectPath: string, prNumber: number, repo?: string | null) => Promise<PrViewInfo>
   createSessionForWorktree?: (
     projectPath: string,
     worktreePath: string,
@@ -2002,11 +2031,12 @@ async function openSessionsForNumberedItems(
   hostId: string | null,
   field: 'prNumber' | 'issueNumber',
   listItems: ListNumberedItems,
-  createSession: CreateNumberedSession
+  createSession: CreateNumberedSession,
+  repo: string | null = null
 ): Promise<OpenSessionsSummary | string> {
   let items: NumberedGhItem[] | string
   try {
-    items = await listItems(projectPath, hostId)
+    items = await listItems(projectPath, hostId, repo)
   } catch (err) {
     return describeGhError(err)
   }
@@ -2017,7 +2047,8 @@ async function openSessionsForNumberedItems(
     hostId,
     field,
     items.map((i) => i.number),
-    createSession
+    createSession,
+    repo ? { repo } : {}
   )
 }
 
@@ -2038,20 +2069,16 @@ export async function createPrSession(
     })
   const prView =
     deps.prView ??
-    (async (cwd: string, number: number): Promise<PrViewInfo> => {
-      const { stdout } = await execFileAsync(
-        'gh',
-        ['pr', 'view', String(number), '--json', PR_VIEW_FIELDS],
-        { cwd }
-      )
+    (async (cwd: string, number: number, repo?: string | null): Promise<PrViewInfo> => {
+      const { stdout } = await execFileAsync('gh', ghPrViewArgs(number, repo), { cwd })
       return JSON.parse(stdout)
     })
   const adopt = deps.createSessionForWorktree ?? createSessionForWorktree
 
-  // Look up PR via gh CLI
+  // Look up PR via gh CLI, targeting an explicit repo (a fork's upstream) when given.
   let prInfo: PrViewInfo
   try {
-    prInfo = await prView(projectPath, prNumber)
+    prInfo = await prView(projectPath, prNumber, options.repo)
   } catch (err) {
     return describePrLookupFailure(prNumber, describeGhError(err))
   }
@@ -2062,7 +2089,14 @@ export async function createPrSession(
 
   const branch = prInfo.headRefName
   const forkFields = forkFieldsFromPr(prInfo)
-  const isFork = forkFields.prIsFork === true
+  // The PR's head lives outside our origin when it's a cross-repo (fork) PR OR
+  // when we're targeting a different repo than origin (e.g. a fork opening its
+  // upstream's PR). Both need the pull-ref checkout into a namespaced branch;
+  // both mean pushes from the worktree won't update the PR.
+  const externalRepo = options.repo || undefined
+  const headElsewhere = forkFields.prIsFork === true || externalRepo !== undefined
+  const prHeadRepo = forkFields.prHeadRepo ?? externalRepo
+  const prIsFork = headElsewhere ? true : undefined
 
   const worktreeName = `pr-${prNumber}`
 
@@ -2074,15 +2108,15 @@ export async function createPrSession(
   // by branch: that would hijack a different fork's session.
   const existing =
     findSessionByPrNumber(projectPath, hostId, prNumber) ??
-    (isFork ? undefined : findSessionByBranch(projectPath, hostId, branch))
+    (headElsewhere ? undefined : findSessionByBranch(projectPath, hostId, branch))
   if (existing) {
     // `gh pr view <prNumber>` just confirmed this branch belongs to the
     // requested PR, so overwrite any stale prNumber rather than only filling
     // an empty one — otherwise the requested PR is reported as linked but the
     // session keeps a different number and the PR gets offered again.
     existing.prNumber = prNumber
-    existing.prIsFork = forkFields.prIsFork
-    existing.prHeadRepo = forkFields.prHeadRepo
+    existing.prIsFork = prIsFork
+    existing.prHeadRepo = prHeadRepo
     if (existing.issueNumber === undefined) {
       existing.issueNumber = parseIssueNumber(prInfo.title)
     }
@@ -2092,28 +2126,31 @@ export async function createPrSession(
 
   const worktreePath = join(projectPath, '.claude', 'worktrees', worktreeName)
 
-  // The local branch to check out. A fork PR's head branch name isn't unique
-  // across forks, so give it a PR-scoped local branch. We namespace it under
-  // `pewpew/` (rather than a bare `pr-<n>`) so the forced fetch below can never
-  // clobber an unrelated user branch that happens to be named `pr-<n>`. Same-
-  // repo PRs keep the real branch name so pushes from the worktree update the
-  // PR via origin/<branch>.
-  const localBranch = isFork ? `pewpew/${worktreeName}` : branch
+  // The local branch to check out. A head-elsewhere PR's branch name isn't ours
+  // to own, so give it a PR-scoped local branch namespaced under `pewpew/`
+  // (rather than a bare `pr-<n>`) so the forced fetch below can never clobber an
+  // unrelated user branch named `pr-<n>`. Same-repo PRs keep the real branch
+  // name so pushes from the worktree update the PR via origin/<branch>.
+  const localBranch = headElsewhere ? `pewpew/${worktreeName}` : branch
 
-  // Fetch the PR head into the local branch we'll check out. A fork PR head is
-  // ONLY authoritative via GitHub's refs/pull/<n>/head: we must not fetch
-  // origin/<branch>, because if the fork's head branch name also exists on the
-  // base repo (e.g. a fork whose head branch is `main`) that fetch would
-  // succeed and we'd later check out the base repo's branch instead of the
-  // PR's commits. A same-repo PR head lives on origin/<branch>, so fetch that.
-  if (isFork) {
+  // Fetch the PR head into the local branch we'll check out. A head-elsewhere PR
+  // head is ONLY authoritative via GitHub's refs/pull/<n>/head, fetched from the
+  // repo the PR belongs to (origin, or a fork's upstream when overridden): we
+  // must not fetch origin/<branch>, because if that branch name also exists on
+  // origin the fetch would succeed and we'd check out the wrong commits. A
+  // same-repo PR head lives on origin/<branch>, so fetch that.
+  if (headElsewhere) {
     // Forced refspec (`+`): a removed session leaves refs/heads/pewpew/pr-<n>
     // behind, and a later PR force-push makes a non-forced fetch reject as
     // non-fast-forward — silently reopening stale commits. The pewpew/ branch
     // is pewpew-owned and must always track the current PR head, and same-PR
     // reuse already returned above, so it isn't checked out here.
     try {
-      await runGit(['fetch', 'origin', `+pull/${prNumber}/head:${localBranch}`])
+      await runGit([
+        'fetch',
+        prHeadFetchRemote(externalRepo),
+        `+pull/${prNumber}/head:${localBranch}`,
+      ])
     } catch {
       // Offline, or the namespaced branch is already present locally.
     }
@@ -2137,8 +2174,9 @@ export async function createPrSession(
   try {
     await runGit(['worktree', 'add', worktreePath, localBranch])
   } catch (err) {
-    // A fork PR has no valid origin fallback — origin/<branch> is not its head.
-    if (isFork) {
+    // A head-elsewhere PR has no valid origin fallback — origin/<branch> is not
+    // its head.
+    if (headElsewhere) {
       return `Failed to create worktree for branch "${branch}": ${(err as Error).message}`
     }
     // Same-repo branch may not exist locally yet — create it tracking origin.
@@ -2153,8 +2191,8 @@ export async function createPrSession(
   // We already know the PR number; set it directly so it shows immediately
   // (the async lookup fired by adoptWorktree will no-op since prNumber is set).
   session.prNumber = prNumber
-  session.prIsFork = forkFields.prIsFork
-  session.prHeadRepo = forkFields.prHeadRepo
+  session.prIsFork = prIsFork
+  session.prHeadRepo = prHeadRepo
   // Prefer an issue number parsed from the PR title if the name/branch didn't yield one.
   if (session.issueNumber === undefined) {
     session.issueNumber = parseIssueNumber(prInfo.title)
@@ -2355,6 +2393,7 @@ async function createRemoteIssueSession(
 export async function openSessionsForOpenPrs(
   projectPath: string,
   hostId: string | null = null,
+  repo: string | null = null,
   deps: OpenSessionsDeps = {}
 ): Promise<OpenSessionsSummary | string> {
   return openSessionsForNumberedItems(
@@ -2362,7 +2401,8 @@ export async function openSessionsForOpenPrs(
     hostId,
     'prNumber',
     deps.listPrs ?? listOpenPrs,
-    deps.createPrSession ?? createPrSession
+    deps.createPrSession ?? createPrSession,
+    repo
   )
 }
 
@@ -2370,14 +2410,16 @@ export async function openSessionsForOpenIssues(
   projectPath: string,
   hostId: string | null = null,
   label?: string,
+  repo: string | null = null,
   deps: OpenSessionsDeps = {}
 ): Promise<OpenSessionsSummary | string> {
   return openSessionsForNumberedItems(
     projectPath,
     hostId,
     'issueNumber',
-    deps.listIssues ?? ((p, h) => listOpenIssues(p, h, label)),
-    deps.createIssueSession ?? createIssueSession
+    deps.listIssues ?? ((p, h, r) => listOpenIssues(p, h, label, r)),
+    deps.createIssueSession ?? createIssueSession,
+    repo
   )
 }
 

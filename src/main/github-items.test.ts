@@ -244,6 +244,49 @@ describe('listOpenPrs / listOpenIssues (local)', () => {
       'Failed to list open issues: gh: not authenticated'
     )
   })
+
+  it('lists PRs for an explicit repo without resolving origin (local)', async () => {
+    const { listOpenPrs } = await load()
+    const calls: string[][] = []
+    state.execLocal = (_file, args) => {
+      calls.push(args)
+      return { stdout: '5\n6\n' }
+    }
+    expect(await listOpenPrs('/proj', null, 'up/stream')).toEqual([{ number: 5 }, { number: 6 }])
+    // The explicit repo means we must NOT run `gh repo view` to resolve origin.
+    expect(calls.some((args) => args[0] === 'repo')).toBe(false)
+    const apiCall = calls.find((args) => args[0] === 'api')
+    expect(apiCall).toContain('repos/up/stream/pulls?state=open&per_page=100')
+  })
+
+  it('lists issues for an explicit repo with a label (local)', async () => {
+    const { listOpenIssues } = await load()
+    const calls: string[][] = []
+    state.execLocal = (_file, args) => {
+      calls.push(args)
+      return { stdout: '9\n' }
+    }
+    expect(await listOpenIssues('/proj', null, 'bug', 'up/stream')).toEqual([{ number: 9 }])
+    expect(calls.some((args) => args[0] === 'repo')).toBe(false)
+    const apiCall = calls.find((args) => args[0] === 'api')
+    expect(apiCall).toContain('repos/up/stream/issues?state=open&per_page=100&labels=bug')
+  })
+
+  it('lists PRs for an explicit repo over SSH without resolving origin', async () => {
+    const { listOpenPrs } = await load()
+    state.execRemote = (_h, argv) => {
+      if (argv.join(' ').includes('command -v gh')) {
+        return { stdout: '', stderr: '', code: 0, timedOut: false }
+      }
+      return { stdout: '5\n', stderr: '', code: 0, timedOut: false }
+    }
+    expect(await listOpenPrs('/remote/proj', 'h1', 'up/stream')).toEqual([{ number: 5 }])
+    const listCall = state.execRemoteCalls.find((argv) => !argv.join(' ').includes('command -v gh'))
+    // The repo override is passed as a positional the remote script prefers over
+    // resolving origin (the `$4` branch), so `up/stream` reaches the host verbatim.
+    expect(listCall).toContain('up/stream')
+    expect(listCall?.join(' ')).toContain('if [ -n "$4" ]')
+  })
 })
 
 describe('countOpenIssues', () => {
@@ -261,6 +304,63 @@ describe('countOpenIssues', () => {
       listIssues: async () => 'Failed to list open issues: gh auth failed',
     })
     expect(result).toBe('Failed to list open issues: gh auth failed')
+  })
+})
+
+describe('getRepoChoices', () => {
+  it('resolves origin and its upstream parent for a fork (local)', async () => {
+    const { getRepoChoices } = await load()
+    const calls: string[][] = []
+    state.execLocal = (_file, args) => {
+      calls.push(args)
+      return { stdout: 'me/fork\nup/stream\n' }
+    }
+    expect(await getRepoChoices('/proj', null)).toEqual({ current: 'me/fork', parent: 'up/stream' })
+    // Asked gh for both nameWithOwner and parent in one repo-view call.
+    expect(calls[0].slice(0, 4)).toEqual(['repo', 'view', '--json', 'nameWithOwner,parent'])
+  })
+
+  it('returns a null parent when origin is not a fork (local)', async () => {
+    const { getRepoChoices } = await load()
+    state.execLocal = () => ({ stdout: 'me/repo\n\n' })
+    expect(await getRepoChoices('/proj', null)).toEqual({ current: 'me/repo', parent: null })
+  })
+
+  it('surfaces a local gh failure as a string', async () => {
+    const { getRepoChoices } = await load()
+    state.execLocal = () => {
+      throw Object.assign(new Error('Command failed'), { stderr: 'gh: not authenticated' })
+    }
+    expect(await getRepoChoices('/proj', null)).toBe(
+      'Failed to resolve repo: gh: not authenticated'
+    )
+  })
+
+  it('resolves the fork/parent over SSH', async () => {
+    const { getRepoChoices } = await load()
+    state.execRemote = (_h, argv) => {
+      if (argv.join(' ').includes('command -v gh')) {
+        return { stdout: '', stderr: '', code: 0, timedOut: false }
+      }
+      return { stdout: 'me/fork\nup/stream\n', stderr: '', code: 0, timedOut: false }
+    }
+    expect(await getRepoChoices('/remote/proj', 'h1')).toEqual({
+      current: 'me/fork',
+      parent: 'up/stream',
+    })
+  })
+
+  it('surfaces a remote gh probe failure instead of resolving', async () => {
+    const { getRepoChoices } = await load()
+    state.execRemote = () => ({
+      stdout: '',
+      stderr: 'Permission denied (publickey).\n',
+      code: 255,
+      timedOut: false,
+    })
+    expect(await getRepoChoices('/remote/proj', 'h1')).toBe(
+      'SSH authentication failed on Dev: Permission denied (publickey).'
+    )
   })
 })
 

@@ -2128,14 +2128,17 @@ describe('openSessionsForOpenPrs', () => {
         baseLocalSession({ id: `s-${prNumber}`, prNumber }) as Session | string
     )
 
-    const result = await sm.openSessionsForOpenPrs('/proj', null, { listPrs, createPrSession })
+    const result = await sm.openSessionsForOpenPrs('/proj', null, null, {
+      listPrs,
+      createPrSession,
+    })
     expect(typeof result).not.toBe('string')
     if (typeof result === 'string') throw new Error(result)
 
     expect(result.skipped).toEqual([7])
     expect(result.created.map((s) => s.prNumber).sort()).toEqual([8, 9])
     expect(result.failed).toEqual([])
-    expect(listPrs).toHaveBeenCalledWith('/proj', null)
+    expect(listPrs).toHaveBeenCalledWith('/proj', null, null)
     expect(createPrSession).toHaveBeenCalledTimes(2)
     expect(createPrSession).toHaveBeenCalledWith('/proj', 8, null, {})
     expect(createPrSession).toHaveBeenCalledWith('/proj', 9, null, {})
@@ -2143,12 +2146,28 @@ describe('openSessionsForOpenPrs', () => {
 
   it('surfaces gh list errors as a string', async () => {
     const sm = await loadSessionManager()
-    const result = await sm.openSessionsForOpenPrs('/proj', null, {
+    const result = await sm.openSessionsForOpenPrs('/proj', null, null, {
       listPrs: async () => 'Failed to list open PRs: gh auth failed',
       createPrSession: vi.fn(),
     })
 
     expect(result).toBe('Failed to list open PRs: gh auth failed')
+  })
+
+  it('threads an explicit repo into listing and per-PR creation', async () => {
+    const sm = await loadSessionManager()
+    const listPrs = vi.fn(async () => [{ number: 8, title: 'x', headRefName: 'b' }])
+    const createPrSession = vi.fn(
+      async (_projectPath: string, prNumber: number) =>
+        baseLocalSession({ id: `s-${prNumber}`, prNumber }) as Session | string
+    )
+    const result = await sm.openSessionsForOpenPrs('/proj', null, 'up/stream', {
+      listPrs,
+      createPrSession,
+    })
+    expect(typeof result).not.toBe('string')
+    expect(listPrs).toHaveBeenCalledWith('/proj', null, 'up/stream')
+    expect(createPrSession).toHaveBeenCalledWith('/proj', 8, null, { repo: 'up/stream' })
   })
 
   it('surfaces remote SSH auth failures separately from missing gh', async () => {
@@ -2192,7 +2211,7 @@ describe('openSessionsForOpenIssues', () => {
         baseLocalSession({ id: `s-${issueNumber}`, issueNumber }) as Session | string
     )
 
-    const result = await sm.openSessionsForOpenIssues('/proj', null, undefined, {
+    const result = await sm.openSessionsForOpenIssues('/proj', null, undefined, null, {
       listIssues,
       createIssueSession,
     })
@@ -2202,14 +2221,14 @@ describe('openSessionsForOpenIssues', () => {
     expect(result.skipped).toEqual([3])
     expect(result.created.map((s) => s.issueNumber)).toEqual([4])
     expect(result.failed).toEqual([])
-    expect(listIssues).toHaveBeenCalledWith('/proj', null)
+    expect(listIssues).toHaveBeenCalledWith('/proj', null, null)
     expect(createIssueSession).toHaveBeenCalledTimes(1)
     expect(createIssueSession).toHaveBeenCalledWith('/proj', 4, null, {})
   })
 
   it('records per-issue create failures in the summary', async () => {
     const sm = await loadSessionManager()
-    const result = await sm.openSessionsForOpenIssues('/proj', null, undefined, {
+    const result = await sm.openSessionsForOpenIssues('/proj', null, undefined, null, {
       listIssues: async () => [{ number: 5 }],
       createIssueSession: async () => 'boom',
     })
@@ -2228,13 +2247,29 @@ describe('openSessionsForOpenIssues', () => {
         baseLocalSession({ id: `s-${issueNumber}`, issueNumber }) as Session | string
     )
 
-    const result = await sm.openSessionsForOpenIssues('/proj', null, 'bug', {
+    const result = await sm.openSessionsForOpenIssues('/proj', null, 'bug', null, {
       listIssues,
       createIssueSession,
     })
     expect(typeof result).not.toBe('string')
     if (typeof result === 'string') throw new Error(result)
     expect(result.created.map((s) => s.issueNumber)).toEqual([7])
+  })
+
+  it('threads an explicit repo into issue listing and creation', async () => {
+    const sm = await loadSessionManager()
+    const listIssues = vi.fn(async () => [{ number: 4 }])
+    const createIssueSession = vi.fn(
+      async (_projectPath: string, issueNumber: number) =>
+        baseLocalSession({ id: `s-${issueNumber}`, issueNumber }) as Session | string
+    )
+    const result = await sm.openSessionsForOpenIssues('/proj', null, 'bug', 'up/stream', {
+      listIssues,
+      createIssueSession,
+    })
+    expect(typeof result).not.toBe('string')
+    expect(listIssues).toHaveBeenCalledWith('/proj', null, 'up/stream')
+    expect(createIssueSession).toHaveBeenCalledWith('/proj', 4, null, { repo: 'up/stream' })
   })
 })
 
@@ -2793,6 +2828,89 @@ describe('createPrSession fork handling', () => {
   })
 })
 
+describe('ghPrViewArgs', () => {
+  it('omits --repo when no repo override is given', async () => {
+    const sm = await loadSessionManager()
+    const args = sm.ghPrViewArgs(7)
+    expect(args.slice(0, 4)).toEqual(['pr', 'view', '7', '--json'])
+    expect(args).not.toContain('--repo')
+  })
+
+  it('appends --repo <owner/name> for an explicit repo', async () => {
+    const sm = await loadSessionManager()
+    expect(sm.ghPrViewArgs(7, 'up/stream').slice(-2)).toEqual(['--repo', 'up/stream'])
+  })
+})
+
+describe('prHeadFetchRemote', () => {
+  it('fetches from origin when there is no repo override', async () => {
+    const sm = await loadSessionManager()
+    expect(sm.prHeadFetchRemote()).toBe('origin')
+    expect(sm.prHeadFetchRemote(null)).toBe('origin')
+  })
+
+  it('fetches from the upstream https URL for a repo override', async () => {
+    const sm = await loadSessionManager()
+    expect(sm.prHeadFetchRemote('up/stream')).toBe('https://github.com/up/stream.git')
+  })
+})
+
+describe('createPrSession repo override (upstream)', () => {
+  it('fetches the PR head from the chosen upstream repo, never from origin', async () => {
+    const sm = await loadSessionManager()
+    const runGit = vi.fn(async (argv: string[]) => {
+      const key = argv.join(' ')
+      // The upstream PR head is fetched from the parent repo's URL into a
+      // pewpew-namespaced PR branch — origin (our fork) is never touched.
+      if (key === 'fetch https://github.com/up/stream.git +pull/42/head:pewpew/pr-42')
+        return { stdout: '' }
+      if (key === 'rev-parse --verify --quiet refs/heads/pewpew/pr-42') return { stdout: 'abc\n' }
+      if (key === 'worktree add /proj/.claude/worktrees/pr-42 pewpew/pr-42') return { stdout: '' }
+      throw new Error(`unexpected git ${key}`)
+    })
+    // A plain internal upstream PR (not cross-repo) — the head still lives in a
+    // repo that isn't our origin, so it must be treated as head-elsewhere.
+    const prView = vi.fn(async () => ({
+      headRefName: 'feature-x',
+      state: 'OPEN',
+      title: 'feat: x',
+      isCrossRepository: false,
+    }))
+    const createSessionForWorktree = vi.fn(async () =>
+      baseLocalSession({
+        id: 'pr-42',
+        projectPath: '/proj',
+        worktreeName: 'pr-42',
+        worktreePath: '/proj/.claude/worktrees/pr-42',
+        branch: 'pewpew/pr-42',
+      })
+    )
+
+    const result = await sm.createPrSession(
+      '/proj',
+      42,
+      null,
+      { repo: 'up/stream' },
+      { runGit, prView, createSessionForWorktree }
+    )
+
+    expect(typeof result).not.toBe('string')
+    if (typeof result === 'string') throw new Error(result)
+    expect(result.prNumber).toBe(42)
+    // The head lives outside origin, so the session is flagged and points at the
+    // source repo (pushes from the worktree won't update the PR).
+    expect(result.prIsFork).toBe(true)
+    expect(result.prHeadRepo).toBe('up/stream')
+    expect(prView).toHaveBeenCalledWith('/proj', 42, 'up/stream')
+    expect(runGit).toHaveBeenCalledWith([
+      'fetch',
+      'https://github.com/up/stream.git',
+      '+pull/42/head:pewpew/pr-42',
+    ])
+    expect(runGit).not.toHaveBeenCalledWith(['fetch', 'origin', 'feature-x'])
+  })
+})
+
 describe('createPrSessions', () => {
   it('skips numbers that already have a session and creates the rest', async () => {
     const sm = await loadSessionManager()
@@ -2814,6 +2932,17 @@ describe('createPrSessions', () => {
     expect(createPrSession).toHaveBeenCalledTimes(2)
     expect(createPrSession).toHaveBeenCalledWith('/proj', 8, null, {})
     expect(createPrSession).toHaveBeenCalledWith('/proj', 9, null, {})
+  })
+
+  it('forwards a repo override to each created PR session', async () => {
+    const sm = await loadSessionManager()
+    const createPrSession = vi.fn(
+      async (_projectPath: string, prNumber: number) =>
+        baseLocalSession({ id: `s-${prNumber}`, prNumber }) as Session | string
+    )
+    await sm.createPrSessions('/proj', [8, 9], null, { repo: 'up/stream' }, { createPrSession })
+    expect(createPrSession).toHaveBeenCalledWith('/proj', 8, null, { repo: 'up/stream' })
+    expect(createPrSession).toHaveBeenCalledWith('/proj', 9, null, { repo: 'up/stream' })
   })
 
   it('aggregates per-number failures into the summary', async () => {

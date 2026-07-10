@@ -3,7 +3,7 @@ import { useProjectsStore, remoteWorktreeKey } from '../stores/projects'
 import { useSessionsStore } from '../stores/sessions'
 import { useHostsStore } from '../stores/hosts'
 import ContextMenu, { type MenuItem } from './ContextMenu'
-import type { AgentTool, OpenSessionsSummary } from '../../shared/types'
+import type { AgentTool, OpenSessionsSummary, RepoChoices } from '../../shared/types'
 import { parsePrSpec } from '../utils/pr-spec-parser'
 
 interface MenuState {
@@ -39,6 +39,14 @@ interface ProjectTreeUiState {
   pendingPrTool: AgentTool
   prNumberInput: string
   prError: string | null
+  pendingOpenAllPrsPath: string | null
+  pendingOpenAllPrsHostId: string | null
+  // The repos a PR/issue can be drawn from (origin + detected upstream parent),
+  // and the currently-selected one. Shared across the PR, issue, and open-all
+  // dialogs since only one is open at a time. null until resolved / when the
+  // project isn't a fork.
+  repoChoices: RepoChoices | null
+  selectedRepo: string
   pendingIssuePath: string | null
   pendingIssueHostId: string | null
   issueLabels: string[] | null
@@ -55,6 +63,37 @@ function projectTreeUiReducer(
   update: Partial<ProjectTreeUiState>
 ): ProjectTreeUiState {
   return { ...state, ...update }
+}
+
+// Repository picker for the PR/issue/open-all dialogs, shown only when origin is
+// a fork (a parent was detected). A component (rather than an inline render
+// helper) so its onChange is a normal event-handler prop.
+function RepoPicker({
+  choices,
+  value,
+  disabled,
+  onChange,
+}: {
+  choices: RepoChoices | null
+  value: string
+  disabled: boolean
+  onChange: (repo: string) => void
+}) {
+  if (!choices?.parent) return null
+  return (
+    <>
+      <div className="session-name-label">Repository:</div>
+      <select
+        className="create-input"
+        value={value}
+        disabled={disabled}
+        onChange={(e) => onChange(e.target.value)}
+      >
+        <option value={choices.current}>{choices.current} (this repo)</option>
+        <option value={choices.parent}>{choices.parent} (upstream)</option>
+      </select>
+    </>
+  )
 }
 
 export default function ProjectTree(props: TreeProps) {
@@ -85,6 +124,10 @@ function useProjectTreeElement({ onOpenSession }: TreeProps) {
     pendingPrTool: 'claude',
     prNumberInput: '',
     prError: null,
+    pendingOpenAllPrsPath: null,
+    pendingOpenAllPrsHostId: null,
+    repoChoices: null,
+    selectedRepo: '',
     pendingIssuePath: null,
     pendingIssueHostId: null,
     issueLabels: null,
@@ -111,6 +154,10 @@ function useProjectTreeElement({ onOpenSession }: TreeProps) {
     pendingPrTool,
     prNumberInput,
     prError,
+    pendingOpenAllPrsPath,
+    pendingOpenAllPrsHostId,
+    repoChoices,
+    selectedRepo,
     pendingIssuePath,
     pendingIssueHostId,
     issueLabels,
@@ -126,6 +173,35 @@ function useProjectTreeElement({ onOpenSession }: TreeProps) {
   // Monotonic token: bumped whenever the issue dialog opens or closes so an
   // in-flight countOpenIssues can detect it was canceled/reopened mid-await.
   const issueRequestRef = useRef(0)
+  // Monotonic token for in-flight getRepoChoices, so a slow response for a
+  // closed/reopened dialog can't clobber current state.
+  const repoRequestRef = useRef(0)
+
+  // Fetch the repo choices (origin + upstream parent) for a dialog. Any failure
+  // (or a non-fork repo) leaves repoChoices null so the picker stays hidden and
+  // the default origin behavior is used.
+  const loadRepoChoices = (projectPath: string, hostId: string | null) => {
+    const token = (repoRequestRef.current += 1)
+    setUi({ repoChoices: null, selectedRepo: '' })
+    window.api
+      .getRepoChoices(projectPath, hostId)
+      .then((result) => {
+        if (repoRequestRef.current !== token) return
+        if (typeof result === 'string') {
+          setUi({ repoChoices: null })
+        } else {
+          setUi({ repoChoices: result, selectedRepo: result.current })
+        }
+      })
+      .catch(() => {
+        if (repoRequestRef.current === token) setUi({ repoChoices: null })
+      })
+  }
+
+  // The repo to pass as an override: only when the user picked a repo other than
+  // origin (the fork's upstream). Otherwise undefined = default origin behavior.
+  const repoOverride = (): string | undefined =>
+    repoChoices && selectedRepo && selectedRepo !== repoChoices.current ? selectedRepo : undefined
 
   const showToast = (msg: string) => {
     setUi({ toast: msg })
@@ -217,6 +293,7 @@ function useProjectTreeElement({ onOpenSession }: TreeProps) {
       prNumberInput: '',
       prError: null,
     })
+    loadRepoChoices(projectPath, hostId)
     setTimeout(() => prNumberInputRef.current?.focus(), 0)
   }
 
@@ -264,11 +341,15 @@ function useProjectTreeElement({ onOpenSession }: TreeProps) {
       : `No open ${itemLabel === 'PR' ? 'PRs' : 'issues'} to open`
   }
 
-  const handleOpenAllPrs = async (projectPath: string, hostId: string | null) => {
+  const handleOpenAllPrs = async (
+    projectPath: string,
+    hostId: string | null,
+    repo: string | null
+  ) => {
     if (creating) return
     setUi({ creating: true })
     try {
-      const result = await window.api.openSessionsForOpenPrs(projectPath, hostId)
+      const result = await window.api.openSessionsForOpenPrs(projectPath, hostId, repo)
       showToast(typeof result === 'string' ? result : formatOpenAllSummary(result, 'PR'))
     } catch (err) {
       showToast(`Failed to open PR sessions: ${String(err)}`)
@@ -277,22 +358,54 @@ function useProjectTreeElement({ onOpenSession }: TreeProps) {
     }
   }
 
-  const openIssuesDialog = (projectPath: string, hostId: string | null) => {
+  // Entry point for "Open sessions for all open PRs". For a fork we pop a small
+  // repo picker first; otherwise we keep the historical instant behavior.
+  const openAllPrs = async (projectPath: string, hostId: string | null) => {
+    if (creating) return
+    const token = (repoRequestRef.current += 1)
+    let choices: RepoChoices | string | null
+    try {
+      choices = await window.api.getRepoChoices(projectPath, hostId)
+    } catch {
+      choices = null
+    }
+    if (repoRequestRef.current !== token) return
+    if (choices && typeof choices !== 'string' && choices.parent) {
+      setUi({
+        pendingOpenAllPrsPath: projectPath,
+        pendingOpenAllPrsHostId: hostId,
+        repoChoices: choices,
+        selectedRepo: choices.current,
+      })
+    } else {
+      await handleOpenAllPrs(projectPath, hostId, null)
+    }
+  }
+
+  const confirmOpenAllPrs = async () => {
+    if (!pendingOpenAllPrsPath) return
+    const projectPath = pendingOpenAllPrsPath
+    const hostId = pendingOpenAllPrsHostId
+    const repo = repoOverride() ?? null
+    setUi({ pendingOpenAllPrsPath: null, pendingOpenAllPrsHostId: null })
+    await handleOpenAllPrs(projectPath, hostId, repo)
+  }
+
+  // Load the label filter list for a repo (origin, or a fork's upstream). Bumps
+  // the shared issue token so a stale response can't overwrite a newer one.
+  const loadIssueLabels = (projectPath: string, hostId: string | null, repo: string | null) => {
     const token = (issueRequestRef.current += 1)
     setUi({
-      pendingIssuePath: projectPath,
-      pendingIssueHostId: hostId,
       issueLabels: null,
       issueLabelsError: null,
       selectedIssueLabel: '',
       issueConfirmCount: null,
-      issueError: null,
     })
     window.api
-      .listRepoLabels(projectPath, hostId)
+      .listRepoLabels(projectPath, hostId, repo)
       .then((result) => {
         // Discard a response that resolved after the dialog was canceled or
-        // reopened (possibly for a different project).
+        // reopened (possibly for a different project or repo).
         if (issueRequestRef.current !== token) return
         if (typeof result === 'string') {
           setUi({ issueLabels: [], issueLabelsError: result })
@@ -304,6 +417,12 @@ function useProjectTreeElement({ onOpenSession }: TreeProps) {
         if (issueRequestRef.current !== token) return
         setUi({ issueLabels: [], issueLabelsError: String(err) })
       })
+  }
+
+  const openIssuesDialog = (projectPath: string, hostId: string | null) => {
+    setUi({ pendingIssuePath: projectPath, pendingIssueHostId: hostId, issueError: null })
+    loadRepoChoices(projectPath, hostId)
+    loadIssueLabels(projectPath, hostId, null)
   }
 
   const closeIssuesDialog = () => {
@@ -326,7 +445,12 @@ function useProjectTreeElement({ onOpenSession }: TreeProps) {
     if (creating) return
     setUi({ creating: true, issueError: null })
     try {
-      const result = await window.api.openSessionsForOpenIssues(projectPath, hostId, label || null)
+      const result = await window.api.openSessionsForOpenIssues(
+        projectPath,
+        hostId,
+        label || null,
+        repoOverride() ?? null
+      )
       showToast(typeof result === 'string' ? result : formatOpenAllSummary(result, 'issue'))
       closeIssuesDialog()
     } catch (err) {
@@ -345,7 +469,12 @@ function useProjectTreeElement({ onOpenSession }: TreeProps) {
     setUi({ creating: true, issueError: null })
     let count: number | string
     try {
-      count = await window.api.countOpenIssues(projectPath, hostId, label || null)
+      count = await window.api.countOpenIssues(
+        projectPath,
+        hostId,
+        label || null,
+        repoOverride() ?? null
+      )
     } catch (err) {
       if (issueRequestRef.current !== token) {
         setUi({ creating: false })
@@ -400,7 +529,7 @@ function useProjectTreeElement({ onOpenSession }: TreeProps) {
       items.push({
         label: 'Open sessions for all open PRs',
         disabled: creating,
-        onClick: () => void handleOpenAllPrs(projectPath, hostId),
+        onClick: () => void openAllPrs(projectPath, hostId),
       })
       items.push({
         label: 'Open sessions for all open issues…',
@@ -480,7 +609,7 @@ function useProjectTreeElement({ onOpenSession }: TreeProps) {
       items.push({
         label: 'Open sessions for all open PRs',
         disabled: creating,
-        onClick: () => void handleOpenAllPrs(projectPath, null),
+        onClick: () => void openAllPrs(projectPath, null),
       })
       items.push({
         label: 'Open sessions for all open issues…',
@@ -583,7 +712,7 @@ function useProjectTreeElement({ onOpenSession }: TreeProps) {
         pendingPrPath,
         parsed.numbers,
         pendingPrHostId,
-        { tool: pendingPrTool }
+        { tool: pendingPrTool, repo: repoOverride() }
       )
       if (typeof result === 'string') {
         setUi({ prError: result })
@@ -686,6 +815,12 @@ function useProjectTreeElement({ onOpenSession }: TreeProps) {
       )}
       {pendingPrPath && (
         <div className="session-name-dialog">
+          <RepoPicker
+            choices={repoChoices}
+            value={selectedRepo}
+            disabled={creating}
+            onChange={(repo) => setUi({ selectedRepo: repo })}
+          />
           <div className="session-name-label">PR number(s):</div>
           <input
             ref={prNumberInputRef}
@@ -740,10 +875,50 @@ function useProjectTreeElement({ onOpenSession }: TreeProps) {
           </div>
         </div>
       )}
+      {pendingOpenAllPrsPath && (
+        <div className="session-name-dialog">
+          <RepoPicker
+            choices={repoChoices}
+            value={selectedRepo}
+            disabled={creating}
+            onChange={(repo) => setUi({ selectedRepo: repo })}
+          />
+          <div className="create-actions">
+            <button
+              type="button"
+              className="create-btn"
+              onClick={confirmOpenAllPrs}
+              disabled={creating}
+            >
+              {creating ? 'Opening…' : 'Open all open PRs'}
+            </button>
+            <button
+              type="button"
+              className="create-btn cancel"
+              onClick={() => setUi({ pendingOpenAllPrsPath: null, pendingOpenAllPrsHostId: null })}
+            >
+              Cancel
+            </button>
+          </div>
+        </div>
+      )}
       {pendingIssuePath && (
         <div className="session-name-dialog">
           {issueConfirmCount === null ? (
             <>
+              <RepoPicker
+                choices={repoChoices}
+                value={selectedRepo}
+                disabled={creating}
+                onChange={(repo) => {
+                  setUi({ selectedRepo: repo })
+                  loadIssueLabels(
+                    pendingIssuePath,
+                    pendingIssueHostId,
+                    repo === repoChoices?.current ? null : repo
+                  )
+                }}
+              />
               <div className="session-name-label">Label filter:</div>
               {issueLabels === null ? (
                 <div className="session-name-label">Loading labels…</div>
