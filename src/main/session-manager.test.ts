@@ -59,6 +59,12 @@ const state = vi.hoisted(() => ({
   // Captured emitToast payloads for assertion.
   toasts: [] as { severity: string; title: string; detail?: string }[],
   hasPtyResult: new Set<string>(),
+  // Response returned by the mocked cleanup dialog: 0 = Delete worktree,
+  // 1 = Keep worktree, 2 = Keep and open in file manager.
+  dialogResponse: 1,
+  // When true, the mocked cleanup dialog rejects (simulates showMessageBox
+  // failing — no window / IPC error) so the toast fallback can be exercised.
+  dialogThrows: false,
 }))
 
 vi.mock('./config', () => ({
@@ -103,7 +109,10 @@ vi.mock('./notifications', () => ({
 
 vi.mock('electron', () => ({
   dialog: {
-    showMessageBox: async () => ({ response: 1 }),
+    showMessageBox: async () => {
+      if (state.dialogThrows) throw new Error('dialog failed')
+      return { response: state.dialogResponse }
+    },
   },
   shell: {
     openPath: async () => '',
@@ -348,6 +357,8 @@ beforeEach(() => {
   state.reconnectConfig = { enabled: true, initialDelayMs: 1000, maxDelayMs: 30000 }
   state.toasts = []
   state.hasPtyResult = new Set()
+  state.dialogResponse = 1
+  state.dialogThrows = false
 })
 
 afterEach(() => {
@@ -1025,6 +1036,25 @@ describe('restoreSessions — remote lazy materialization', () => {
 })
 
 describe('reconnectRemoteSession', () => {
+  it('is a no-op for a terminal (completed/error) session', async () => {
+    // A kept remote session persists as 'completed'; deriveRestoredState brings it
+    // back with connectionState 'pending', which re-exposes the Reconnect affordance.
+    // Triggering reconnect must not probe-and-flip a terminal session to 'dead'.
+    for (const status of ['completed', 'error'] as const) {
+      writeSessionsJson([baseRemoteSession({ id: 'r1', status })])
+      state.hasRemoteTmuxResult.set('r1', false) // would flip to dead if it probed
+      const sm = await loadSessionManager()
+      sm.restoreSessions()
+      expect(sm.getSessions()[0].status).toBe(status)
+
+      await sm.reconnectRemoteSession('r1')
+
+      expect(sm.getSessions()[0].status).toBe(status)
+      expect(state.ensureHostConnectionCalls).toEqual([])
+      expect(state.reattachRemotePtyCalls).toEqual([])
+    }
+  })
+
   it('tmux present → reattach and mark live', async () => {
     writeSessionsJson([baseRemoteSession({ id: 'r1', status: 'idle' })])
     state.hasRemoteTmuxResult.set('r1', true)
@@ -1323,6 +1353,28 @@ describe('probePendingSessionsOnHost', () => {
     expect(byId['c'].connectionState).toBe('live')
   })
 
+  it('skips a kept terminal (completed) session left pending by restore', async () => {
+    // deriveRestoredState lazily marks a kept remote session 'completed' + 'pending'.
+    // A sibling-triggered batch probe must not sweep it up and flip it to 'dead',
+    // which would silently undo the user's Keep after an app restart.
+    writeSessionsJson([
+      baseRemoteSession({ id: 'a', hostId: 'h1', status: 'idle' }),
+      baseRemoteSession({ id: 'kept', hostId: 'h1', status: 'completed' }),
+    ] as Session[])
+    state.hasRemoteTmuxResult.set('a', true)
+    state.hasRemoteTmuxResult.set('kept', false) // tmux gone — would flip to dead if probed
+    state.runtimeStates.set('h1', 'live')
+    const sm = await loadSessionManager()
+    sm.restoreSessions()
+
+    await sm.probePendingSessionsOnHost('h1')
+
+    const byId = Object.fromEntries(sm.getSessions().map((s) => [s.id, s]))
+    expect(byId['a'].connectionState).toBe('live') // live sibling still probed
+    expect(byId['kept'].status).toBe('completed') // terminal session untouched
+    expect(state.reattachRemotePtyCalls.map((c) => c.sessionId)).toEqual(['a'])
+  })
+
   it('short-circuits to auth-failed cascade with zero network', async () => {
     writeSessionsJson(threePendingOnH1())
     state.runtimeStates.set('h1', 'auth-failed')
@@ -1385,6 +1437,34 @@ describe('probePendingSessionsOnHost', () => {
     const cReattaches = state.reattachRemotePtyCalls.filter((c) => c.sessionId === 'c').length
     expect(aReattaches).toBe(1)
     expect(cReattaches).toBe(1)
+  })
+
+  it('a Keep landing during a batch probe is not clobbered back to dead', async () => {
+    // Batch-path analogue of the in-flight-probe race: while 'kept' is inside its
+    // probe, a concurrent session.end → promptCleanup → Keep marks it completed.
+    // The probe's later 'absent' result must not overwrite that back to 'dead'.
+    writeSessionsJson([
+      baseRemoteSession({ id: 'a', hostId: 'h1', status: 'idle' }),
+      baseRemoteSession({ id: 'kept', hostId: 'h1', status: 'idle' }),
+    ] as Session[])
+    state.hasRemoteTmuxResult.set('a', true)
+    state.hasRemoteTmuxResult.set('kept', false) // probe → absent
+    state.runtimeStates.set('h1', 'live')
+    const sm = await loadSessionManager()
+    sm.restoreSessions()
+
+    // Simulate the Keep landing (status → completed) while 'kept' is being probed.
+    state.probeSideEffect.set('kept', () => {
+      const kept = sm.getSessions().find((s) => s.id === 'kept')!
+      kept.status = 'completed'
+      kept.connectionState = 'live'
+    })
+
+    await sm.probePendingSessionsOnHost('h1')
+
+    const byId = Object.fromEntries(sm.getSessions().map((s) => [s.id, s]))
+    expect(byId['kept'].status).toBe('completed') // Keep preserved, not clobbered
+    expect(byId['a'].connectionState).toBe('live') // live sibling still reconnected
   })
 
   it('idempotency: concurrent batch probes coalesce', async () => {
@@ -2957,17 +3037,135 @@ describe('attemptAutoReconnect', () => {
     expect(state.toasts).toEqual([{ severity: 'info', title: 'Reconnected to Dev' }])
   })
 
-  it('tmux gone → gave-up, marks dead, toasts session-ended', async () => {
+  it('tmux gone → gave-up, prompts cleanup; "Keep" leaves it completed with no silent removal', async () => {
     writeSessionsJson([baseRemoteSession({ id: 'r1', status: 'idle' })])
     state.hasRemoteTmuxResult.set('r1', false)
+    state.dialogResponse = 1 // Keep worktree
     const sm = await loadSessionManager()
     sm.restoreSessions()
 
     const outcome = await sm.attemptAutoReconnect('r1')
-
     expect(outcome).toBe('gave-up')
-    expect(sm.getSessions()[0].status).toBe('dead')
-    expect(state.toasts).toEqual([{ severity: 'error', title: 'Dev: remote session ended' }])
+
+    // A confirmed-gone remote session ended: it must get the same cleanup dialog
+    // a local session gets on exit (promptCleanup runs fire-and-forget, so the
+    // mocked dialog resolves on a later tick). Choosing "Keep" marks it completed
+    // and must not touch the worktree.
+    await vi.waitFor(() => expect(sm.getSessions()[0].status).toBe('completed'))
+    // Normalize connectionState to 'live' so a kept remote session is uniformly
+    // terminal — SessionCard/DetailPane must not offer a Reconnect that reverts it.
+    expect(sm.getSessions()[0].connectionState).toBe('live')
+    expect(
+      state.execRemoteCalls.some((c) => c.argv.includes('worktree') && c.argv.includes('remove'))
+    ).toBe(false)
+    // Parity with local: the dialog is the notification — no "session ended" toast.
+    expect(state.toasts).toEqual([])
+  })
+
+  it('tmux gone → cleanup dialog "Delete" removes the session and its remote worktree', async () => {
+    writeSessionsJson([baseRemoteSession({ id: 'r1', status: 'idle' })])
+    state.hasRemoteTmuxResult.set('r1', false)
+    state.dialogResponse = 0 // Delete worktree
+    const sm = await loadSessionManager()
+    sm.restoreSessions()
+
+    const outcome = await sm.attemptAutoReconnect('r1')
+    expect(outcome).toBe('gave-up')
+
+    await vi.waitFor(() => expect(sm.getSessions()).toHaveLength(0))
+    expect(state.execRemoteCalls).toContainEqual({
+      hostId: 'h1',
+      argv: [
+        'git',
+        '-C',
+        '/remote/proj',
+        'worktree',
+        'remove',
+        '/remote/proj/.claude/worktrees/feat',
+        '--force',
+      ],
+    })
+  })
+
+  it('a late session.end after "Keep" does not re-prompt or delete the kept worktree', async () => {
+    // Regression for the double-prompt race: the probe-driven cleanup prompt
+    // clears cleanupInProgress as soon as the user answers, so a delayed remote
+    // session.end must not re-open the dialog and let a Delete remove the
+    // worktree the user just chose to keep.
+    writeSessionsJson([baseRemoteSession({ id: 'r1', status: 'idle' })])
+    state.hasRemoteTmuxResult.set('r1', false)
+    state.dialogResponse = 1 // Keep worktree
+    const sm = await loadSessionManager()
+    sm.restoreSessions()
+
+    await sm.attemptAutoReconnect('r1')
+    await vi.waitFor(() => expect(sm.getSessions()[0].status).toBe('completed'))
+
+    // The delayed hook arrives; even if the user would now click Delete, the
+    // already-completed session must be ignored (no second dialog, no removal).
+    state.dialogResponse = 0 // Delete — would remove the worktree if unguarded
+    sm.handleHookEvent('session.end', { cwd: '/remote/proj/.claude/worktrees/feat' }, 'h1')
+    await new Promise((resolve) => setTimeout(resolve, 20))
+
+    expect(sm.getSessions()).toHaveLength(1)
+    expect(sm.getSessions()[0].status).toBe('completed')
+    expect(
+      state.execRemoteCalls.some((c) => c.argv.includes('worktree') && c.argv.includes('remove'))
+    ).toBe(false)
+  })
+
+  it('falls back to a toast when the cleanup dialog fails', async () => {
+    // If showMessageBox rejects (no window / IPC error), promptCleanup rejects and
+    // the user would otherwise get neither a dialog nor a notification. The dead
+    // branch's .catch must still surface the "session ended" toast.
+    writeSessionsJson([baseRemoteSession({ id: 'r1', status: 'idle' })])
+    state.hasRemoteTmuxResult.set('r1', false)
+    state.dialogThrows = true
+    const sm = await loadSessionManager()
+    sm.restoreSessions()
+
+    await sm.attemptAutoReconnect('r1')
+
+    await vi.waitFor(() =>
+      expect(state.toasts).toContainEqual({ severity: 'error', title: 'Dev: remote session ended' })
+    )
+  })
+
+  it('does not clobber a Keep made during an in-flight probe', async () => {
+    // Race: the auto-reconnect probe is in flight when a delayed session.end hook
+    // drives promptCleanup and the user chooses Keep. The probe then returns
+    // 'absent' — it must not overwrite the just-completed session back to 'dead'
+    // (which would re-prompt cleanup and let a Delete remove the kept worktree).
+    writeSessionsJson([baseRemoteSession({ id: 'r1', status: 'idle' })])
+    state.hasRemoteTmuxResult.set('r1', false) // probe would report 'absent'
+    state.dialogResponse = 1 // Keep
+    let gateResolve!: () => void
+    state.ensureHostConnectionGate = new Promise<void>((res) => {
+      gateResolve = res
+    })
+    const sm = await loadSessionManager()
+    sm.restoreSessions()
+
+    // Auto-reconnect parks at the gated ensureHostConnection, before the probe.
+    const attemptPromise = sm.attemptAutoReconnect('r1')
+    await new Promise((resolve) => setTimeout(resolve, 0))
+
+    // A delayed session.end arrives → promptCleanup → Keep → completed + live.
+    sm.handleHookEvent('session.end', { cwd: '/remote/proj/.claude/worktrees/feat' }, 'h1')
+    await new Promise((resolve) => setTimeout(resolve, 0))
+    expect(sm.getSessions()[0].status).toBe('completed')
+
+    // Release the probe. If it clobbered the Keep back to 'dead', the follow-up
+    // re-prompt would Delete now (response 0). It must not.
+    state.dialogResponse = 0
+    gateResolve()
+    await attemptPromise
+    await new Promise((resolve) => setTimeout(resolve, 20))
+
+    expect(sm.getSessions()).toHaveLength(1)
+    expect(sm.getSessions()[0].status).toBe('completed')
+    // And no spurious "Reconnected" toast for a session that actually ended.
+    expect(state.toasts).not.toContainEqual({ severity: 'info', title: 'Reconnected to Dev' })
   })
 
   it('auth-failed → gave-up (no retry)', async () => {

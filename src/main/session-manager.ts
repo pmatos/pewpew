@@ -1213,6 +1213,17 @@ const inflightReconnects = new Map<string, Promise<ReconnectOutcome>>()
 // `startRuntime` before ensureHostConnection rejects), so auth-failed vs.
 // network-unreachable get distinct UI states without re-parsing stderr.
 export async function reconnectRemoteSession(id: string): Promise<void> {
+  // A terminal session is done — never re-probe/reconnect it. attemptAutoReconnect
+  // already bails on 'completed'/'error' before calling; guard the manual/IPC entry
+  // point too, so triggering Reconnect on a kept ('completed') or errored session
+  // can't probe-and-flip it back to 'dead', silently undoing the user's Keep.
+  // Defense-in-depth: deriveRestoredState now restores terminal remotes as 'live'
+  // (not 'pending'), so the UI no longer offers Reconnect for them — but this keeps
+  // any other caller that reaches here with a stale non-live terminal session a
+  // no-op. Mirrors the status guard in attemptAutoReconnect.
+  const current = sessions.get(id)?.session
+  if (current && (current.status === 'completed' || current.status === 'error')) return
+
   const existing = inflightReconnects.get(id)
   if (existing) {
     await existing
@@ -1294,7 +1305,14 @@ async function doReconnectRemoteSession(id: string): Promise<ReconnectOutcome> {
   try {
     lease = await remoteHostRuntime.acquirePreparedHost(host)
     const probe = await probeRemoteTmuxSession(id, host)
-    if (probe === 'present') {
+    if (session.status === 'completed' || session.status === 'error') {
+      // The session resolved to a terminal state while this probe was in flight
+      // — e.g. a delayed session.end hook drove promptCleanup and the user chose
+      // Keep (status → 'completed', connectionState → 'live'). Applying the probe
+      // result now would clobber that decision ('absent' → 'dead'), re-exposing
+      // cleanup and risking deletion of the kept worktree. Leave it untouched;
+      // the lease is still returned below so the caller reconciles/releases it.
+    } else if (probe === 'present') {
       await reattachRemotePty(id, host)
       session.connectionState = 'live'
       if (session.status === 'running') session.status = 'idle'
@@ -1367,13 +1385,33 @@ export async function attemptAutoReconnect(id: string): Promise<AttemptOutcome> 
   const after = sessions.get(id)?.session
   if (!after) return 'gave-up'
 
+  // The session resolved to terminal (a concurrent session.end → promptCleanup →
+  // Keep) while our probe was in flight; doReconnectRemoteSession left it intact.
+  // Don't toast "Reconnected" or re-drive cleanup for a session that already ended.
+  if (after.status === 'completed' || after.status === 'error') return 'gave-up'
+
   if (after.connectionState === 'live') {
     emitToast({ severity: 'info', title: `Reconnected to ${label}` })
     return 'recovered'
   }
   if (after.status === 'dead') {
-    // Remote tmux confirmed gone — retrying is futile.
-    emitToast({ severity: 'error', title: `${label}: remote session ended` })
+    // Remote tmux confirmed gone: the agent ended. The session.end hook that
+    // drives promptCleanup for a live session is unreliable over a remote link
+    // (it races the ControlMaster/reverse-forward teardown as the PTY drops, so
+    // the message is often lost before it arrives), leaving remote sessions
+    // without the "Clean up worktree?" dialog local sessions get on exit. This
+    // probe result is the dependable "session ended" signal, so prompt the same
+    // cleanup here — otherwise the card is silently left dead and the user
+    // removes it by hand, deleting the worktree with no confirmation. Fire and
+    // forget (the dialog awaits user input); promptCleanup's own in-progress
+    // guard makes a late-arriving session.end hook a no-op.
+    void promptCleanup(id).catch((err) => {
+      console.error(`promptCleanup(${id}) failed:`, err)
+      // If the dialog itself failed (no window available, Electron dialog IPC
+      // error), still surface the "session ended" signal the old synchronous
+      // toast guaranteed — a dialog failure must not silently swallow it.
+      emitToast({ severity: 'error', title: `${label}: remote session ended` })
+    })
     return 'gave-up'
   }
   if (after.connectionState === 'auth-failed') {
@@ -1425,7 +1463,18 @@ async function doProbePendingSessionsOnHost(
 
   const pending: Session[] = []
   for (const entry of sessions.values()) {
-    if (entry.session.hostId === hostId && entry.session.connectionState === 'pending') {
+    // Skip terminal (completed/error) sessions from the pending pool: probing one
+    // would find its tmux gone and flip it to 'dead', silently reverting a session
+    // the user chose to keep. deriveRestoredState now restores terminal remotes as
+    // 'live' (not 'pending'), so they shouldn't reach here — this is defense-in-depth
+    // against any other path leaving a terminal session 'pending'. Mirrors the
+    // guards in attemptAutoReconnect and reconnectRemoteSession.
+    if (
+      entry.session.hostId === hostId &&
+      entry.session.connectionState === 'pending' &&
+      entry.session.status !== 'completed' &&
+      entry.session.status !== 'error'
+    ) {
       pending.push(entry.session)
     }
   }
@@ -1456,6 +1505,15 @@ async function doProbePendingSessionsOnHost(
     }
     try {
       const probe = await probeRemoteTmuxSession(s.id, reconnectHost)
+      // The session may have resolved to terminal (a concurrent session.end →
+      // promptCleanup → Keep) while this probe was in flight — the snapshot
+      // filter above only catches sessions already terminal at batch entry.
+      // Don't clobber that decision by applying the probe result; mirrors the
+      // post-await guard in doReconnectRemoteSession.
+      if (s.status === 'completed' || s.status === 'error') {
+        await reconnectNext(index + 1)
+        return
+      }
       if (probe === 'present') {
         await reattachRemotePty(s.id, reconnectHost)
         s.connectionState = 'live'
@@ -1710,6 +1768,18 @@ async function promptCleanup(id: string): Promise<void> {
     if (!entry) return
 
     const session = entry.session
+
+    // A terminal cleanup decision was already made for this session, so bail
+    // rather than prompt again. The Keep branches below are the only producer
+    // of 'completed', and Delete removes the entry outright — so reaching
+    // promptCleanup for a 'completed'/'error' session means a late remote
+    // session.end hook (or a second probe) raced in after the first decision
+    // cleared cleanupInProgress. Re-opening the dialog would show a duplicate
+    // prompt and let a Delete destroy a worktree the user just chose to keep.
+    // Mirrors the terminal-state guards in the unexpected-exit listener and
+    // attemptAutoReconnect.
+    if (session.status === 'completed' || session.status === 'error') return
+
     const parentWindow = getMainWindow()
 
     const options = {
@@ -1726,12 +1796,31 @@ async function promptCleanup(id: string): Promise<void> {
       : await dialog.showMessageBox(options)
 
     if (response === 0) {
-      await removeSession(id)
-    } else if (response === 1) {
+      try {
+        await removeSession(id)
+      } catch (err) {
+        // Surface a Delete failure (host config removed → getRequiredHost throws,
+        // or the remote SSH teardown fails) with its own accurate error. Letting
+        // it propagate to attemptAutoReconnect's `.catch` would mislabel it
+        // "remote session ended" and mask a worktree that's still there.
+        console.error(`removeSession(${id}) failed:`, err)
+        emitToast({
+          severity: 'error',
+          title: `Failed to remove worktree "${session.projectName}/${session.worktreeName}"`,
+        })
+      }
+    } else if (response === 1 || response === 2) {
+      // Keep (1) / Keep-and-open (2): the session is finished. The probe-absent
+      // path reaches here with connectionState 'offline' (the remote tmux is
+      // gone). Leaving it non-live would make SessionCard/DetailPane treat this
+      // kept session as a droppable remote and offer a Reconnect/Retry that
+      // silently reverts it to 'dead', undoing the Keep. Normalize to 'live' —
+      // the same terminal state a live-connection completion already lands in —
+      // so a kept remote session is uniformly terminal. (Local sessions have no
+      // hostId and keep connectionState undefined.)
+      if (session.hostId) session.connectionState = 'live'
       updateSession(id, 'completed')
-    } else if (response === 2) {
-      updateSession(id, 'completed')
-      shell.openPath(session.worktreePath)
+      if (response === 2) shell.openPath(session.worktreePath)
     }
   } finally {
     cleanupInProgress.delete(id)
