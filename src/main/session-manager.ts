@@ -1818,6 +1818,18 @@ async function promptCleanup(id: string): Promise<void> {
     if (!entry) return
 
     const session = entry.session
+
+    // A terminal cleanup decision was already made for this session, so bail
+    // rather than prompt again. The Keep branches below are the only producer
+    // of 'completed', and Delete removes the entry outright — so reaching
+    // promptCleanup for a 'completed'/'error' session means a late remote
+    // session.end hook (or a second probe) raced in after the first decision
+    // cleared cleanupInProgress. Re-opening the dialog would show a duplicate
+    // prompt and let a Delete destroy a worktree the user just chose to keep.
+    // Mirrors the terminal-state guards in the unexpected-exit listener and
+    // attemptAutoReconnect.
+    if (session.status === 'completed' || session.status === 'error') return
+
     const parentWindow = getMainWindow()
 
     const options = {

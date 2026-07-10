@@ -3008,6 +3008,33 @@ describe('attemptAutoReconnect', () => {
     })
   })
 
+  it('a late session.end after "Keep" does not re-prompt or delete the kept worktree', async () => {
+    // Regression for the double-prompt race: the probe-driven cleanup prompt
+    // clears cleanupInProgress as soon as the user answers, so a delayed remote
+    // session.end must not re-open the dialog and let a Delete remove the
+    // worktree the user just chose to keep.
+    writeSessionsJson([baseRemoteSession({ id: 'r1', status: 'idle' })])
+    state.hasRemoteTmuxResult.set('r1', false)
+    state.dialogResponse = 1 // Keep worktree
+    const sm = await loadSessionManager()
+    sm.restoreSessions()
+
+    await sm.attemptAutoReconnect('r1')
+    await vi.waitFor(() => expect(sm.getSessions()[0].status).toBe('completed'))
+
+    // The delayed hook arrives; even if the user would now click Delete, the
+    // already-completed session must be ignored (no second dialog, no removal).
+    state.dialogResponse = 0 // Delete — would remove the worktree if unguarded
+    sm.handleHookEvent('session.end', { cwd: '/remote/proj/.claude/worktrees/feat' }, 'h1')
+    await new Promise((resolve) => setTimeout(resolve, 20))
+
+    expect(sm.getSessions()).toHaveLength(1)
+    expect(sm.getSessions()[0].status).toBe('completed')
+    expect(
+      state.execRemoteCalls.some((c) => c.argv.includes('worktree') && c.argv.includes('remove'))
+    ).toBe(false)
+  })
+
   it('auth-failed → gave-up (no retry)', async () => {
     writeSessionsJson([baseRemoteSession({ id: 'r1', status: 'idle' })])
     state.ensureHostConnectionThrows = {
