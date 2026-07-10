@@ -1402,7 +1402,14 @@ async function doReconnectRemoteSession(id: string): Promise<ReconnectOutcome> {
   try {
     lease = await remoteHostRuntime.acquirePreparedHost(host)
     const probe = await probeRemoteTmuxSession(id, host)
-    if (probe === 'present') {
+    if (session.status === 'completed' || session.status === 'error') {
+      // The session resolved to a terminal state while this probe was in flight
+      // — e.g. a delayed session.end hook drove promptCleanup and the user chose
+      // Keep (status → 'completed', connectionState → 'live'). Applying the probe
+      // result now would clobber that decision ('absent' → 'dead'), re-exposing
+      // cleanup and risking deletion of the kept worktree. Leave it untouched;
+      // the lease is still returned below so the caller reconciles/releases it.
+    } else if (probe === 'present') {
       await reattachRemotePty(id, host)
       session.connectionState = 'live'
       if (session.status === 'running') session.status = 'idle'
@@ -1474,6 +1481,11 @@ export async function attemptAutoReconnect(id: string): Promise<AttemptOutcome> 
 
   const after = sessions.get(id)?.session
   if (!after) return 'gave-up'
+
+  // The session resolved to terminal (a concurrent session.end → promptCleanup →
+  // Keep) while our probe was in flight; doReconnectRemoteSession left it intact.
+  // Don't toast "Reconnected" or re-drive cleanup for a session that already ended.
+  if (after.status === 'completed' || after.status === 'error') return 'gave-up'
 
   if (after.connectionState === 'live') {
     emitToast({ severity: 'info', title: `Reconnected to ${label}` })
