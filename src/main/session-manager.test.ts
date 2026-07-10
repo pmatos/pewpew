@@ -1344,6 +1344,28 @@ describe('probePendingSessionsOnHost', () => {
     expect(byId['c'].connectionState).toBe('live')
   })
 
+  it('skips a kept terminal (completed) session left pending by restore', async () => {
+    // deriveRestoredState lazily marks a kept remote session 'completed' + 'pending'.
+    // A sibling-triggered batch probe must not sweep it up and flip it to 'dead',
+    // which would silently undo the user's Keep after an app restart.
+    writeSessionsJson([
+      baseRemoteSession({ id: 'a', hostId: 'h1', status: 'idle' }),
+      baseRemoteSession({ id: 'kept', hostId: 'h1', status: 'completed' }),
+    ] as Session[])
+    state.hasRemoteTmuxResult.set('a', true)
+    state.hasRemoteTmuxResult.set('kept', false) // tmux gone — would flip to dead if probed
+    state.runtimeStates.set('h1', 'live')
+    const sm = await loadSessionManager()
+    sm.restoreSessions()
+
+    await sm.probePendingSessionsOnHost('h1')
+
+    const byId = Object.fromEntries(sm.getSessions().map((s) => [s.id, s]))
+    expect(byId['a'].connectionState).toBe('live') // live sibling still probed
+    expect(byId['kept'].status).toBe('completed') // terminal session untouched
+    expect(state.reattachRemotePtyCalls.map((c) => c.sessionId)).toEqual(['a'])
+  })
+
   it('short-circuits to auth-failed cascade with zero network', async () => {
     writeSessionsJson(threePendingOnH1())
     state.runtimeStates.set('h1', 'auth-failed')

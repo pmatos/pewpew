@@ -1544,7 +1544,18 @@ async function doProbePendingSessionsOnHost(
 
   const pending: Session[] = []
   for (const entry of sessions.values()) {
-    if (entry.session.hostId === hostId && entry.session.connectionState === 'pending') {
+    // Skip terminal (completed/error) sessions even when restore left them
+    // 'pending' — deriveRestoredState lazily marks every non-dead remote session
+    // pending, including a kept 'completed' one. Probing it would find its tmux
+    // gone and flip it to 'dead', silently reverting a session the user chose to
+    // keep. Mirrors the terminal-state guards in attemptAutoReconnect and
+    // reconnectRemoteSession, closing the last reconnect entry point.
+    if (
+      entry.session.hostId === hostId &&
+      entry.session.connectionState === 'pending' &&
+      entry.session.status !== 'completed' &&
+      entry.session.status !== 'error'
+    ) {
       pending.push(entry.session)
     }
   }
