@@ -15,8 +15,6 @@ export interface PrViewInfo {
 export const PR_VIEW_FIELDS =
   'headRefName,state,title,isCrossRepository,headRepositoryOwner,headRepository'
 
-export type NumberedGhItem = { number: number }
-
 // Extract the owner segment from a GitHub remote URL (`git@host:owner/repo.git`
 // or `https://host/owner/repo`). Used to disambiguate `gh pr list --head
 // <branch>` results when a fork has opened a PR whose head branch name collides
@@ -48,47 +46,6 @@ export function describePrLookupFailure(prNumber: number, detail: string): strin
     return `PR #${prNumber} not found in this repository.`
   }
   return `Failed to look up PR #${prNumber}: ${trimmed}`
-}
-
-export function describeGhError(err: unknown): string {
-  const detail =
-    typeof err === 'object' && err !== null && 'stderr' in err
-      ? String((err as { stderr?: unknown }).stderr ?? '').trim()
-      : ''
-  if (detail) return detail
-  if (err instanceof Error) return err.message.replace(/^Error:\s*/, '')
-  return String(err)
-}
-
-export function ghApiOpenItemsArgs(kind: 'pr' | 'issue', repo: string, label?: string): string[] {
-  const labelQuery = kind === 'issue' && label ? `&labels=${encodeURIComponent(label)}` : ''
-  const endpoint =
-    kind === 'pr'
-      ? `repos/${repo}/pulls?state=open&per_page=100`
-      : `repos/${repo}/issues?state=open&per_page=100${labelQuery}`
-  const jq = kind === 'pr' ? '.[].number' : '.[] | select(.pull_request | not) | .number'
-  return ['api', '--paginate', endpoint, '--jq', jq]
-}
-
-export function parseNumberedGhLines(stdout: string, label: string): NumberedGhItem[] {
-  const items: NumberedGhItem[] = []
-  for (const raw of stdout.split(/\r?\n/)) {
-    const line = raw.trim()
-    if (!line) continue
-    const number = Number(line)
-    if (!Number.isInteger(number) || number <= 0) {
-      throw new Error(`Expected ${label} number, got ${JSON.stringify(line)}.`)
-    }
-    items.push({ number })
-  }
-  return items
-}
-
-export function parseLabelLines(stdout: string): string[] {
-  return stdout
-    .split(/\r?\n/)
-    .map((line) => line.trim())
-    .filter((line) => line.length > 0)
 }
 
 // Runs `gh <args>` in the given working directory and returns stdout. Injected

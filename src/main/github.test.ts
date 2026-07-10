@@ -1,12 +1,8 @@
 import { describe, expect, it, vi } from 'vitest'
 import {
   createPrLookup,
-  describeGhError,
   describePrLookupFailure,
   forkFieldsFromPr,
-  ghApiOpenItemsArgs,
-  parseLabelLines,
-  parseNumberedGhLines,
   parseOwnerFromRemoteUrl,
   type GhRunner,
 } from './github'
@@ -79,84 +75,6 @@ describe('describePrLookupFailure', () => {
     expect(describePrLookupFailure(42, 'API rate limit exceeded')).toBe(
       'Failed to look up PR #42: API rate limit exceeded'
     )
-  })
-})
-
-describe('describeGhError', () => {
-  it('prefers trimmed stderr when present', () => {
-    expect(describeGhError({ stderr: '  boom\n' })).toBe('boom')
-  })
-
-  it('strips a leading "Error:" from an Error message', () => {
-    expect(describeGhError(new Error('Error: nope'))).toBe('nope')
-  })
-
-  it('stringifies anything else', () => {
-    expect(describeGhError('plain string')).toBe('plain string')
-  })
-})
-
-describe('parseNumberedGhLines', () => {
-  it('parses one number per non-blank line', () => {
-    expect(parseNumberedGhLines('12\n\n34\n', 'PR')).toEqual([{ number: 12 }, { number: 34 }])
-  })
-
-  it('throws with the label when a line is not a positive integer', () => {
-    expect(() => parseNumberedGhLines('12\nnope', 'issue')).toThrow(/issue number/)
-  })
-})
-
-describe('ghApiOpenItemsArgs', () => {
-  it('uses paginated REST calls for PR numbers', () => {
-    expect(ghApiOpenItemsArgs('pr', 'owner/repo')).toEqual([
-      'api',
-      '--paginate',
-      'repos/owner/repo/pulls?state=open&per_page=100',
-      '--jq',
-      '.[].number',
-    ])
-  })
-
-  it('uses paginated REST calls for issue numbers without including PRs', () => {
-    expect(ghApiOpenItemsArgs('issue', 'owner/repo')).toEqual([
-      'api',
-      '--paginate',
-      'repos/owner/repo/issues?state=open&per_page=100',
-      '--jq',
-      '.[] | select(.pull_request | not) | .number',
-    ])
-  })
-
-  it('appends an encoded labels filter for issues when a label is given', () => {
-    expect(ghApiOpenItemsArgs('issue', 'owner/repo', 'bug')).toEqual([
-      'api',
-      '--paginate',
-      'repos/owner/repo/issues?state=open&per_page=100&labels=bug',
-      '--jq',
-      '.[] | select(.pull_request | not) | .number',
-    ])
-  })
-
-  it('url-encodes labels containing spaces', () => {
-    expect(ghApiOpenItemsArgs('issue', 'owner/repo', 'good first issue')[2]).toBe(
-      'repos/owner/repo/issues?state=open&per_page=100&labels=good%20first%20issue'
-    )
-  })
-
-  it('ignores the label for PRs', () => {
-    expect(ghApiOpenItemsArgs('pr', 'owner/repo', 'bug')[2]).toBe(
-      'repos/owner/repo/pulls?state=open&per_page=100'
-    )
-  })
-})
-
-describe('parseLabelLines', () => {
-  it('splits, trims, and drops blank lines', () => {
-    expect(parseLabelLines('bug\nenhancement\n\n  good first issue ')).toEqual([
-      'bug',
-      'enhancement',
-      'good first issue',
-    ])
   })
 })
 
