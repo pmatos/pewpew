@@ -1,6 +1,6 @@
 import { execFile } from 'child_process'
 import { promisify } from 'util'
-import type { Host } from '../shared/types'
+import type { Host, RepoChoices } from '../shared/types'
 import { classifySshExit } from './ssh-exit-parser'
 import { exec as execRemote } from './host-connection'
 import { getRequiredHost, expectRemoteOk } from './remote-command'
@@ -16,7 +16,8 @@ const execFileAsync = promisify(execFile)
 export type NumberedGhItem = { number: number }
 export type ListNumberedItems = (
   projectPath: string,
-  hostId: string | null
+  hostId: string | null,
+  repo?: string | null
 ) => Promise<NumberedGhItem[] | string>
 
 type RemoteGhProbe = { ok: true } | { ok: false; error: string }
@@ -55,6 +56,61 @@ function parseNumberedGhLines(stdout: string, label: string): NumberedGhItem[] {
   return items
 }
 
+// jq that reduces `gh repo view --json nameWithOwner,parent` to two lines:
+// the repo's own owner/name, then the parent's owner/name (blank when origin is
+// not a fork). Keeping it a single reduced query means the local and remote
+// paths share one gh invocation and one parser.
+const REPO_CHOICES_JQ =
+  '.nameWithOwner, (.parent | if . == null then "" else .owner.login + "/" + .name end)'
+
+export function parseRepoChoices(stdout: string): RepoChoices {
+  const lines = stdout.split(/\r?\n/).map((line) => line.trim())
+  return { current: lines[0] ?? '', parent: lines[1] ? lines[1] : null }
+}
+
+export async function getRepoChoices(
+  projectPath: string,
+  hostId: string | null
+): Promise<RepoChoices | string> {
+  if (hostId === null) {
+    try {
+      const { stdout } = await execFileAsync(
+        'gh',
+        ['repo', 'view', '--json', 'nameWithOwner,parent', '--jq', REPO_CHOICES_JQ],
+        { cwd: projectPath, timeout: 30000 }
+      )
+      return parseRepoChoices(String(stdout))
+    } catch (err) {
+      return `Failed to resolve repo: ${describeGhError(err)}`
+    }
+  }
+
+  const host = getRequiredHost(hostId)
+  const ghProbe = await probeRemoteGh(host)
+  if (!ghProbe.ok) return ghProbe.error
+
+  try {
+    const stdout = await expectRemoteOk(
+      host,
+      [
+        'sh',
+        '-c',
+        [
+          'set -e',
+          'cd "$1"',
+          `gh repo view --json nameWithOwner,parent --jq '${REPO_CHOICES_JQ}'`,
+        ].join('\n'),
+        '_',
+        projectPath,
+      ],
+      'gh failed'
+    )
+    return parseRepoChoices(stdout)
+  } catch (err) {
+    return `Failed to resolve repo: ${describeGhError(err)}`
+  }
+}
+
 export function parseLabelLines(stdout: string): string[] {
   return stdout
     .split(/\r?\n/)
@@ -86,19 +142,27 @@ export async function probeRemoteGh(host: Host): Promise<RemoteGhProbe> {
   return { ok: false, error: describeRemoteGhProbeFailure(host, result) }
 }
 
+// Resolve the repo to query: an explicit override (e.g. a fork's upstream) is
+// used verbatim, otherwise fall back to origin via `gh repo view`.
+async function resolveLocalRepo(projectPath: string, repo?: string | null): Promise<string> {
+  if (repo) return repo
+  const { stdout } = await execFileAsync(
+    'gh',
+    ['repo', 'view', '--json', 'nameWithOwner', '--jq', '.nameWithOwner'],
+    { cwd: projectPath, timeout: 30000 }
+  )
+  return String(stdout).trim()
+}
+
 async function listLocalOpenGhItems(
   projectPath: string,
   kind: 'pr' | 'issue',
-  label?: string
+  label?: string,
+  repo?: string | null
 ): Promise<NumberedGhItem[] | string> {
   try {
-    const { stdout: repoStdout } = await execFileAsync(
-      'gh',
-      ['repo', 'view', '--json', 'nameWithOwner', '--jq', '.nameWithOwner'],
-      { cwd: projectPath, timeout: 30000 }
-    )
-    const repo = String(repoStdout).trim()
-    const { stdout } = await execFileAsync('gh', ghApiOpenItemsArgs(kind, repo, label), {
+    const resolved = await resolveLocalRepo(projectPath, repo)
+    const { stdout } = await execFileAsync('gh', ghApiOpenItemsArgs(kind, resolved, label), {
       cwd: projectPath,
       timeout: 30000,
     })
@@ -112,7 +176,8 @@ async function listRemoteOpenGhItems(
   projectPath: string,
   hostId: string,
   kind: 'pr' | 'issue',
-  label?: string
+  label?: string,
+  repo?: string | null
 ): Promise<NumberedGhItem[] | string> {
   const host = getRequiredHost(hostId)
   const ghProbe = await probeRemoteGh(host)
@@ -128,7 +193,8 @@ async function listRemoteOpenGhItems(
         [
           'set -e',
           'cd "$1"',
-          'repo=$(gh repo view --json nameWithOwner --jq .nameWithOwner)',
+          // $4 (repo override) wins; otherwise resolve origin via gh repo view.
+          'if [ -n "$4" ]; then repo="$4"; else repo=$(gh repo view --json nameWithOwner --jq .nameWithOwner); fi',
           'if [ "$2" = pr ]; then',
           '  gh api --paginate "repos/$repo/pulls?state=open&per_page=100" --jq ".[].number"',
           'else',
@@ -139,6 +205,7 @@ async function listRemoteOpenGhItems(
         projectPath,
         kind,
         labelQuery,
+        repo ?? '',
       ],
       'gh failed'
     )
@@ -150,32 +217,36 @@ async function listRemoteOpenGhItems(
 
 export async function listOpenPrs(
   projectPath: string,
-  hostId: string | null
+  hostId: string | null,
+  repo?: string | null
 ): Promise<NumberedGhItem[] | string> {
   return hostId === null
-    ? listLocalOpenGhItems(projectPath, 'pr')
-    : listRemoteOpenGhItems(projectPath, hostId, 'pr')
+    ? listLocalOpenGhItems(projectPath, 'pr', undefined, repo)
+    : listRemoteOpenGhItems(projectPath, hostId, 'pr', undefined, repo)
 }
 
 export async function listOpenIssues(
   projectPath: string,
   hostId: string | null,
-  label?: string
+  label?: string,
+  repo?: string | null
 ): Promise<NumberedGhItem[] | string> {
   return hostId === null
-    ? listLocalOpenGhItems(projectPath, 'issue', label)
-    : listRemoteOpenGhItems(projectPath, hostId, 'issue', label)
+    ? listLocalOpenGhItems(projectPath, 'issue', label, repo)
+    : listRemoteOpenGhItems(projectPath, hostId, 'issue', label, repo)
 }
 
 export async function countOpenIssues(
   projectPath: string,
   hostId: string | null = null,
   label?: string,
-  deps: { listIssues?: ListNumberedItems } = {}
+  deps: { listIssues?: ListNumberedItems } = {},
+  repo?: string | null
 ): Promise<number | string> {
-  const list = deps.listIssues ?? ((p: string, h: string | null) => listOpenIssues(p, h, label))
+  const list =
+    deps.listIssues ?? ((p: string, h: string | null) => listOpenIssues(p, h, label, repo))
   try {
-    const items = await list(projectPath, hostId)
+    const items = await list(projectPath, hostId, repo)
     if (typeof items === 'string') return items
     return items.length
   } catch (err) {
@@ -185,19 +256,15 @@ export async function countOpenIssues(
 
 export async function listRepoLabels(
   projectPath: string,
-  hostId: string | null = null
+  hostId: string | null = null,
+  repo?: string | null
 ): Promise<string[] | string> {
   if (hostId === null) {
     try {
-      const { stdout: repoStdout } = await execFileAsync(
-        'gh',
-        ['repo', 'view', '--json', 'nameWithOwner', '--jq', '.nameWithOwner'],
-        { cwd: projectPath, timeout: 30000 }
-      )
-      const repo = String(repoStdout).trim()
+      const resolved = await resolveLocalRepo(projectPath, repo)
       const { stdout } = await execFileAsync(
         'gh',
-        ['api', '--paginate', `repos/${repo}/labels?per_page=100`, '--jq', '.[].name'],
+        ['api', '--paginate', `repos/${resolved}/labels?per_page=100`, '--jq', '.[].name'],
         { cwd: projectPath, timeout: 30000 }
       )
       return parseLabelLines(String(stdout))
@@ -219,11 +286,12 @@ export async function listRepoLabels(
         [
           'set -e',
           'cd "$1"',
-          'repo=$(gh repo view --json nameWithOwner --jq .nameWithOwner)',
+          'if [ -n "$2" ]; then repo="$2"; else repo=$(gh repo view --json nameWithOwner --jq .nameWithOwner); fi',
           'gh api --paginate "repos/$repo/labels?per_page=100" --jq ".[].name"',
         ].join('\n'),
         '_',
         projectPath,
+        repo ?? '',
       ],
       'gh failed'
     )

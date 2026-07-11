@@ -2,7 +2,9 @@ import { describe, expect, it } from 'vitest'
 import {
   describePrLookupFailure,
   forkFieldsFromPr,
+  forkPullRefUnavailableMessage,
   planPrWorktree,
+  prHeadFetchRemote,
   type PrViewInfo,
 } from './pr-worktree-planner'
 
@@ -56,6 +58,43 @@ describe('forkFieldsFromPr', () => {
   })
 })
 
+describe('forkPullRefUnavailableMessage', () => {
+  it('names the pull ref that could not be fetched', () => {
+    expect(forkPullRefUnavailableMessage('feature-x', 42)).toBe(
+      'Failed to create worktree for branch "feature-x": could not fetch refs/pull/42/head'
+    )
+  })
+
+  it('appends the underlying git error so an upstream auth/transport failure is visible', () => {
+    expect(
+      forkPullRefUnavailableMessage(
+        'feature-x',
+        42,
+        'fatal: Authentication failed for https://github.com/up/stream.git'
+      )
+    ).toBe(
+      'Failed to create worktree for branch "feature-x": could not fetch refs/pull/42/head — fatal: Authentication failed for https://github.com/up/stream.git'
+    )
+  })
+
+  it('ignores a blank detail', () => {
+    expect(forkPullRefUnavailableMessage('feature-x', 42, '   ')).toBe(
+      'Failed to create worktree for branch "feature-x": could not fetch refs/pull/42/head'
+    )
+  })
+})
+
+describe('prHeadFetchRemote', () => {
+  it('fetches from origin when there is no repo override', () => {
+    expect(prHeadFetchRemote()).toBe('origin')
+    expect(prHeadFetchRemote(null)).toBe('origin')
+  })
+
+  it('fetches from the overridden repo https URL', () => {
+    expect(prHeadFetchRemote('up/stream')).toBe('https://github.com/up/stream.git')
+  })
+})
+
 describe('describePrLookupFailure', () => {
   it('reports "not found" when gh could not resolve the PR', () => {
     expect(
@@ -105,6 +144,7 @@ describe('planPrWorktree', () => {
       localBranch: 'feat-y',
       isFork: false,
       forkFields: {},
+      fetchRemote: 'origin',
       fetchRefspec: 'feat-y',
       title: 'feat: y',
     })
@@ -120,9 +160,37 @@ describe('planPrWorktree', () => {
       localBranch: 'pewpew/pr-335',
       isFork: true,
       forkFields: { prIsFork: true, prHeadRepo: 'contributor/s11' },
+      fetchRemote: 'origin',
       fetchRefspec: '+pull/335/head:pewpew/pr-335',
       title: 'docs: fix x',
     })
+  })
+
+  it('treats a repo override as head-elsewhere: pull-ref checkout from the upstream URL', () => {
+    // A fork clone opening a plain (non-cross-repo) PR from its upstream: the head
+    // lives outside origin, so it must be fetched from the upstream's URL into a
+    // pewpew-namespaced branch and flagged like a fork.
+    const result = planPrWorktree(42, sameRepoPr({ headRefName: 'feature-x' }), 'up/stream')
+    if (!result.ok) throw new Error(result.message)
+    expect(result.plan).toEqual({
+      worktreeName: 'pr-42',
+      branch: 'feature-x',
+      localBranch: 'pewpew/pr-42',
+      isFork: true,
+      forkFields: { prIsFork: true, prHeadRepo: 'up/stream' },
+      fetchRemote: 'https://github.com/up/stream.git',
+      fetchRefspec: '+pull/42/head:pewpew/pr-42',
+      title: 'feat: y',
+    })
+  })
+
+  it('keeps the real head repo when a cross-repo PR is opened via a repo override', () => {
+    // The override picks which repo the PR is listed from; prHeadRepo still names
+    // the actual head repo (the contributor's fork) when gh reports one.
+    const result = planPrWorktree(50, forkPr(), 'up/stream')
+    if (!result.ok) throw new Error(result.message)
+    expect(result.plan.fetchRemote).toBe('https://github.com/up/stream.git')
+    expect(result.plan.forkFields).toEqual({ prIsFork: true, prHeadRepo: 'contributor/s11' })
   })
 
   it('never derives a fork local branch that could collide with the base repo', () => {

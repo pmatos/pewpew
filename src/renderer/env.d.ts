@@ -8,6 +8,7 @@ import type {
   OpenSessionsSummary,
   Project,
   RemoteProject,
+  RepoChoices,
   ReviewBranchesResult,
   ReviewDefaultBranchResult,
   ReviewDiffResult,
@@ -47,19 +48,27 @@ declare global {
       ) => Promise<OpenSessionsSummary | string>
       openSessionsForOpenPrs: (
         projectPath: string,
-        hostId?: string | null
+        hostId?: string | null,
+        repo?: string | null
       ) => Promise<OpenSessionsSummary | string>
       openSessionsForOpenIssues: (
         projectPath: string,
         hostId?: string | null,
-        label?: string | null
+        label?: string | null,
+        repo?: string | null
       ) => Promise<OpenSessionsSummary | string>
       countOpenIssues: (
         projectPath: string,
         hostId?: string | null,
-        label?: string | null
+        label?: string | null,
+        repo?: string | null
       ) => Promise<number | string>
-      listRepoLabels: (projectPath: string, hostId?: string | null) => Promise<string[] | string>
+      listRepoLabels: (
+        projectPath: string,
+        hostId?: string | null,
+        repo?: string | null
+      ) => Promise<string[] | string>
+      getRepoChoices: (projectPath: string, hostId?: string | null) => Promise<RepoChoices | string>
       mirrorWorktree: (
         projectPath: string,
         worktreePath: string,

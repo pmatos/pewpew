@@ -933,6 +933,13 @@ async function createRemoteSession(
   return session
 }
 
+// `gh pr view` args for a PR, targeting an explicit repo (a fork's upstream)
+// when given so gh doesn't resolve the wrong default repo.
+export function ghPrViewArgs(prNumber: number, repo?: string | null): string[] {
+  const args = ['pr', 'view', String(prNumber), '--json', PR_VIEW_FIELDS]
+  return repo ? [...args, '--repo', repo] : args
+}
+
 async function localBranchExists(runGit: GitRunner, branch: string): Promise<boolean> {
   try {
     await runGit(['rev-parse', '--verify', '--quiet', `refs/heads/${branch}`])
@@ -966,14 +973,19 @@ async function createRemotePrSession(
       return ghProbe.error
     }
 
+    // Target an explicit repo (a fork's upstream) when given so gh doesn't
+    // resolve the wrong default repo; the repo is passed as $3 and inlined only
+    // when present.
+    const externalRepo = options.repo || undefined
     let prInfo: PrViewInfo
     const viewResult = await execRemote(host, [
       'sh',
       '-c',
-      `cd "$1" && gh pr view "$2" --json ${PR_VIEW_FIELDS}`,
+      `cd "$1" && gh pr view "$2" --json ${PR_VIEW_FIELDS}${externalRepo ? ' --repo "$3"' : ''}`,
       '_',
       projectPath,
       String(prNumber),
+      externalRepo ?? '',
     ])
     if (viewResult.timedOut || viewResult.code !== 0) {
       const detail =
@@ -986,9 +998,9 @@ async function createRemotePrSession(
       return `Failed to parse PR metadata for #${prNumber}.`
     }
 
-    const planResult = planPrWorktree(prNumber, prInfo)
+    const planResult = planPrWorktree(prNumber, prInfo, externalRepo)
     if (!planResult.ok) return planResult.message
-    const { branch, localBranch, isFork, forkFields, fetchRefspec } = planResult.plan
+    const { branch, localBranch, isFork, forkFields, fetchRemote, fetchRefspec } = planResult.plan
 
     const effectiveTool: AgentTool = options.tool ?? getConfig().defaultTool
     const agentPath = agentPaths[effectiveTool]
@@ -1000,13 +1012,27 @@ async function createRemotePrSession(
     const tmuxSession = `pewpew-${id}`
 
     // Fetch the PR head into the local branch we'll check out; planPrWorktree
-    // picked the refspec (a fork's head is force-fetched from refs/pull/<n>/head
-    // into its pewpew-namespaced branch, a same-repo head from origin/<branch>).
-    // A failure is tolerated — the branch may already be present locally, and a
-    // fork that genuinely couldn't fetch is caught by the probe below.
-    await execRemote(host, ['git', '-C', projectPath, 'fetch', 'origin', fetchRefspec]).catch(
-      () => undefined
-    )
+    // picked the remote (origin, or the overridden repo's URL when a fork clone
+    // opens an upstream PR) and the refspec (a head-elsewhere PR head is
+    // force-fetched from refs/pull/<n>/head into its pewpew-namespaced branch, a
+    // same-repo head from origin/<branch>). A failure is tolerated — the branch
+    // may already be present locally, and a head-elsewhere PR that genuinely
+    // couldn't fetch is caught by the probe below.
+    const fetchResult = await execRemote(host, [
+      'git',
+      '-C',
+      projectPath,
+      'fetch',
+      fetchRemote,
+      fetchRefspec,
+    ]).catch(() => undefined)
+    // Keep the fetch's stderr: an override fetch runs over the upstream repo's
+    // URL (not origin), so an auth/transport failure surfaces here and would
+    // otherwise be lost behind the generic "could not fetch" message.
+    const fetchError =
+      fetchResult && fetchResult.code !== 0
+        ? fetchResult.stderr.trim() || `git fetch exited ${fetchResult.code}`
+        : undefined
 
     // Pick the worktree-add form by probing for the local branch first instead
     // of try-then-fallback. The fallback masked real failures (e.g. branch
@@ -1015,9 +1041,9 @@ async function createRemotePrSession(
     const branchExistsLocally = await remoteBranchExists(host, projectPath, localBranch)
     if (isFork && !branchExistsLocally) {
       // The pull-ref fetch should have created the pewpew/ branch; if it didn't
-      // there's no valid origin fallback for a fork (origin/<branch> isn't the
-      // PR head).
-      return forkPullRefUnavailableMessage(branch, prNumber)
+      // there's no valid origin fallback for a head-elsewhere PR (origin/<branch>
+      // isn't the PR head).
+      return forkPullRefUnavailableMessage(branch, prNumber, fetchError)
     }
     const addArgv = branchExistsLocally
       ? ['git', '-C', projectPath, 'worktree', 'add', worktreePath, localBranch]
@@ -1872,7 +1898,7 @@ interface CreateIssueSessionDeps {
 
 interface CreatePrSessionDeps {
   runGit?: GitRunner
-  prView?: (projectPath: string, prNumber: number) => Promise<PrViewInfo>
+  prView?: (projectPath: string, prNumber: number, repo?: string | null) => Promise<PrViewInfo>
   createSessionForWorktree?: (
     projectPath: string,
     worktreePath: string,
@@ -1994,11 +2020,12 @@ async function openSessionsForNumberedItems(
   hostId: string | null,
   field: 'prNumber' | 'issueNumber',
   listItems: ListNumberedItems,
-  createSession: CreateNumberedSession
+  createSession: CreateNumberedSession,
+  repo: string | null = null
 ): Promise<OpenSessionsSummary | string> {
   let items: NumberedGhItem[] | string
   try {
-    items = await listItems(projectPath, hostId)
+    items = await listItems(projectPath, hostId, repo)
   } catch (err) {
     return describeGhError(err)
   }
@@ -2009,7 +2036,8 @@ async function openSessionsForNumberedItems(
     hostId,
     field,
     items.map((i) => i.number),
-    createSession
+    createSession,
+    repo ? { repo } : {}
   )
 }
 
@@ -2030,27 +2058,24 @@ export async function createPrSession(
     })
   const prView =
     deps.prView ??
-    (async (cwd: string, number: number): Promise<PrViewInfo> => {
-      const { stdout } = await execFileAsync(
-        'gh',
-        ['pr', 'view', String(number), '--json', PR_VIEW_FIELDS],
-        { cwd }
-      )
+    (async (cwd: string, number: number, repo?: string | null): Promise<PrViewInfo> => {
+      const { stdout } = await execFileAsync('gh', ghPrViewArgs(number, repo), { cwd })
       return JSON.parse(stdout)
     })
   const adopt = deps.createSessionForWorktree ?? createSessionForWorktree
 
-  // Look up PR via gh CLI
+  // Look up PR via gh CLI, targeting an explicit repo (a fork's upstream) when given.
   let prInfo: PrViewInfo
   try {
-    prInfo = await prView(projectPath, prNumber)
+    prInfo = await prView(projectPath, prNumber, options.repo)
   } catch (err) {
     return describePrLookupFailure(prNumber, describeGhError(err))
   }
 
-  const planResult = planPrWorktree(prNumber, prInfo)
+  const planResult = planPrWorktree(prNumber, prInfo, options.repo)
   if (!planResult.ok) return planResult.message
-  const { worktreeName, branch, localBranch, isFork, forkFields, fetchRefspec } = planResult.plan
+  const { worktreeName, branch, localBranch, isFork, forkFields, fetchRemote, fetchRefspec } =
+    planResult.plan
 
   // Reuse an existing session for this PR. First match by PR number (the only
   // globally-unique key), then — for a same-repo PR whose head branch name
@@ -2079,27 +2104,35 @@ export async function createPrSession(
   const worktreePath = join(projectPath, '.claude', 'worktrees', worktreeName)
 
   // Fetch the PR head into the local branch we'll check out; planPrWorktree
-  // picked the refspec (a fork's head is force-fetched from refs/pull/<n>/head
-  // into its pewpew-namespaced branch, a same-repo head from origin/<branch>).
+  // picked the remote (origin, or the overridden repo's URL when a fork clone
+  // opens an upstream PR) and the refspec (a head-elsewhere PR head is
+  // force-fetched from refs/pull/<n>/head into its pewpew-namespaced branch, a
+  // same-repo head from origin/<branch>).
+  // Keep the fetch error: an override fetch runs over the upstream repo's URL
+  // (not origin), so an auth/transport failure surfaces here and would otherwise
+  // be lost behind the generic "could not fetch" message.
+  let fetchError: string | undefined
   try {
-    await runGit(['fetch', 'origin', fetchRefspec])
-  } catch {
+    await runGit(['fetch', fetchRemote, fetchRefspec])
+  } catch (err) {
     // Offline, or the branch is already present locally.
+    fetchError = describeGhError(err)
   }
-  // The pull ref must have produced the fork's local branch. If the fetch failed
-  // and it doesn't exist, do NOT run `git worktree add <path> <localBranch>`:
-  // with no local branch, git DWIMs the name to a remote-tracking
-  // origin/<localBranch> (if one exists) and silently checks out the wrong
-  // commits. Fail explicitly instead, mirroring the remote path.
+  // The pull ref must have produced the local branch. If the fetch failed and it
+  // doesn't exist, do NOT run `git worktree add <path> <localBranch>`: with no
+  // local branch, git DWIMs the name to a remote-tracking origin/<localBranch>
+  // (if one exists) and silently checks out the wrong commits. Fail explicitly
+  // instead, mirroring the remote path.
   if (isFork && !(await localBranchExists(runGit, localBranch))) {
-    return forkPullRefUnavailableMessage(branch, prNumber)
+    return forkPullRefUnavailableMessage(branch, prNumber, fetchError)
   }
 
   // Create worktree from the PR branch
   try {
     await runGit(['worktree', 'add', worktreePath, localBranch])
   } catch (err) {
-    // A fork PR has no valid origin fallback — origin/<branch> is not its head.
+    // A head-elsewhere PR has no valid origin fallback — origin/<branch> is not
+    // its head.
     if (isFork) {
       return `Failed to create worktree for branch "${branch}": ${(err as Error).message}`
     }
@@ -2315,6 +2348,7 @@ async function createRemoteIssueSession(
 export async function openSessionsForOpenPrs(
   projectPath: string,
   hostId: string | null = null,
+  repo: string | null = null,
   deps: OpenSessionsDeps = {}
 ): Promise<OpenSessionsSummary | string> {
   return openSessionsForNumberedItems(
@@ -2322,7 +2356,8 @@ export async function openSessionsForOpenPrs(
     hostId,
     'prNumber',
     deps.listPrs ?? listOpenPrs,
-    deps.createPrSession ?? createPrSession
+    deps.createPrSession ?? createPrSession,
+    repo
   )
 }
 
@@ -2330,14 +2365,16 @@ export async function openSessionsForOpenIssues(
   projectPath: string,
   hostId: string | null = null,
   label?: string,
+  repo: string | null = null,
   deps: OpenSessionsDeps = {}
 ): Promise<OpenSessionsSummary | string> {
   return openSessionsForNumberedItems(
     projectPath,
     hostId,
     'issueNumber',
-    deps.listIssues ?? ((p, h) => listOpenIssues(p, h, label)),
-    deps.createIssueSession ?? createIssueSession
+    deps.listIssues ?? ((p, h, r) => listOpenIssues(p, h, label, r)),
+    deps.createIssueSession ?? createIssueSession,
+    repo
   )
 }
 

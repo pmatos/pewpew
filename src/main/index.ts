@@ -52,7 +52,7 @@ import {
   updateLastKnownStatesBatch,
   stopSessionManager,
 } from './session-manager'
-import { countOpenIssues, listRepoLabels } from './github-items'
+import { countOpenIssues, listRepoLabels, getRepoChoices } from './github-items'
 import {
   collectReviewDiff,
   listReviewBranches,
@@ -370,31 +370,52 @@ app.whenReady().then(async () => {
 
   ipcMain.handle(
     'sessions:open-all-prs',
-    async (_event, projectPath: string, hostId?: string | null) => {
-      return openSessionsForOpenPrs(projectPath, hostId ?? null)
+    async (_event, projectPath: string, hostId?: string | null, repo?: string | null) => {
+      return openSessionsForOpenPrs(projectPath, hostId ?? null, repo ?? null)
     }
   )
 
   ipcMain.handle(
     'sessions:open-all-issues',
-    async (_event, projectPath: string, hostId?: string | null, label?: string | null) => {
-      return openSessionsForOpenIssues(projectPath, hostId ?? null, label ?? undefined)
+    async (
+      _event,
+      projectPath: string,
+      hostId?: string | null,
+      label?: string | null,
+      repo?: string | null
+    ) => {
+      return openSessionsForOpenIssues(
+        projectPath,
+        hostId ?? null,
+        label ?? undefined,
+        repo ?? null
+      )
     }
   )
 
   ipcMain.handle(
     'sessions:count-open-issues',
-    async (_event, projectPath: string, hostId?: string | null, label?: string | null) => {
-      return countOpenIssues(projectPath, hostId ?? null, label ?? undefined)
+    async (
+      _event,
+      projectPath: string,
+      hostId?: string | null,
+      label?: string | null,
+      repo?: string | null
+    ) => {
+      return countOpenIssues(projectPath, hostId ?? null, label ?? undefined, {}, repo ?? null)
     }
   )
 
   ipcMain.handle(
     'repo:list-labels',
-    async (_event, projectPath: string, hostId?: string | null) => {
-      return listRepoLabels(projectPath, hostId ?? null)
+    async (_event, projectPath: string, hostId?: string | null, repo?: string | null) => {
+      return listRepoLabels(projectPath, hostId ?? null, repo ?? null)
     }
   )
+
+  ipcMain.handle('repo:choices', async (_event, projectPath: string, hostId?: string | null) => {
+    return getRepoChoices(projectPath, hostId ?? null)
+  })
 
   async function gitignoreWarning(
     projectPath: string,

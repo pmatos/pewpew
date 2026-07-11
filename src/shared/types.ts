@@ -168,6 +168,19 @@ export type WorktreeBase = 'local' | 'origin-default'
 export interface CreateSessionOptions {
   baseRef?: WorktreeBase
   tool?: AgentTool
+  // The repo a PR belongs to, as "owner/name". Set only when it differs from
+  // the project's origin (e.g. opening a session for a PR that lives in the
+  // fork's upstream parent). The PR head is then fetched from this repo rather
+  // than from origin. Omitted = use origin, the historical behavior.
+  repo?: string
+}
+
+// The repos a project's PRs/issues can be drawn from: its origin ("current")
+// and, when origin is a fork, the detected upstream ("parent"). Presented in
+// the New PR/issue dialogs so a fork clone can target its upstream.
+export interface RepoChoices {
+  current: string
+  parent: string | null
 }
 
 export interface ReviewDiffResult {

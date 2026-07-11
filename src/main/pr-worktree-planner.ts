@@ -33,6 +33,14 @@ export function forkFieldsFromPr(prInfo: PrViewInfo): ForkFields {
   return { prIsFork: true, prHeadRepo: owner && name ? `${owner}/${name}` : undefined }
 }
 
+// Where to fetch a PR head's refs/pull/<n>/head from. With no override the head
+// lives on origin; an override (the PR's own repo, e.g. a fork's upstream when a
+// fork clone opens an upstream PR) exposes the pull ref on its own GitHub URL,
+// which we fetch directly so no named remote is required for it.
+export function prHeadFetchRemote(repo?: string | null): string {
+  return repo ? `https://github.com/${repo}.git` : 'origin'
+}
+
 // `gh pr view` fails for many reasons beyond the PR genuinely not existing —
 // rate limiting, auth, network, or gh resolving the wrong default repo. Only
 // report "not found" when gh actually said the PR couldn't be resolved;
@@ -60,10 +68,17 @@ export interface PrWorktreePlan {
   // across forks, so it gets a PR-scoped branch namespaced under `pewpew/`;
   // same-repo PRs keep the real branch so pushes update the PR via origin.
   localBranch: string
+  // True when the PR head lives outside our origin — a cross-repo (fork) PR, OR
+  // a repo override (a fork clone opening its upstream's PR). Both need the
+  // pull-ref checkout into a pewpew-namespaced branch and have no origin/<branch>
+  // fallback.
   isFork: boolean
   forkFields: ForkFields
-  // The third argument to `git fetch origin`. A fork PR head is only
-  // authoritative via refs/pull/<n>/head, force-fetched (`+`) into the
+  // The remote to `git fetch` from: `origin` normally, or the overridden repo's
+  // GitHub URL when the PR belongs to a different repo than origin.
+  fetchRemote: string
+  // The refspec argument to `git fetch <fetchRemote>`. A head-elsewhere PR head is
+  // only authoritative via refs/pull/<n>/head, force-fetched (`+`) into the
   // pewpew-namespaced branch; a same-repo PR head lives on origin/<branch>.
   fetchRefspec: string
   // The PR title, carried through so callers can parse an issue number from it.
@@ -76,17 +91,30 @@ export type PlanPrWorktreeResult =
 // Decide how to check out a PR from its gh metadata. Returns a user-facing
 // message (never throws) when the PR isn't open; otherwise a fully-resolved
 // plan the caller executes with its own git runner (local or remote).
-export function planPrWorktree(prNumber: number, prInfo: PrViewInfo): PlanPrWorktreeResult {
+export function planPrWorktree(
+  prNumber: number,
+  prInfo: PrViewInfo,
+  repo?: string | null
+): PlanPrWorktreeResult {
   if (prInfo.state !== 'OPEN') {
     return { ok: false, message: `PR #${prNumber} is ${prInfo.state.toLowerCase()}, not open.` }
   }
 
   const worktreeName = `pr-${prNumber}`
   const branch = prInfo.headRefName
-  const forkFields = forkFieldsFromPr(prInfo)
-  const isFork = forkFields.prIsFork === true
+  const crossRepoFields = forkFieldsFromPr(prInfo)
+  const externalRepo = repo || undefined
+  // The head lives outside origin for a cross-repo (fork) PR OR when a repo
+  // override targets a different repo than origin. Both take the pull-ref path.
+  const isFork = crossRepoFields.prIsFork === true || externalRepo !== undefined
   const localBranch = isFork ? `pewpew/${worktreeName}` : branch
+  const fetchRemote = prHeadFetchRemote(externalRepo)
   const fetchRefspec = isFork ? `+pull/${prNumber}/head:${localBranch}` : branch
+  const headRepo = crossRepoFields.prHeadRepo ?? externalRepo
+  const forkFields: ForkFields = {
+    ...(isFork ? { prIsFork: true } : {}),
+    ...(headRepo ? { prHeadRepo: headRepo } : {}),
+  }
 
   return {
     ok: true,
@@ -96,15 +124,27 @@ export function planPrWorktree(prNumber: number, prInfo: PrViewInfo): PlanPrWork
       localBranch,
       isFork,
       forkFields,
+      fetchRemote,
       fetchRefspec,
       title: prInfo.title,
     },
   }
 }
 
-// The error surfaced when a fork PR's pull-ref fetch didn't produce the local
-// branch: there is no valid origin fallback for a fork (origin/<branch> is not
-// the PR head), so both call sites must fail explicitly with this message.
-export function forkPullRefUnavailableMessage(branch: string, prNumber: number): string {
-  return `Failed to create worktree for branch "${branch}": could not fetch refs/pull/${prNumber}/head`
+// The error surfaced when a head-elsewhere PR's pull-ref fetch didn't produce
+// the local branch: there is no valid origin fallback (origin/<branch> is not
+// the PR head), so both call sites must fail explicitly with this message. When
+// the fetch itself reported an error, `detail` carries it — an override fetch
+// runs over the upstream repo's own URL rather than the pre-configured `origin`,
+// so a private/SSH-only/GHES upstream can fail auth here even though `gh pr view`
+// succeeded, and the raw git error is what tells the user that (rather than
+// looking like the PR doesn't exist).
+export function forkPullRefUnavailableMessage(
+  branch: string,
+  prNumber: number,
+  detail?: string
+): string {
+  const base = `Failed to create worktree for branch "${branch}": could not fetch refs/pull/${prNumber}/head`
+  const trimmed = detail?.trim()
+  return trimmed ? `${base} — ${trimmed}` : base
 }
