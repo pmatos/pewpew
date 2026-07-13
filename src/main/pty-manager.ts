@@ -50,7 +50,7 @@ interface PtyEntry {
 }
 
 const ptys = new Map<string, PtyEntry>()
-let flushInterval: ReturnType<typeof setInterval> | null = null
+let flushTimer: ReturnType<typeof setTimeout> | null = null
 
 // Fires when the underlying node-pty exits without going through
 // destroyPty/detachPty/destroyRemotePty (those all delete the entry from
@@ -82,6 +82,23 @@ function flushBuffers(): void {
   }
 }
 
+// Coalesce PTY output into ~16ms (≈60fps) broadcasts. The timer is armed only
+// when data is actually buffered, so an idle app with no terminal output stops
+// waking the main process 60×/sec — the previous unconditional interval kept
+// the CPU package from settling (issue #185).
+function scheduleFlush(): void {
+  if (flushTimer) return
+  flushTimer = setTimeout(() => {
+    flushTimer = null
+    flushBuffers()
+  }, 16)
+}
+
+function appendToBuffer(entry: PtyEntry, data: string): void {
+  entry.buffer += data
+  scheduleFlush()
+}
+
 export function isTmuxAvailable(): boolean {
   try {
     execFileSync('which', ['tmux'], {
@@ -95,13 +112,13 @@ export function isTmuxAvailable(): boolean {
 }
 
 export function initPtyManager(): void {
-  flushInterval = setInterval(flushBuffers, 16)
+  // Flushing is self-arming (see scheduleFlush); nothing to start here.
 }
 
 export function stopPtyManager(): void {
-  if (flushInterval) {
-    clearInterval(flushInterval)
-    flushInterval = null
+  if (flushTimer) {
+    clearTimeout(flushTimer)
+    flushTimer = null
   }
 }
 
@@ -145,7 +162,7 @@ export function createPty(sessionId: string, cwd: string, options?: SpawnOptions
   }
 
   ptyProcess.onData((data) => {
-    entry.buffer += data
+    appendToBuffer(entry, data)
   })
 
   ptyProcess.onExit(() => {
@@ -206,7 +223,7 @@ export async function createRemotePty(
   }
 
   ptyProcess.onData((data) => {
-    entry.buffer += data
+    appendToBuffer(entry, data)
   })
 
   ptyProcess.onExit(() => {
@@ -470,7 +487,7 @@ export function reattachPty(sessionId: string): void {
   }
 
   ptyProcess.onData((data) => {
-    entry.buffer += data
+    appendToBuffer(entry, data)
   })
 
   ptyProcess.onExit(() => {
@@ -487,7 +504,7 @@ export function reattachPty(sessionId: string): void {
       { encoding: 'utf-8', timeout: 5000, stdio: 'pipe' }
     )
     if (scrollback) {
-      entry.buffer += scrollback
+      appendToBuffer(entry, scrollback)
     }
   } catch {
     // Scrollback capture may fail — not critical
@@ -514,7 +531,7 @@ export async function reattachRemotePty(sessionId: string, host: Host): Promise<
   }
 
   ptyProcess.onData((data) => {
-    entry.buffer += data
+    appendToBuffer(entry, data)
   })
 
   ptyProcess.onExit(() => {
@@ -526,6 +543,6 @@ export async function reattachRemotePty(sessionId: string, host: Host): Promise<
 
   const scrollback = await getScrollback(sessionId)
   if (scrollback) {
-    entry.buffer += scrollback
+    appendToBuffer(entry, scrollback)
   }
 }

@@ -5,6 +5,7 @@ import LaneHeader from './components/LaneHeader'
 import Terminal from './components/Terminal'
 import ReviewOverlay from './components/ReviewOverlay'
 import { useThemeStore } from './stores/theme'
+import { useAnimationsStore } from './stores/animations'
 
 function parseSessionIds(): string[] {
   const params = new URLSearchParams(window.location.search)
@@ -22,6 +23,7 @@ export default function SwimLanesApp() {
 
   useEffect(() => {
     void useThemeStore.getState().init()
+    void useAnimationsStore.getState().init()
   }, [])
 
   useEffect(() => {

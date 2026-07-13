@@ -1,12 +1,15 @@
 import { useSessionsStore } from '../stores/sessions'
 import { useCanvasStore } from '../stores/canvas'
 import { useThemeStore } from '../stores/theme'
+import { useAnimationsStore } from '../stores/animations'
 
 export default function StatusBar() {
   const { sessions } = useSessionsStore()
   const panToCluster = useCanvasStore((s) => s.panToCluster)
   const theme = useThemeStore((s) => s.theme)
   const toggleTheme = useThemeStore((s) => s.toggle)
+  const reduceAnimations = useAnimationsStore((s) => s.reduceAnimations)
+  const toggleAnimations = useAnimationsStore((s) => s.toggle)
 
   const running = sessions.filter((s) => s.status === 'running').length
   const needsInput = sessions.filter((s) => s.status === 'needs_input')
@@ -38,6 +41,20 @@ export default function StatusBar() {
           ))}
         </div>
       )}
+      <button
+        type="button"
+        className="anim-toggle-btn"
+        onClick={toggleAnimations}
+        title={
+          reduceAnimations
+            ? 'Animations reduced — click to enable'
+            : 'Reduce animations (lowers idle GPU/power)'
+        }
+        aria-label={reduceAnimations ? 'Enable animations' : 'Reduce animations'}
+        aria-pressed={reduceAnimations}
+      >
+        {reduceAnimations ? '✧' : '✦'}
+      </button>
       <button
         type="button"
         className="theme-toggle-btn"
