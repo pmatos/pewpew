@@ -52,8 +52,15 @@ export const useAnimationsStore = create<AnimationsStore>((set, get) => ({
     if (!broadcastListenerInstalled) {
       broadcastListenerInstalled = true
       window.api.onReduceAnimationsBroadcast((reduce) => {
-        if (get().reduceAnimations === reduce) return
-        applyReduceAnimations(reduce)
+        // A broadcast is newer cross-window state than an in-flight init()
+        // getReduceAnimations() reply, so it must bump mutationCount even when
+        // the value already matches the current (default) state. Otherwise a
+        // stale reply passes init()'s mutationCount guard and clobbers this
+        // window's value — with no way to correct it in a window that has no
+        // local toggle (e.g. Swim Lanes). Only touch the DOM on a real change.
+        if (get().reduceAnimations !== reduce) {
+          applyReduceAnimations(reduce)
+        }
         set({ reduceAnimations: reduce, mutationCount: get().mutationCount + 1 })
       })
     }
