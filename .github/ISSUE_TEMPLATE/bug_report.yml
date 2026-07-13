@@ -1,0 +1,46 @@
+name: Bug report
+description: Report a defect in pewpew
+labels: [bug]
+body:
+  - type: markdown
+    attributes:
+      value: Thanks for filing a bug. Please fill out the sections below so it can be reproduced.
+  - type: textarea
+    id: what-happened
+    attributes:
+      label: What happened?
+      description: A clear description of the bug — what you expected vs. what actually occurred.
+    validations:
+      required: true
+  - type: textarea
+    id: repro
+    attributes:
+      label: Steps to reproduce
+      description: Minimal steps to trigger the behaviour.
+      placeholder: |
+        1. ...
+        2. ...
+        3. ...
+    validations:
+      required: true
+  - type: textarea
+    id: logs
+    attributes:
+      label: Relevant logs / screenshots
+      render: shell
+    validations:
+      required: false
+  - type: input
+    id: version
+    attributes:
+      label: pewpew version
+      description: From the About dialog or `package.json`.
+    validations:
+      required: true
+  - type: textarea
+    id: environment
+    attributes:
+      label: Environment
+      description: OS + version, desktop/window manager, agent (claude/codex), and whether the session is local or remote.
+    validations:
+      required: true
