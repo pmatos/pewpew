@@ -217,6 +217,10 @@ function createWindow(): BrowserWindow {
       preload: join(__dirname, '../preload/index.js'),
       contextIsolation: true,
       nodeIntegration: false,
+      // Let Chromium throttle timers/rAF when the window is hidden. This is the
+      // default, but pewpew is routinely left idle in the background, so make
+      // the intent explicit (see issue #185).
+      backgroundThrottling: true,
     },
   })
 
@@ -693,6 +697,21 @@ app.whenReady().then(async () => {
     }
   })
 
+  ipcMain.handle('config:get-reduce-animations', () => {
+    return getConfig().reduceAnimations
+  })
+
+  ipcMain.handle('config:save-reduce-animations', (_event, reduce: boolean) => {
+    const config = getConfig()
+    config.reduceAnimations = reduce
+    saveConfig(config)
+    // Broadcast to every renderer so secondary windows (Swim Lanes etc.)
+    // pick up the change without a reload.
+    for (const win of BrowserWindow.getAllWindows()) {
+      safeSend(win, 'reduce-animations:changed', reduce)
+    }
+  })
+
   ipcMain.handle('swim-lanes:open', (_event, sessionIds: string[]) => {
     const swimWindow = new BrowserWindow({
       width: 1200,
@@ -702,6 +721,7 @@ app.whenReady().then(async () => {
         preload: join(__dirname, '../preload/index.js'),
         contextIsolation: true,
         nodeIntegration: false,
+        backgroundThrottling: true,
       },
     })
 

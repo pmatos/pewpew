@@ -107,6 +107,9 @@ declare global {
       getTheme: () => Promise<Theme>
       saveTheme: (theme: Theme) => Promise<void>
       onThemeBroadcast: (callback: (theme: Theme) => void) => () => void
+      getReduceAnimations: () => Promise<boolean>
+      saveReduceAnimations: (reduce: boolean) => Promise<void>
+      onReduceAnimationsBroadcast: (callback: (reduce: boolean) => void) => () => void
       onTextThumbnails: (callback: (data: Record<string, string>) => void) => () => void
       pickDirectory: () => Promise<string | null>
       relocateProject: (oldPath: string, newPath: string) => Promise<{ migratedCount: number }>

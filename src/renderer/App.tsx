@@ -12,6 +12,7 @@ import { useSessionsStore } from './stores/sessions'
 import { useHostsStore } from './stores/hosts'
 import { useToastsStore } from './stores/toasts'
 import { useThemeStore } from './stores/theme'
+import { useAnimationsStore } from './stores/animations'
 
 interface CreateProjectDialogProps {
   onCreate: (name: string) => Promise<void>
@@ -95,6 +96,7 @@ export default function App() {
 
   useEffect(() => {
     void useThemeStore.getState().init()
+    void useAnimationsStore.getState().init()
   }, [])
 
   useEffect(() => {

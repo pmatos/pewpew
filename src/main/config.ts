@@ -39,6 +39,7 @@ export interface AppConfig {
   defaultTool: AgentTool
   worktreeBase: WorktreeBase
   theme: Theme
+  reduceAnimations: boolean
   bulkOpenConfirmThreshold: number
   reconnect: ReconnectConfig
 }
@@ -61,6 +62,7 @@ const DEFAULT_CONFIG: AppConfig = {
   defaultTool: 'claude',
   worktreeBase: 'local',
   theme: 'dark',
+  reduceAnimations: false,
   bulkOpenConfirmThreshold: 20,
   reconnect: { enabled: true, initialDelayMs: 1000, maxDelayMs: 30000 },
 }

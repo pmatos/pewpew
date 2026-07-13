@@ -109,6 +109,14 @@ contextBridge.exposeInMainWorld('api', {
     ipcRenderer.on('theme:changed', handler)
     return () => ipcRenderer.removeListener('theme:changed', handler)
   },
+  getReduceAnimations: () => ipcRenderer.invoke('config:get-reduce-animations') as Promise<boolean>,
+  saveReduceAnimations: (reduce: boolean) =>
+    ipcRenderer.invoke('config:save-reduce-animations', reduce),
+  onReduceAnimationsBroadcast: (callback: (reduce: boolean) => void) => {
+    const handler = (_event: Electron.IpcRendererEvent, reduce: boolean) => callback(reduce)
+    ipcRenderer.on('reduce-animations:changed', handler)
+    return () => ipcRenderer.removeListener('reduce-animations:changed', handler)
+  },
   onTextThumbnails: (callback: (data: Record<string, string>) => void) => {
     const handler = (_event: Electron.IpcRendererEvent, data: Record<string, string>) =>
       callback(data)
