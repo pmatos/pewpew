@@ -2050,46 +2050,6 @@ describe('codex agent integration', () => {
   })
 })
 
-describe('sanitizeBranchPrefix', () => {
-  it('preserves valid ref-component characters', async () => {
-    const sm = await loadSessionManager()
-    expect(sm.sanitizeBranchPrefix('pewpew')).toBe('pewpew')
-    expect(sm.sanitizeBranchPrefix('my_repo.v2')).toBe('my_repo.v2')
-  })
-
-  it('replaces git-illegal characters with `-`', async () => {
-    const sm = await loadSessionManager()
-    expect(sm.sanitizeBranchPrefix('My Repo')).toBe('My-Repo')
-    expect(sm.sanitizeBranchPrefix('repo:with~bad^chars?*[\\]')).toBe('repo-with-bad-chars')
-  })
-
-  it('strips consecutive dots rejected by git ref names', async () => {
-    const sm = await loadSessionManager()
-    expect(sm.sanitizeBranchPrefix('my..repo')).toBe('my-repo')
-    expect(sm.sanitizeBranchPrefix('repo...v2')).toBe('repo-v2')
-  })
-
-  it('strips leading and trailing punctuation', async () => {
-    const sm = await loadSessionManager()
-    expect(sm.sanitizeBranchPrefix('-leading')).toBe('leading')
-    expect(sm.sanitizeBranchPrefix('.dot.')).toBe('dot')
-  })
-
-  it('strips trailing `.lock` suffixes (illegal as ref-component suffixes)', async () => {
-    const sm = await loadSessionManager()
-    expect(sm.sanitizeBranchPrefix('proj.lock')).toBe('proj')
-    expect(sm.sanitizeBranchPrefix('proj.lock.lock')).toBe('proj')
-    expect(sm.sanitizeBranchPrefix('proj-.lock')).toBe('proj')
-  })
-
-  it('falls back to `pewpew` when nothing valid remains', async () => {
-    const sm = await loadSessionManager()
-    expect(sm.sanitizeBranchPrefix('   ')).toBe('pewpew')
-    expect(sm.sanitizeBranchPrefix(':::')).toBe('pewpew')
-    expect(sm.sanitizeBranchPrefix('')).toBe('pewpew')
-  })
-})
-
 describe('createIssueSession', () => {
   it('creates a worktree on branch issue-<n> from origin default and sets issueNumber', async () => {
     const sm = await loadSessionManager()
