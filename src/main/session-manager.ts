@@ -63,6 +63,7 @@ import {
 import { exec as execRemote, runtimeStateFor, type HostConnectionState } from './host-connection'
 import { remoteHostRuntime, type PreparedRemoteHostLease } from './remote-host-runtime'
 import { createPrLookup, parseOwnerFromRemoteUrl } from './github'
+import { parseIssueNumber, parsePrNumber, worktreeBranchName } from './branch-naming'
 import type {
   AgentTool,
   CreateSessionOptions,
@@ -77,35 +78,6 @@ import type {
 
 const execFileAsync = promisify(execFile)
 const SESSIONS_PATH = join(CONFIG_DIR, 'sessions.json')
-
-// Matches "issue37", "issue-37", "issue_37", "issue/37", "issue#37", "issue 37"
-// anywhere in a string. Case-insensitive. Captures the number.
-const ISSUE_REGEX = /issue[-_/#\s]?(\d+)/i
-
-function parseIssueNumber(...sources: (string | undefined)[]): number | undefined {
-  for (const src of sources) {
-    if (!src) continue
-    const m = src.match(ISSUE_REGEX)
-    if (m) return parseInt(m[1], 10)
-  }
-  return undefined
-}
-
-// Project names come from arbitrary directory basenames (or a user-supplied
-// remote-project label), so they can contain characters that are illegal in a
-// git ref component (space, `:`, `~`, `^`, `?`, `*`, `[`, `\`, control chars,
-// `..`, leading `-`/`.`, etc.). Coerce to a safe slug; fall back to
-// `pewpew` when nothing valid remains.
-export function sanitizeBranchPrefix(name: string): string {
-  const slug = name
-    .replace(/[^A-Za-z0-9._-]+/g, '-')
-    .replace(/\.{2,}/g, '-')
-    .replace(/-+/g, '-')
-    .replace(/^[-._]+|[-._]+$/g, '')
-    .replace(/(?:\.lock)+$/i, '')
-    .replace(/^[-._]+|[-._]+$/g, '')
-  return slug || 'pewpew'
-}
 
 // Read the actual branch checked out in a worktree. Falls back to the
 // conventional `<project>/<worktree>` name if the worktree is missing or git fails.
@@ -124,7 +96,7 @@ function resolveBranchFromWorktree(
       // fall through to default
     }
   }
-  return `${sanitizeBranchPrefix(projectName)}/${worktreeName}`
+  return worktreeBranchName(projectName, worktreeName)
 }
 
 type GitRunner = (argv: string[]) => Promise<{ stdout: string }>
@@ -830,7 +802,7 @@ async function createRemoteSession(
 
   const id = randomUUID().slice(0, 8)
   const tmuxSession = `pewpew-${id}`
-  const branchName = `${sanitizeBranchPrefix(remoteProject.name)}/${worktreeName}`
+  const branchName = worktreeBranchName(remoteProject.name, worktreeName)
   const baseRef = effectiveWorktreeBase(options)
 
   const branch = await remoteHostRuntime.withPreparedHost(
@@ -1113,7 +1085,7 @@ export async function createSession(
 
   const worktreeName = name || `session-${randomUUID().slice(0, 8)}`
   const worktreePath = join(projectPath, '.claude', 'worktrees', worktreeName)
-  const branchName = `${sanitizeBranchPrefix(basename(projectPath))}/${worktreeName}`
+  const branchName = worktreeBranchName(basename(projectPath), worktreeName)
   const baseRef = effectiveWorktreeBase(options)
 
   if (baseRef === 'origin-default') {
@@ -2516,14 +2488,13 @@ function backfillDerivedFields(session: Session): void {
       session.projectName
     )
   } else if (!session.branch) {
-    session.branch = `${sanitizeBranchPrefix(session.projectName)}/${session.worktreeName}`
+    session.branch = worktreeBranchName(session.projectName, session.worktreeName)
   }
   if (session.issueNumber === undefined) {
     session.issueNumber = parseIssueNumber(session.worktreeName, session.branch)
   }
   if (session.prNumber === undefined) {
-    const m = session.worktreeName.match(/^pr-(\d+)$/)
-    if (m) session.prNumber = parseInt(m[1], 10)
+    session.prNumber = parsePrNumber(session.worktreeName)
   }
   if (!session.tool) session.tool = 'claude'
 }
