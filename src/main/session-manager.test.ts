@@ -38,6 +38,10 @@ const state = vi.hoisted(() => ({
   // simulate a concurrent reconnect advancing another session's state while
   // the batch is in flight.
   probeSideEffect: new Map<string, () => void>(),
+  // Per-session side effect fired inside reattachRemotePty (i.e. during the
+  // reattach await). Lets tests simulate a concurrent session.end → Keep
+  // resolving a session to terminal while the reconnect is parked on reattach.
+  reattachSideEffect: new Map<string, () => void>(),
   runtimeRefs: new Map<string, number>(),
   sessionsUpdatedBroadcasts: 0,
   execRemoteCalls: [] as { hostId: string; argv: string[] }[],
@@ -194,6 +198,8 @@ vi.mock('./pty-manager', () => ({
   },
   reattachRemotePty: async (sessionId: string, host: Host) => {
     state.reattachRemotePtyCalls.push({ sessionId, hostId: host.hostId })
+    const effect = state.reattachSideEffect.get(sessionId)
+    if (effect) effect()
     // Match production: reattachRemotePty retains the host runtime for the
     // PTY's lifetime so the runtime survives the caller's release.
     state.runtimeRefs.set(host.hostId, (state.runtimeRefs.get(host.hostId) ?? 0) + 1)
@@ -348,6 +354,7 @@ beforeEach(() => {
   state.runtimeRefs = new Map()
   state.sessionsUpdatedBroadcasts = 0
   state.probeSideEffect = new Map()
+  state.reattachSideEffect = new Map()
   state.execRemoteCalls = []
   state.execRemoteResults = new Map()
   state.claudeHistoryProbeResult = new Map()
@@ -1068,6 +1075,38 @@ describe('reconnectRemoteSession', () => {
     expect(got.status).toBe('idle')
     expect(state.reattachRemotePtyCalls).toEqual([{ sessionId: 'r1', hostId: 'h1' }])
     expect(state.createRemotePtyCalls).toEqual([])
+  })
+
+  it('present + session goes terminal during reattach await → terminal status preserved', async () => {
+    // Regression: the probe transition is computed from the pre-reattach status,
+    // but reattachRemotePty awaits (SSH + scrollback). If a concurrent
+    // session.end → promptCleanup → Keep resolves the session to 'completed'
+    // (connectionState 'live') during that await, applying a cached
+    // 'running → idle' delta would revert the user's Keep. The reconnect must
+    // re-derive the transition against the post-await status and leave a
+    // now-terminal session untouched.
+    writeSessionsJson([baseRemoteSession({ id: 'r1', status: 'running' })])
+    state.hasRemoteTmuxResult.set('r1', true) // probe → present
+    const sm = await loadSessionManager()
+    sm.restoreSessions()
+    // restore maps remote `running` → `idle`; drive it back to `running` (a live
+    // session that resumed activity before the connection dropped) so the probe
+    // transition is computed with `status: 'idle'` baked in — the delta the race
+    // would otherwise clobber the Keep with.
+    sm.getSessions().find((s) => s.id === 'r1')!.status = 'running'
+    // Mimic the concurrent Keep landing while parked on the reattach await.
+    state.reattachSideEffect.set('r1', () => {
+      const live = sm.getSessions().find((s) => s.id === 'r1')!
+      live.status = 'completed'
+      live.connectionState = 'live'
+    })
+
+    await sm.reconnectRemoteSession('r1')
+
+    const got = sm.getSessions()[0]
+    expect(got.status).toBe('completed') // not clobbered back to 'idle'
+    expect(got.connectionState).toBe('live')
+    expect(state.reattachRemotePtyCalls).toEqual([{ sessionId: 'r1', hostId: 'h1' }])
   })
 
   it('tmux gone → mark session dead without creating new PTY', async () => {

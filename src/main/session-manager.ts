@@ -1310,11 +1310,17 @@ async function doReconnectRemoteSession(id: string): Promise<ReconnectOutcome> {
     // now would clobber that decision ('absent' → 'dead'), re-exposing cleanup and
     // risking deletion of the kept worktree. Leave it untouched; the lease is still
     // returned below so the caller reconciles/releases it.
-    const transition = computeProbeTransition(session.status, probe, Date.now())
-    if (transition) {
+    let transition = computeProbeTransition(session.status, probe, Date.now())
+    if (transition?.reattach) {
       // Reattach before applying the delta so a reattach failure leaves the
-      // session's fields untouched and falls through to the catch below.
-      if (transition.reattach) await reattachRemotePty(id, host)
+      // session's fields untouched and falls through to the catch below. The
+      // reattach await is a real window in which a concurrent session.end → Keep
+      // can drive status to terminal, so re-derive against the now-current status:
+      // a stale 'running → idle' delta must not revert a session the user kept.
+      await reattachRemotePty(id, host)
+      transition = computeProbeTransition(session.status, probe, Date.now())
+    }
+    if (transition) {
       applyProbeTransition(session, transition)
       onSessionsChanged()
     }
@@ -1496,12 +1502,22 @@ async function doProbePendingSessionsOnHost(
       // promptCleanup → Keep) while this probe was in flight — the snapshot filter
       // above only catches sessions already terminal at batch entry. Skip it and
       // move on without clobbering that decision.
-      const transition = computeProbeTransition(s.status, probe, Date.now())
+      let transition = computeProbeTransition(s.status, probe, Date.now())
       if (transition === null) {
         await reconnectNext(index + 1)
         return
       }
-      if (transition.reattach) await reattachRemotePty(s.id, reconnectHost)
+      if (transition.reattach) {
+        // The reattach await is a real window in which a concurrent session.end →
+        // Keep can resolve this session to terminal; re-derive against the
+        // now-current status so a stale 'running → idle' delta can't revert it.
+        await reattachRemotePty(s.id, reconnectHost)
+        transition = computeProbeTransition(s.status, probe, Date.now())
+        if (transition === null) {
+          await reconnectNext(index + 1)
+          return
+        }
+      }
       applyProbeTransition(s, transition)
       // An SSH probe failure (unreachable — timeout / auth / network) means the
       // remote may still be running. The transition already marked it; bail so we
