@@ -1198,6 +1198,12 @@ body,
   line-height: 1;
   padding: 4px 8px;
   border-radius: 4px;
+}
+
+/* Only the first-in-DOM toggle absorbs the free space; a second auto margin
+   would split the row and strand this button in the middle. Both toggles then
+   cluster at the right edge, spaced by the statusbar's gap. */
+.anim-toggle-btn {
   margin-left: auto;
 }
 
