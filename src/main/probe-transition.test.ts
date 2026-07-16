@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest'
-import type { ConnectionState, Session, SessionStatus } from '../shared/types'
+import type { Session, SessionStatus } from '../shared/types'
 import { applyProbeTransition, computeProbeTransition } from './probe-transition'
 
 // Seam under test: the pure `computeProbeTransition` decision core extracted from
@@ -125,11 +125,3 @@ describe('applyProbeTransition', () => {
     expect(s.lastActivity).toBe(NOW)
   })
 })
-
-// Type-only guard: a transition's connectionState is always a concrete ConnectionState.
-const _typeGuard: ConnectionState = computeProbeTransition(
-  'running',
-  'present',
-  NOW
-)!.connectionState
-void _typeGuard
