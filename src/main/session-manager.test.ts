@@ -1506,6 +1506,39 @@ describe('probePendingSessionsOnHost', () => {
     expect(byId['a'].connectionState).toBe('live') // live sibling still reconnected
   })
 
+  it('a Keep landing during a batch reattach is not clobbered back to idle', async () => {
+    // Batch-path analogue of the reattach-await race (regression-tested for the
+    // single-session path in reconnectRemoteSession). Unlike the probe-await guard
+    // above, this exercises the window *after* the terminal check, while a pending
+    // 'present' sibling is parked inside reattachRemotePty: a concurrent
+    // session.end → Keep marks it completed. Re-deriving the transition after the
+    // await must drop the stale running → idle delta so the Keep survives.
+    writeSessionsJson([
+      baseRemoteSession({ id: 'a', hostId: 'h1', status: 'idle' }),
+      baseRemoteSession({ id: 'kept', hostId: 'h1', status: 'idle' }),
+    ] as Session[])
+    state.hasRemoteTmuxResult.set('a', true)
+    state.hasRemoteTmuxResult.set('kept', true) // probe → present → reattach
+    state.runtimeStates.set('h1', 'live')
+    const sm = await loadSessionManager()
+    sm.restoreSessions()
+    // restore maps remote running → idle; drive 'kept' back to running so its
+    // present transition bakes status: 'idle' — the delta the race would clobber with.
+    sm.getSessions().find((s) => s.id === 'kept')!.status = 'running'
+    // Keep lands (status → completed) while 'kept' is parked on its reattach await.
+    state.reattachSideEffect.set('kept', () => {
+      const kept = sm.getSessions().find((s) => s.id === 'kept')!
+      kept.status = 'completed'
+      kept.connectionState = 'live'
+    })
+
+    await sm.probePendingSessionsOnHost('h1')
+
+    const byId = Object.fromEntries(sm.getSessions().map((s) => [s.id, s]))
+    expect(byId['kept'].status).toBe('completed') // not clobbered back to 'idle'
+    expect(byId['kept'].connectionState).toBe('live')
+  })
+
   it('idempotency: concurrent batch probes coalesce', async () => {
     writeSessionsJson(threePendingOnH1())
     state.hasRemoteTmuxResult.set('a', true)
