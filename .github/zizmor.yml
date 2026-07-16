@@ -1,0 +1,11 @@
+# zizmor configuration
+# https://docs.zizmor.sh/configuration/
+
+rules:
+  # Actions are pinned to release tags (e.g. @v7) rather than commit SHAs.
+  # Allow any ref-pin (tag/branch) instead of zizmor's default blanket hash-pin
+  # requirement. Tag updates are handled by the github-actions Dependabot group.
+  unpinned-uses:
+    config:
+      policies:
+        '*': ref-pin
