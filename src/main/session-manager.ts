@@ -52,6 +52,7 @@ import {
 } from './github-items'
 import { applyHookEvent, type SideEffectIntent } from './session-state-machine'
 import { deriveRestoredState } from './restore-planner'
+import { applyProbeTransition, computeProbeTransition } from './probe-transition'
 import { planIssueWorktree } from './worktree-plan'
 import {
   PR_VIEW_FIELDS,
@@ -1232,31 +1233,24 @@ async function doReconnectRemoteSession(id: string): Promise<ReconnectOutcome> {
   try {
     lease = await remoteHostRuntime.acquirePreparedHost(host)
     const probe = await probeRemoteTmuxSession(id, host)
-    if (session.status === 'completed' || session.status === 'error') {
-      // The session resolved to a terminal state while this probe was in flight
-      // — e.g. a delayed session.end hook drove promptCleanup and the user chose
-      // Keep (status → 'completed', connectionState → 'live'). Applying the probe
-      // result now would clobber that decision ('absent' → 'dead'), re-exposing
-      // cleanup and risking deletion of the kept worktree. Leave it untouched;
-      // the lease is still returned below so the caller reconciles/releases it.
-    } else if (probe === 'present') {
+    // Pure decision core in probe-transition.ts. `null` = the session resolved to
+    // a terminal state while this probe was in flight (e.g. a delayed session.end
+    // hook drove promptCleanup and the user chose Keep). Applying the probe result
+    // now would clobber that decision ('absent' → 'dead'), re-exposing cleanup and
+    // risking deletion of the kept worktree. Leave it untouched; the lease is still
+    // returned below so the caller reconciles/releases it.
+    let transition = computeProbeTransition(session.status, probe, Date.now())
+    if (transition?.reattach) {
+      // Reattach before applying the delta so a reattach failure leaves the
+      // session's fields untouched and falls through to the catch below. The
+      // reattach await is a real window in which a concurrent session.end → Keep
+      // can drive status to terminal, so re-derive against the now-current status:
+      // a stale 'running → idle' delta must not revert a session the user kept.
       await reattachRemotePty(id, host)
-      session.connectionState = 'live'
-      if (session.status === 'running') session.status = 'idle'
-      session.lastActivity = Date.now()
-      onSessionsChanged()
-    } else if (probe === 'absent') {
-      // Remote confirmed the tmux session is gone — mark dead. The user can
-      // invoke "Restart terminal" (reviveSession) to spawn a fresh one.
-      session.connectionState = 'offline'
-      session.status = 'dead'
-      session.lastActivity = Date.now()
-      onSessionsChanged()
-    } else {
-      // SSH-level failure probing an otherwise-live control connection. Treat
-      // as unreachable and let the user retry; do NOT mark dead because the
-      // remote Claude may still be running.
-      session.connectionState = 'unreachable'
+      transition = computeProbeTransition(session.status, probe, Date.now())
+    }
+    if (transition) {
+      applyProbeTransition(session, transition)
       onSessionsChanged()
     }
   } catch (err) {
@@ -1432,31 +1426,32 @@ async function doProbePendingSessionsOnHost(
     }
     try {
       const probe = await probeRemoteTmuxSession(s.id, reconnectHost)
-      // The session may have resolved to terminal (a concurrent session.end →
-      // promptCleanup → Keep) while this probe was in flight — the snapshot
-      // filter above only catches sessions already terminal at batch entry.
-      // Don't clobber that decision by applying the probe result; mirrors the
-      // post-await guard in doReconnectRemoteSession.
-      if (s.status === 'completed' || s.status === 'error') {
+      // Same pure decision core as doReconnectRemoteSession (probe-transition.ts).
+      // `null` = the session resolved to terminal (a concurrent session.end →
+      // promptCleanup → Keep) while this probe was in flight — the snapshot filter
+      // above only catches sessions already terminal at batch entry. Skip it and
+      // move on without clobbering that decision.
+      let transition = computeProbeTransition(s.status, probe, Date.now())
+      if (transition === null) {
         await reconnectNext(index + 1)
         return
       }
-      if (probe === 'present') {
+      if (transition.reattach) {
+        // The reattach await is a real window in which a concurrent session.end →
+        // Keep can resolve this session to terminal; re-derive against the
+        // now-current status so a stale 'running → idle' delta can't revert it.
         await reattachRemotePty(s.id, reconnectHost)
-        s.connectionState = 'live'
-        if (s.status === 'running') s.status = 'idle'
-        s.lastActivity = Date.now()
-      } else if (probe === 'absent') {
-        s.connectionState = 'offline'
-        s.status = 'dead'
-        s.lastActivity = Date.now()
-      } else {
-        // SSH probe failed (timeout / auth / network) — the remote may still be
-        // running. Mark unreachable and bail so we don't mis-classify the rest
-        // of the batch as dead on a transient failure.
-        s.connectionState = 'unreachable'
-        return
+        transition = computeProbeTransition(s.status, probe, Date.now())
+        if (transition === null) {
+          await reconnectNext(index + 1)
+          return
+        }
       }
+      applyProbeTransition(s, transition)
+      // An SSH probe failure (unreachable — timeout / auth / network) means the
+      // remote may still be running. The transition already marked it; bail so we
+      // don't mis-classify the rest of the batch as dead on a transient failure.
+      if (probe === 'unreachable') return
     } catch (err) {
       // A mid-batch SSH failure means the host dropped. Mark this sibling
       // unreachable and stop — remaining siblings stay `pending` for a
