@@ -66,6 +66,7 @@ import { remoteHostRuntime, type PreparedRemoteHostLease } from './remote-host-r
 import { createPrLookup, parseOwnerFromRemoteUrl } from './github'
 import { parseIssueNumber, parsePrNumber, worktreeBranchName } from './branch-naming'
 import { resolveOriginDefaultBase, type GitRunner } from './origin-base'
+import { branchRefExists } from './branch-ref'
 import type {
   AgentTool,
   CreateSessionOptions,
@@ -146,16 +147,10 @@ function effectiveWorktreeBase(options: CreateSessionOptions): WorktreeBase {
 }
 
 async function branchExists(projectPath: string, branchName: string): Promise<boolean> {
-  try {
-    await execFileAsync(
-      'git',
-      ['-C', projectPath, 'rev-parse', '--verify', `refs/heads/${branchName}`],
-      { timeout: 5000 }
-    )
-    return true
-  } catch {
-    return false
-  }
+  return branchRefExists(
+    (argv) => execFileAsync('git', ['-C', projectPath, ...argv], { timeout: 5000 }),
+    branchName
+  )
 }
 
 async function remoteBranchExists(
@@ -163,16 +158,13 @@ async function remoteBranchExists(
   projectPath: string,
   branchName: string
 ): Promise<boolean> {
-  try {
-    await expectRemoteOk(
-      host,
-      ['git', '-C', projectPath, 'rev-parse', '--verify', `refs/heads/${branchName}`],
-      'git failed'
-    )
-    return true
-  } catch {
-    return false
-  }
+  return branchRefExists(
+    (argv) =>
+      expectRemoteOk(host, ['git', '-C', projectPath, ...argv], 'git failed').then((stdout) => ({
+        stdout,
+      })),
+    branchName
+  )
 }
 
 // Resolve a branch to its open PR number via `gh`, with origin-owner
@@ -840,15 +832,6 @@ async function createRemoteSession(
 export function ghPrViewArgs(prNumber: number, repo?: string | null): string[] {
   const args = ['pr', 'view', String(prNumber), '--json', PR_VIEW_FIELDS]
   return repo ? [...args, '--repo', repo] : args
-}
-
-async function localBranchExists(runGit: GitRunner, branch: string): Promise<boolean> {
-  try {
-    await runGit(['rev-parse', '--verify', '--quiet', `refs/heads/${branch}`])
-    return true
-  } catch {
-    return false
-  }
 }
 
 async function createRemotePrSession(
@@ -2019,7 +2002,7 @@ export async function createPrSession(
   // local branch, git DWIMs the name to a remote-tracking origin/<localBranch>
   // (if one exists) and silently checks out the wrong commits. Fail explicitly
   // instead, mirroring the remote path.
-  if (isFork && !(await localBranchExists(runGit, localBranch))) {
+  if (isFork && !(await branchRefExists(runGit, localBranch, { quiet: true }))) {
     return forkPullRefUnavailableMessage(branch, prNumber, fetchError)
   }
 
