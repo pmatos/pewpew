@@ -54,6 +54,7 @@ import { applyHookEvent, type SideEffectIntent } from './session-state-machine'
 import { deriveRestoredState } from './restore-planner'
 import { applyProbeTransition, computeProbeTransition } from './probe-transition'
 import { planIssueWorktree } from './worktree-plan'
+import { planRelocation } from './relocation-plan'
 import {
   PR_VIEW_FIELDS,
   describePrLookupFailure,
@@ -2273,30 +2274,26 @@ export async function relocateProject(
     throw new Error(`${newProjectPath} is not a git repository`)
   }
 
-  const toMigrate: SessionEntry[] = []
-  for (const entry of sessions.values()) {
-    if (entry.session.hostId === null && entry.session.projectPath === oldProjectPath) {
-      toMigrate.push(entry)
-    }
-  }
+  // Stored session paths are canonical, so canonicalize the old managed root
+  // too before prefix-matching (oldProjectPath may be a symlink form). The pure
+  // path/name policy — which sessions move and where — lives in `planRelocation`.
+  const oldManagedRoot = canonicalPath(join(oldProjectPath, '.claude', 'worktrees')) + sep
+  const plan = planRelocation(
+    Array.from(sessions.values(), (entry) => entry.session),
+    { oldProjectPath, newProjectPath, oldManagedRoot }
+  )
 
   const fingerprint = await getRepoFingerprint(newProjectPath)
 
-  // Stored session paths are canonical, so canonicalize the old managed root
-  // too before prefix-matching (oldProjectPath may be a symlink form).
-  const oldManagedRoot = canonicalPath(join(oldProjectPath, '.claude', 'worktrees')) + sep
-  for (const entry of toMigrate) {
+  const toolsInUse = new Set<AgentTool>()
+  for (const remap of plan) {
+    const entry = sessions.get(remap.id)
+    if (!entry) continue
     const s = entry.session
-    s.projectPath = newProjectPath
-    s.projectName = basename(newProjectPath)
-    // Only rewrite worktreePath for managed worktrees under the old project's
-    // .claude/worktrees tree, preserving the exact subpath (worktreeName may be
-    // a branch label like "<project>/feat-x" that doesn't match the dirname).
-    // External mirrored paths are kept verbatim.
-    if (s.worktreePath.startsWith(oldManagedRoot)) {
-      const suffix = s.worktreePath.slice(oldManagedRoot.length)
-      s.worktreePath = join(newProjectPath, '.claude', 'worktrees', suffix)
-    }
+    toolsInUse.add(s.tool)
+    s.projectPath = remap.projectPath
+    s.projectName = remap.projectName
+    s.worktreePath = remap.worktreePath
     if (fingerprint) s.repoFingerprint = fingerprint
 
     // Recreate PTY so tmux gets the new worktree cwd
@@ -2322,7 +2319,6 @@ export async function relocateProject(
   }
   saveConfig(config)
 
-  const toolsInUse = new Set(toMigrate.map((e) => e.session.tool))
   if (toolsInUse.has('claude') || toolsInUse.size === 0) {
     await installHooks(newProjectPath)
   }
@@ -2332,7 +2328,7 @@ export async function relocateProject(
   }
   onSessionsChanged()
 
-  return { migratedCount: toMigrate.length }
+  return { migratedCount: plan.length }
 }
 
 // claude stores per-worktree conversations under
