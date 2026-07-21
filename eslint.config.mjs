@@ -26,6 +26,14 @@ export default tseslint.config(
     },
   },
   {
+    files: ['commitlint.config.cjs'],
+    languageOptions: {
+      globals: {
+        ...globals.node,
+      },
+    },
+  },
+  {
     ignores: ['node_modules/', 'dist/', 'dist-electron/', 'out/', '.claude/'],
   }
 )
