@@ -1,10 +1,13 @@
-# Lints commit messages against Conventional Commits on pushes to the default branch.
-# Direct pushes are what the PR-title check can't see; PRs are covered by lint-pr-title.yml.
+# Lints commit messages against Conventional Commits.
+# - push to main: covers direct pushes/merges, which lint-pr-title.yml can't see.
+# - pull_request: lints the PR's own commit range before merge, since
+#   lint-pr-title.yml only validates the PR title, not each commit.
 name: Lint commits
 
 on:
   push:
     branches: [main]
+  pull_request:
 
 permissions:
   contents: read
@@ -22,5 +25,8 @@ jobs:
       - name: Install commitlint
         run: npm install --no-save @commitlint/cli@21 @commitlint/config-conventional@21
       - name: Lint pushed commits
-        if: github.event.before != '0000000000000000000000000000000000000000'
+        if: github.event_name == 'push' && github.event.before != '0000000000000000000000000000000000000000'
         run: npx commitlint --from ${{ github.event.before }} --to ${{ github.sha }} --verbose
+      - name: Lint PR commits
+        if: github.event_name == 'pull_request'
+        run: npx commitlint --from ${{ github.event.pull_request.base.sha }} --to ${{ github.event.pull_request.head.sha }} --verbose
