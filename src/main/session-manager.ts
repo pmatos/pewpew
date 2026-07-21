@@ -65,9 +65,10 @@ import {
 import { exec as execRemote, runtimeStateFor, type HostConnectionState } from './host-connection'
 import { remoteHostRuntime, type PreparedRemoteHostLease } from './remote-host-runtime'
 import { createPrLookup, parseOwnerFromRemoteUrl } from './github'
-import { parseIssueNumber, parsePrNumber, worktreeBranchName } from './branch-naming'
+import { parseIssueNumber, worktreeBranchName } from './branch-naming'
 import { resolveOriginDefaultBase, type GitRunner } from './origin-base'
 import { branchRefExists } from './branch-ref'
+import { deriveSessionFields } from './session-fields'
 import type {
   AgentTool,
   CreateSessionOptions,
@@ -2378,28 +2379,19 @@ async function hasRemoteClaudeConversationHistory(
   }
 }
 
-// Backfill / reconcile fields added in later versions. For local sessions
-// (worktreePath exists on this machine) the live git branch trumps whatever
-// was persisted — an earlier version stored a wrong default that we self-heal
-// here. Remote sessions can't access git without SSH, so they keep the
-// persisted branch and only fall back when it's missing.
+// Backfill / reconcile fields added in later versions. The reconciliation rules
+// live in the pure `deriveSessionFields` decision core; here we resolve the one
+// IO fact it needs — a local worktree's live git branch — and apply the result.
 function backfillDerivedFields(session: Session): void {
-  if (!session.hostId && existsSync(session.worktreePath)) {
-    session.branch = resolveBranchFromWorktree(
-      session.worktreePath,
-      session.worktreeName,
-      session.projectName
-    )
-  } else if (!session.branch) {
-    session.branch = worktreeBranchName(session.projectName, session.worktreeName)
-  }
-  if (session.issueNumber === undefined) {
-    session.issueNumber = parseIssueNumber(session.worktreeName, session.branch)
-  }
-  if (session.prNumber === undefined) {
-    session.prNumber = parsePrNumber(session.worktreeName)
-  }
-  if (!session.tool) session.tool = 'claude'
+  const resolvedLocalBranch =
+    !session.hostId && existsSync(session.worktreePath)
+      ? resolveBranchFromWorktree(session.worktreePath, session.worktreeName, session.projectName)
+      : undefined
+  const derived = deriveSessionFields(session, { resolvedLocalBranch })
+  session.branch = derived.branch
+  session.issueNumber = derived.issueNumber
+  session.prNumber = derived.prNumber
+  session.tool = derived.tool
 }
 
 export function restoreSessions(): void {
