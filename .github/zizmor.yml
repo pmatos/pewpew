@@ -9,3 +9,15 @@ rules:
     config:
       policies:
         '*': ref-pin
+  adhoc-packages:
+    ignore:
+      # commitlint deps are only used by this CI-only linting step (never
+      # shipped), and are version-pinned to a major release; not worth a
+      # dedicated lockfile entry in the main package.json.
+      - commitlint.yml:27
+  dangerous-triggers:
+    ignore:
+      # Needed to read fork PR titles with API access, but this workflow
+      # never checks out or executes PR-controlled code, so the usual
+      # pull_request_target injection risk doesn't apply here.
+      - lint-pr-title.yml:5
