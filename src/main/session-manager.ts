@@ -69,6 +69,13 @@ import { parseIssueNumber, worktreeBranchName } from './branch-naming'
 import { resolveOriginDefaultBase, type GitRunner } from './origin-base'
 import { branchRefExists } from './branch-ref'
 import { deriveSessionFields } from './session-fields'
+import {
+  numbersInUse,
+  selectNumbersToOpen,
+  shouldCreateSerially,
+  summarizeCreations,
+  type CreateOutcome,
+} from './numbered-session-plan'
 import type {
   AgentTool,
   CreateSessionOptions,
@@ -1734,23 +1741,7 @@ async function promptCleanup(id: string): Promise<void> {
   }
 }
 
-export function selectNumbersToOpen<T extends { number: number }>(
-  items: T[],
-  existing: Set<number>
-): { toCreate: T[]; toSkip: number[] } {
-  const toCreate: T[] = []
-  const toSkip: number[] = []
-  const seen = new Set(existing)
-  for (const item of items) {
-    if (seen.has(item.number)) {
-      toSkip.push(item.number)
-    } else {
-      seen.add(item.number)
-      toCreate.push(item)
-    }
-  }
-  return { toCreate, toSkip }
-}
+export { selectNumbersToOpen }
 
 type CreateNumberedSession = (
   projectPath: string,
@@ -1832,28 +1823,19 @@ async function createSessionsForNumbers(
   createSession: CreateNumberedSession,
   options: CreateSessionOptions = {}
 ): Promise<OpenSessionsSummary> {
-  const existing = new Set<number>()
-  for (const entry of sessions.values()) {
-    if (entry.session.hostId !== hostId || entry.session.projectPath !== projectPath) continue
-    const number = entry.session[field]
-    if (number !== undefined) existing.add(number)
-  }
-
-  // Snapshot ids that already exist so we can tell a freshly-created session
-  // apart from one that createSession reused (it returns a pre-existing session
-  // when the requested branch is already checked out).
-  const preexistingIds = new Set<string>()
-  for (const entry of sessions.values()) preexistingIds.add(entry.session.id)
+  // Snapshot the session registry once: which numbers are already taken, and
+  // which ids exist before the batch runs (so a reused session — one createSession
+  // hands back when its branch is already checked out — is told apart from a
+  // freshly-created one).
+  const currentSessions = Array.from(sessions.values(), (e) => e.session)
+  const existing = numbersInUse(currentSessions, projectPath, hostId, field)
+  const preexistingIds = new Set(currentSessions.map((s) => s.id))
 
   const { toCreate, toSkip } = selectNumbersToOpen(
     numbers.map((n) => ({ number: n })),
     existing
   )
-  const created: Session[] = []
-  const reused: Session[] = []
-  const failed: { number: number; error: string }[] = []
-  type CreateSessionResult = { session: Session } | { number: number; error: string }
-  const createOne = async (item: { number: number }): Promise<CreateSessionResult> => {
+  const createOne = async (item: { number: number }): Promise<CreateOutcome> => {
     try {
       const result = await createSession(projectPath, item.number, hostId, options)
       if (typeof result === 'string') {
@@ -1868,32 +1850,19 @@ async function createSessionsForNumbers(
   const effectiveTool = options.tool ?? getConfig().defaultTool
   const createSerially = async (
     index: number,
-    results: CreateSessionResult[]
-  ): Promise<CreateSessionResult[]> => {
+    results: CreateOutcome[]
+  ): Promise<CreateOutcome[]> => {
     const item = toCreate[index]
     if (!item) return results
     results.push(await createOne(item))
     return createSerially(index + 1, results)
   }
 
-  const results: CreateSessionResult[] =
-    hostId !== null && effectiveTool === 'codex'
-      ? await createSerially(0, [])
-      : await Promise.all(toCreate.map((item) => createOne(item)))
+  const results: CreateOutcome[] = shouldCreateSerially(hostId, effectiveTool)
+    ? await createSerially(0, [])
+    : await Promise.all(toCreate.map((item) => createOne(item)))
 
-  for (const result of results) {
-    if ('session' in result) {
-      if (preexistingIds.has(result.session.id)) {
-        reused.push(result.session)
-      } else {
-        created.push(result.session)
-      }
-    } else {
-      failed.push(result)
-    }
-  }
-
-  return { created, reused, skipped: toSkip, failed }
+  return summarizeCreations(results, preexistingIds, toSkip)
 }
 
 async function openSessionsForNumberedItems(
