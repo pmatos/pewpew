@@ -47,6 +47,25 @@ export function assertToolCompatible(existing: Session, tool: AgentTool): void {
   }
 }
 
+// Host-scoped tool guard that inspects EVERY session on the (hostId,
+// worktreePath), not just the first. restoreSessions() can load duplicate
+// records for one worktree — it keys the registry by session.id with no
+// occupancy re-check — so a same-tool first match must not mask a later record
+// that already tracks the worktree with a different tool. Use this where a bare
+// findSessionOnWorktree + assertToolCompatible would only check the first hit.
+export function assertNoConflictingToolOnWorktree(
+  sessions: Iterable<Session>,
+  hostId: string | null,
+  worktreePath: string,
+  tool: AgentTool
+): void {
+  for (const session of sessions) {
+    if (session.hostId === hostId && session.worktreePath === worktreePath) {
+      assertToolCompatible(session, tool)
+    }
+  }
+}
+
 // Canonicalized worktree paths across every session — the local mirror's
 // "already adopted" set.
 export function occupiedWorktreePaths(

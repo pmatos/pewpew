@@ -1,6 +1,7 @@
 import { describe, expect, it } from 'vitest'
 import type { Session } from '../shared/types'
 import {
+  assertNoConflictingToolOnWorktree,
   assertToolCompatible,
   findSessionByBranch,
   findSessionByPrNumber,
@@ -117,6 +118,40 @@ describe('assertToolCompatible', () => {
   it('does not throw when the tools match', () => {
     const existing = makeSession({ id: 'a', tool: 'claude' })
     expect(() => assertToolCompatible(existing, 'claude')).not.toThrow()
+  })
+})
+
+describe('assertNoConflictingToolOnWorktree (scan-all tool guard)', () => {
+  it('throws when a later duplicate on the path uses a different tool, even if the first matches', () => {
+    // The P2 case: a same-tool first record must not mask a mismatched later
+    // one. restoreSessions() keys by session.id and can hold both.
+    const sessions = [
+      makeSession({ id: 'first', hostId: 'h1', worktreePath: '/r/x', tool: 'claude' }),
+      makeSession({ id: 'second', hostId: 'h1', worktreePath: '/r/x', tool: 'codex' }),
+    ]
+    expect(() => assertNoConflictingToolOnWorktree(sessions, 'h1', '/r/x', 'claude')).toThrow(
+      'Worktree already has a codex session; mixed tools per worktree are not supported'
+    )
+  })
+
+  it('does not throw when every match on the path shares the tool', () => {
+    const sessions = [
+      makeSession({ id: 'first', hostId: 'h1', worktreePath: '/r/x', tool: 'claude' }),
+      makeSession({ id: 'second', hostId: 'h1', worktreePath: '/r/x', tool: 'claude' }),
+    ]
+    expect(() => assertNoConflictingToolOnWorktree(sessions, 'h1', '/r/x', 'claude')).not.toThrow()
+  })
+
+  it('ignores sessions on a different host or path', () => {
+    const sessions = [
+      makeSession({ id: 'otherHost', hostId: 'h2', worktreePath: '/r/x', tool: 'codex' }),
+      makeSession({ id: 'otherPath', hostId: 'h1', worktreePath: '/r/y', tool: 'codex' }),
+    ]
+    expect(() => assertNoConflictingToolOnWorktree(sessions, 'h1', '/r/x', 'claude')).not.toThrow()
+  })
+
+  it('is a no-op (falls through) when nothing occupies the path', () => {
+    expect(() => assertNoConflictingToolOnWorktree([], 'h1', '/r/x', 'claude')).not.toThrow()
   })
 })
 

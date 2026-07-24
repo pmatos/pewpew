@@ -77,6 +77,7 @@ import {
   type CreateOutcome,
 } from './numbered-session-plan'
 import {
+  assertNoConflictingToolOnWorktree,
   assertToolCompatible,
   findSessionByBranch,
   findSessionByPrNumber,
@@ -720,9 +721,10 @@ async function createRemoteSession(
   const worktreePath = posix.join(projectPath, '.claude', 'worktrees', worktreeName)
 
   // A same-tool session on this path is left to fall through (a new named
-  // session is created); only a tool mismatch is rejected.
-  const existing = findSessionOnWorktree(allSessions(), hostId, worktreePath)
-  if (existing) assertToolCompatible(existing, effectiveTool)
+  // session is created); only a tool mismatch is rejected. Scan every match,
+  // not just the first: restored data can hold duplicate records for one
+  // worktree, so a same-tool first record must not mask a mismatched later one.
+  assertNoConflictingToolOnWorktree(allSessions(), hostId, worktreePath, effectiveTool)
 
   const id = randomUUID().slice(0, 8)
   const tmuxSession = `pewpew-${id}`
