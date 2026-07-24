@@ -76,6 +76,15 @@ import {
   summarizeCreations,
   type CreateOutcome,
 } from './numbered-session-plan'
+import {
+  assertToolCompatible,
+  findSessionByBranch,
+  findSessionByPrNumber,
+  findSessionOnCanonicalWorktree,
+  findSessionOnWorktree,
+  occupiedWorktreePaths,
+  worktreePathsForHost,
+} from './session-queries'
 import type {
   AgentTool,
   CreateSessionOptions,
@@ -131,6 +140,11 @@ interface SessionEntry {
 }
 
 const sessions = new Map<string, SessionEntry>()
+
+// Live view of the session set for the pure lookups in session-queries.
+function* allSessions(): Iterable<Session> {
+  for (const entry of sessions.values()) yield entry.session
+}
 
 function getRemoteProject(hostId: string, projectPath: string): RemoteProject {
   const project = listRemoteProjects().find((p) => p.hostId === hostId && p.path === projectPath)
@@ -385,15 +399,10 @@ export async function createSessionForWorktree(
 ): Promise<Session> {
   const effectiveTool: AgentTool = tool ?? getConfig().defaultTool
   const target = canonicalPath(worktreePath)
-  for (const e of sessions.values()) {
-    if (canonicalPath(e.session.worktreePath) === target) {
-      if (e.session.tool !== effectiveTool) {
-        throw new Error(
-          `Worktree already has a ${e.session.tool} session; mixed tools per worktree are not supported`
-        )
-      }
-      return e.session
-    }
+  const existing = findSessionOnCanonicalWorktree(allSessions(), worktreePath, canonicalPath)
+  if (existing) {
+    assertToolCompatible(existing, effectiveTool)
+    return existing
   }
 
   const inflight = inflightAdoptions.get(target)
@@ -535,8 +544,7 @@ export async function mirrorAllWorktrees(
   if (hostId) return mirrorAllRemoteWorktrees(hostId, projectPath, deps)
 
   const worktrees = await gitWorktrees(projectPath)
-  const existingPaths = new Set<string>()
-  for (const e of sessions.values()) existingPaths.add(canonicalPath(e.session.worktreePath))
+  const existingPaths = occupiedWorktreePaths(allSessions(), canonicalPath)
 
   const targets = worktrees.filter((wt) => !wt.isMain && !existingPaths.has(canonicalPath(wt.path)))
 
@@ -551,10 +559,7 @@ async function mirrorAllRemoteWorktrees(
 ): Promise<MirrorAllResult> {
   const host = getRequiredHost(hostId)
   const worktrees = await gitRemoteWorktrees(host, projectPath)
-  const adopted = new Set<string>()
-  for (const e of sessions.values()) {
-    if (e.session.hostId === hostId) adopted.add(e.session.worktreePath)
-  }
+  const adopted = worktreePathsForHost(allSessions(), hostId)
 
   const targets = worktrees.filter((wt) => !wt.isMain && !adopted.has(wt.path))
 
@@ -605,15 +610,10 @@ export async function createRemoteSessionForWorktree(
 ): Promise<Session> {
   const effectiveTool: AgentTool = tool ?? getConfig().defaultTool
 
-  for (const e of sessions.values()) {
-    if (e.session.hostId === hostId && e.session.worktreePath === worktreePath) {
-      if (e.session.tool !== effectiveTool) {
-        throw new Error(
-          `Worktree already has a ${e.session.tool} session; mixed tools per worktree are not supported`
-        )
-      }
-      return e.session
-    }
+  const existing = findSessionOnWorktree(allSessions(), hostId, worktreePath)
+  if (existing) {
+    assertToolCompatible(existing, effectiveTool)
+    return existing
   }
 
   const key = `${hostId} ${worktreePath}`
@@ -719,17 +719,10 @@ async function createRemoteSession(
   const worktreeName = name || `session-${randomUUID().slice(0, 8)}`
   const worktreePath = posix.join(projectPath, '.claude', 'worktrees', worktreeName)
 
-  for (const e of sessions.values()) {
-    if (
-      e.session.hostId === hostId &&
-      e.session.worktreePath === worktreePath &&
-      e.session.tool !== effectiveTool
-    ) {
-      throw new Error(
-        `Worktree already has a ${e.session.tool} session; mixed tools per worktree are not supported`
-      )
-    }
-  }
+  // A same-tool session on this path is left to fall through (a new named
+  // session is created); only a tool mismatch is rejected.
+  const existing = findSessionOnWorktree(allSessions(), hostId, worktreePath)
+  if (existing) assertToolCompatible(existing, effectiveTool)
 
   const id = randomUUID().slice(0, 8)
   const tmuxSession = `pewpew-${id}`
@@ -855,11 +848,8 @@ async function createRemotePrSession(
   const worktreeName = `pr-${prNumber}`
   const worktreePath = posix.join(projectPath, '.claude', 'worktrees', worktreeName)
 
-  for (const e of sessions.values()) {
-    if (e.session.hostId === hostId && e.session.worktreePath === worktreePath) {
-      return e.session
-    }
-  }
+  const existing = findSessionOnWorktree(allSessions(), hostId, worktreePath)
+  if (existing) return existing
 
   return remoteHostRuntime.withPreparedHost(host, async ({ notifyScriptPath, agentPaths }) => {
     const ghProbe = await probeRemoteGh(host)
@@ -1779,42 +1769,6 @@ interface CreatePrSessionDeps {
   ) => Promise<Session>
 }
 
-function findSessionByBranch(
-  projectPath: string,
-  hostId: string | null,
-  branch: string
-): Session | undefined {
-  for (const entry of sessions.values()) {
-    const session = entry.session
-    if (
-      session.hostId === hostId &&
-      session.projectPath === projectPath &&
-      session.branch === branch
-    ) {
-      return session
-    }
-  }
-  return undefined
-}
-
-function findSessionByPrNumber(
-  projectPath: string,
-  hostId: string | null,
-  prNumber: number
-): Session | undefined {
-  for (const entry of sessions.values()) {
-    const session = entry.session
-    if (
-      session.hostId === hostId &&
-      session.projectPath === projectPath &&
-      session.prNumber === prNumber
-    ) {
-      return session
-    }
-  }
-  return undefined
-}
-
 async function createSessionsForNumbers(
   projectPath: string,
   hostId: string | null,
@@ -1934,8 +1888,8 @@ export async function createPrSession(
   // name is NOT unique (two forks can share `fix`), so we never reuse a fork PR
   // by branch: that would hijack a different fork's session.
   const existing =
-    findSessionByPrNumber(projectPath, hostId, prNumber) ??
-    (isFork ? undefined : findSessionByBranch(projectPath, hostId, branch))
+    findSessionByPrNumber(allSessions(), projectPath, hostId, prNumber) ??
+    (isFork ? undefined : findSessionByBranch(allSessions(), projectPath, hostId, branch))
   if (existing) {
     // `gh pr view <prNumber>` just confirmed this branch belongs to the
     // requested PR, so overwrite any stale prNumber rather than only filling
@@ -2038,11 +1992,9 @@ export async function createIssueSession(
   const { worktreeName, branch } = planIssueWorktree(issueNumber)
   const worktreePath = join(projectPath, '.claude', 'worktrees', worktreeName)
 
-  for (const e of sessions.values()) {
-    if (e.session.hostId === null && e.session.worktreePath === worktreePath) {
-      return e.session
-    }
-  }
+  // Exact (non-canonical) compare, matching the historical local-issue lookup.
+  const existing = findSessionOnWorktree(allSessions(), null, worktreePath)
+  if (existing) return existing
 
   const runGit =
     deps.runGit ??
@@ -2097,11 +2049,8 @@ async function createRemoteIssueSession(
   const { worktreeName, branch } = planIssueWorktree(issueNumber)
   const worktreePath = posix.join(projectPath, '.claude', 'worktrees', worktreeName)
 
-  for (const e of sessions.values()) {
-    if (e.session.hostId === hostId && e.session.worktreePath === worktreePath) {
-      return e.session
-    }
-  }
+  const existing = findSessionOnWorktree(allSessions(), hostId, worktreePath)
+  if (existing) return existing
 
   return remoteHostRuntime.withPreparedHost(host, async ({ notifyScriptPath, agentPaths }) => {
     const effectiveTool: AgentTool = options.tool ?? getConfig().defaultTool
