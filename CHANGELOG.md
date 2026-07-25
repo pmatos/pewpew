@@ -1,3 +1,10 @@
+## [0.3.1](https://github.com/pmatos/pewpew/compare/v0.3.0...v0.3.1) (2026-07-25)
+
+
+### Bug Fixes
+
+* **sessions:** reject mixed-tool duplicates on a remote worktree ([7ee686f](https://github.com/pmatos/pewpew/commit/7ee686f8d4830d076d24edcaed38f426065f81f5)), closes [#223](https://github.com/pmatos/pewpew/issues/223)
+
 # [0.3.0](https://github.com/pmatos/pewpew/compare/v0.2.2...v0.3.0) (2026-07-23)
 
 
