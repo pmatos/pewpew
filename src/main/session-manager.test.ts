@@ -2074,6 +2074,49 @@ describe('relocateProject', () => {
     }
   })
 
+  it('reinstalls the guard hook before recreating the PTY, so a relocated session never launches against the stale root', async () => {
+    const oldProjectPath = mkdtempSync(join(tmpdir(), 'reloc-old-'))
+    const newProjectPath = mkdtempSync(join(tmpdir(), 'reloc-new-'))
+    writeFileSync(join(newProjectPath, '.git'), '')
+
+    const oldWorktreePath = join(oldProjectPath, '.claude', 'worktrees', 'feat-x')
+    mkdirSync(oldWorktreePath, { recursive: true })
+    const newWorktreePath = join(newProjectPath, '.claude', 'worktrees', 'feat-x')
+    mkdirSync(newWorktreePath, { recursive: true })
+
+    writeSessionsJson([
+      baseLocalSession({
+        id: 'l1',
+        projectPath: oldProjectPath,
+        worktreePath: oldWorktreePath,
+        tool: 'claude',
+      }),
+    ])
+
+    const sm = await loadSessionManager()
+    sm.restoreSessions()
+    state.hasPtyResult.add('l1')
+    const { installHooks } = await import('./hook-installer')
+    vi.mocked(installHooks).mockClear()
+    let createPtyCallCountWhenInstallHooksRan: number | undefined
+    vi.mocked(installHooks).mockImplementationOnce(async () => {
+      createPtyCallCountWhenInstallHooksRan = state.createPtyCalls.length
+    })
+
+    try {
+      await sm.relocateProject(oldProjectPath, newProjectPath)
+
+      // If the PTY were recreated first, Claude would already be running
+      // (and would have read the stale hook config) by the time the guard
+      // is reinstalled with the new root.
+      expect(createPtyCallCountWhenInstallHooksRan).toBe(0)
+      expect(state.createPtyCalls.map((c) => c.sessionId)).toEqual(['l1'])
+    } finally {
+      rmSync(oldProjectPath, { recursive: true, force: true })
+      rmSync(newProjectPath, { recursive: true, force: true })
+    }
+  })
+
   it('does not reinstall hooks for a remapped worktree that no longer exists on disk', async () => {
     const oldProjectPath = mkdtempSync(join(tmpdir(), 'reloc-old-'))
     const newProjectPath = mkdtempSync(join(tmpdir(), 'reloc-new-'))

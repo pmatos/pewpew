@@ -2305,6 +2305,17 @@ export async function relocateProject(
     s.worktreePath = remap.worktreePath
     if (fingerprint) s.repoFingerprint = fingerprint
 
+    // worktree-guard.sh bakes the root in as an argv literal at install
+    // time; relocating the project changes that path out from under it, so
+    // the guard's own `cd "$root"` starts failing and denies every write in
+    // the relocated worktree. Reinstall the hook with the fresh worktreePath
+    // BEFORE recreating the PTY below — Claude reads its hook config at
+    // process start, so if the PTY launched first it would run its entire
+    // lifetime against the stale, now-failing guard command.
+    if (s.tool === 'claude' && existsSync(s.worktreePath)) {
+      await installHooks(s.worktreePath, { skipGitignore: true })
+    }
+
     // Recreate PTY so tmux gets the new worktree cwd
     if (hasPty(s.id)) {
       destroyPty(s.id)
@@ -2314,15 +2325,6 @@ export async function relocateProject(
       } else {
         s.status = 'dead'
       }
-    }
-
-    // worktree-guard.sh bakes the root in as an argv literal at install
-    // time; relocating the project changes that path out from under it, so
-    // the guard's own `cd "$root"` starts failing and denies every write in
-    // the relocated worktree. Reinstall the hook here with the fresh
-    // worktreePath so relocated Claude sessions keep working.
-    if (s.tool === 'claude' && existsSync(s.worktreePath)) {
-      await installHooks(s.worktreePath, { skipGitignore: true })
     }
   }
 

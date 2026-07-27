@@ -3,7 +3,7 @@ import type { ExecResult } from './host-connection'
 import type { AgentTool } from '../shared/types'
 
 export const NOTIFY_SCRIPT_VERSION = 1
-export const WORKTREE_GUARD_SCRIPT_VERSION = 4
+export const WORKTREE_GUARD_SCRIPT_VERSION = 5
 
 // Tools pewpew strictly requires on a remote host for sessions and the notify
 // hook to work. Exported so the connection-test flow can surface missing ones
@@ -58,6 +58,17 @@ if ! command -v jq >/dev/null 2>&1; then
   # guard for the rest of the session. Deny with a hand-built JSON reason
   # (there's no jq available to build one) instead of failing open.
   printf '%s' '{"hookSpecificOutput":{"hookEventName":"PreToolUse","permissionDecision":"deny","permissionDecisionReason":"pewpew: worktree guard cannot run because jq is not installed on this host; blocking the write (fail-closed)"}}'
+  exit 0
+fi
+
+# A payload that isn't valid JSON at all is indistinguishable, further down,
+# from "a tool call with no file_path" (both make the later jq extractions
+# come back empty) — which exits allow. That's the wrong default for
+# malformed input: legitimate Write/Edit/MultiEdit/NotebookEdit calls from
+# Claude Code are always well-formed JSON, so anything else must fail closed.
+if ! printf '%s' "$payload" | jq -e . >/dev/null 2>&1; then
+  jq -nc --arg reason "pewpew: the hook payload is not valid JSON; blocking the write (fail-closed)" \\
+    '{hookSpecificOutput:{hookEventName:"PreToolUse",permissionDecision:"deny",permissionDecisionReason:$reason}}'
   exit 0
 fi
 

@@ -10,6 +10,11 @@
 # hook-installer.ts). It does not see Bash writes — that containment is a
 # separate layer.
 #
+# This hook only validates the target and exits; the actual Write/Edit runs
+# afterward as a separate step, so a TOCTOU race between validation and write
+# (e.g. a path swapped out from under a symlink) is a structural limitation,
+# not something this script can close.
+#
 # Usage: worktree-guard.sh <worktree-root>
 # The root is baked in at hook-install time as an argv arg, never read from
 # the hook payload's `cwd` field: by the time an agent has escaped, cwd is
@@ -26,6 +31,17 @@ if ! command -v jq >/dev/null 2>&1; then
   # guard for the rest of the session. Deny with a hand-built JSON reason
   # (there's no jq available to build one) instead of failing open.
   printf '%s' '{"hookSpecificOutput":{"hookEventName":"PreToolUse","permissionDecision":"deny","permissionDecisionReason":"pewpew: worktree guard cannot run because jq is not installed on this host; blocking the write (fail-closed)"}}'
+  exit 0
+fi
+
+# A payload that isn't valid JSON at all is indistinguishable, further down,
+# from "a tool call with no file_path" (both make the later jq extractions
+# come back empty) — which exits allow. That's the wrong default for
+# malformed input: legitimate Write/Edit/MultiEdit/NotebookEdit calls from
+# Claude Code are always well-formed JSON, so anything else must fail closed.
+if ! printf '%s' "$payload" | jq -e . >/dev/null 2>&1; then
+  jq -nc --arg reason "pewpew: the hook payload is not valid JSON; blocking the write (fail-closed)" \
+    '{hookSpecificOutput:{hookEventName:"PreToolUse",permissionDecision:"deny",permissionDecisionReason:$reason}}'
   exit 0
 fi
 
