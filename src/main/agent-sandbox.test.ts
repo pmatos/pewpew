@@ -20,7 +20,7 @@ describe('buildSandboxArgs', () => {
       '--bind',
       `${PROJECT}/.git`,
       `${PROJECT}/.git`,
-      '--ro-bind',
+      '--ro-bind-try',
       `${PROJECT}/.git/hooks`,
       `${PROJECT}/.git/hooks`,
       '--bind',

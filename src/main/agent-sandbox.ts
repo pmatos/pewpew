@@ -14,8 +14,10 @@
 //   2. --ro-bind <project> <project>       lock the project root read-only
 //   3. --bind <project>/.git <project>/.git    ...except the shared .git,
 //      writable again (git commit/checkout need it for the linked worktree)
-//   4. --ro-bind <project>/.git/hooks ...  ...except hooks/, which stays
-//      read-only (kills the code-exec-persistence path through .git/hooks)
+//   4. --ro-bind-try <project>/.git/hooks ...  ...except hooks/, which stays
+//      read-only (kills the code-exec-persistence path through .git/hooks).
+//      "-try" degrades gracefully when hooks/ doesn't exist (e.g. a repo with
+//      core.hooksPath pointed elsewhere) instead of hard-failing bwrap's spawn.
 //   5. extra caller-granted writable paths (e.g. /tmp)
 //   6. --bind <worktree> <worktree>        the session's own worktree, r/w
 //   7. --chdir <worktree> --               land in the worktree; `--`
@@ -54,7 +56,7 @@ export function buildSandboxArgs(
     '--bind',
     `${projectPath}/.git`,
     `${projectPath}/.git`,
-    '--ro-bind',
+    '--ro-bind-try',
     `${projectPath}/.git/hooks`,
     `${projectPath}/.git/hooks`,
   ]
