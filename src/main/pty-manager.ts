@@ -139,8 +139,64 @@ export function isTmuxAvailable(): boolean {
   return commandAvailable('tmux')
 }
 
+// `which bwrap` only proves the binary is on PATH — it doesn't prove bwrap
+// can actually create the namespaces/mounts it needs. Unprivileged user
+// namespaces can be disabled host-wide (sysctl
+// kernel.unprivileged_userns_clone=0) or blocked by an LSM/container policy,
+// in which case bwrap fails at exec time and a session spawned with the
+// sandbox prefix dies immediately instead of falling back to the unsandboxed
+// path the missing-binary case already gets. Probe with a real (minimal)
+// invocation exercising the same namespace/mount setup as the production
+// prefix in agent-sandbox.ts (--ro-bind / /, --dev /dev, --unshare-pid,
+// --proc /proc, --tmpfs /tmp) — a strict subset of that argv, so a pass here
+// isn't a false positive on a host that can list bwrap on PATH but can't run
+// it. `timeout` is load-bearing: this runs synchronously on the Electron main
+// process, so a hang (not just a nonzero exit) must not block the UI.
+//
+// Only the positive result is memoized: caching a negative would wrongly pin
+// every future session to unsandboxed if the host's namespace policy changes
+// (or bubblewrap gets installed) mid-run — same reasoning as the caching
+// discussion tracked in #251 for the simpler presence check this replaces.
+let sandboxUsable: boolean | null = null
+
+function probeSandboxUsable(): boolean {
+  if (sandboxUsable) return true
+  try {
+    execFileSync(
+      'bwrap',
+      [
+        '--ro-bind',
+        '/',
+        '/',
+        '--dev',
+        '/dev',
+        '--unshare-pid',
+        '--proc',
+        '/proc',
+        '--tmpfs',
+        '/tmp',
+        '--',
+        '/bin/true',
+      ],
+      { stdio: 'pipe', timeout: 3000, env: sanitizeChildEnv() as NodeJS.ProcessEnv }
+    )
+    sandboxUsable = true
+    return true
+  } catch {
+    return false
+  }
+}
+
+// Test-only escape hatch: pty-manager.test.ts exercises both the usable and
+// unusable case within one process, and the positive-only memoization above
+// would otherwise make the first successful probe permanently mask a later
+// test simulating an unusable bwrap. Not called from any production path.
+export function __resetSandboxProbeCacheForTesting(): void {
+  sandboxUsable = null
+}
+
 export function isSandboxAvailable(): boolean {
-  return commandAvailable('bwrap')
+  return probeSandboxUsable()
 }
 
 // Under the hardened bwrap args (--ro-bind / /, see agent-sandbox.ts), $HOME

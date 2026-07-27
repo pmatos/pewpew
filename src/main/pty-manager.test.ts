@@ -29,7 +29,12 @@ vi.mock('child_process', () => ({
     if (file === 'which') {
       const [bin] = args
       if (bin === 'tmux' && !state.tmuxAvailable) throw new Error('not found')
-      if (bin === 'bwrap' && !state.bwrapAvailable) throw new Error('not found')
+      return ''
+    }
+    // isSandboxAvailable() no longer checks `which bwrap` — it runs a real
+    // (minimal) bwrap invocation, so the fake has to answer to `bwrap` itself.
+    if (file === 'bwrap') {
+      if (!state.bwrapAvailable) throw new Error('not found')
       return ''
     }
     if (file === 'tmux' && args[0] === 'new-session') {
@@ -68,7 +73,12 @@ vi.mock('./host-connection', () => ({
 
 import { homedir } from 'os'
 import { join } from 'path'
-import { buildAgentArgs, createPty, createRemotePty } from './pty-manager'
+import {
+  buildAgentArgs,
+  createPty,
+  createRemotePty,
+  __resetSandboxProbeCacheForTesting,
+} from './pty-manager'
 import { buildSandboxArgs } from './agent-sandbox'
 import { OMP_HOOK_SCRIPT } from './hook-installer'
 import { canonicalPath, encodeOmpSessionDirName } from './agent-state-paths'
@@ -187,6 +197,10 @@ describe('createPty', () => {
     state.bwrapAvailable = true
     state.tmuxArgvCalls = []
     state.mkdirCalls = []
+    // isSandboxAvailable() memoizes a successful real-bwrap probe; without
+    // resetting it here, the first test to see bwrapAvailable=true would
+    // permanently mask every later test simulating bwrap being unusable.
+    __resetSandboxProbeCacheForTesting()
     warnSpy.mockClear()
   })
 
