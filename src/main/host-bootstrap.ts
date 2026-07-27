@@ -3,7 +3,7 @@ import type { ExecResult } from './host-connection'
 import type { AgentTool } from '../shared/types'
 
 export const NOTIFY_SCRIPT_VERSION = 1
-export const WORKTREE_GUARD_SCRIPT_VERSION = 1
+export const WORKTREE_GUARD_SCRIPT_VERSION = 2
 
 // Tools pewpew strictly requires on a remote host for sessions and the notify
 // hook to work. Exported so the connection-test flow can surface missing ones
@@ -57,29 +57,63 @@ payload=$(cat)
 target=$(printf '%s' "$payload" | jq -r '.tool_input.file_path // .tool_input.notebook_path // empty' 2>/dev/null)
 [ -z "$target" ] && exit 0
 
-# Resolve an absolute, symlink-free path even when the target doesn't exist
-# yet (a new file's parent directory may not have been created). Walk up from
-# the target until an existing *directory* ancestor is found (an existing
-# regular file can't be cd'd into, so -d rather than -e), canonicalize that,
-# then re-append the unresolved remainder.
+# Resolve an absolute, symlink-free, \`.\`/\`..\`-normalized path even when the
+# target doesn't exist yet (a new file's parent directory may not have been
+# created). Processes path components left to right through a work queue:
+# \`..\` pops the last resolved component lexically, independent of whether
+# that component currently exists on disk; any component that resolves to an
+# existing symlink — including the FINAL component, and including a symlink
+# to a regular file rather than a directory — has its target re-queued for
+# the same treatment, so a chain of symlinks and \`..\` segments is fully
+# unwound rather than left partially resolved (which previously let a
+# final-component symlink, or a \`..\` past a not-yet-created component,
+# through unresolved).
 resolve_path() {
   p="$1"
   case "$p" in
     /*) ;;
     *) p="$root_real/$p" ;;
   esac
-  suffix=""
-  while [ ! -d "$p" ]; do
-    suffix="/\${p##*/}$suffix"
-    parent="\${p%/*}"
-    if [ "$parent" = "$p" ] || [ -z "$parent" ]; then
-      p="/"
-      break
+
+  queue=()
+  IFS='/' read -r -a queue <<< "$p"
+
+  resolved=()
+  iterations=0
+  while [ "\${#queue[@]}" -gt 0 ]; do
+    iterations=$((iterations + 1))
+    # Bound total work so a symlink cycle can't hang the hook indefinitely.
+    [ "$iterations" -gt 256 ] && return 1
+
+    part="\${queue[0]}"
+    queue=("\${queue[@]:1}")
+
+    case "$part" in
+      '' | '.') continue ;;
+      '..')
+        last=$((\${#resolved[@]} - 1))
+        [ "$last" -ge 0 ] && unset 'resolved[last]'
+        continue
+        ;;
+    esac
+
+    resolved+=("$part")
+    candidate="/$(IFS=/; printf '%s' "\${resolved[*]}")"
+
+    if [ -L "$candidate" ]; then
+      last=$((\${#resolved[@]} - 1))
+      unset 'resolved[last]'
+      linktarget=$(readlink "$candidate") || return 1
+      case "$linktarget" in
+        /*) resolved=() ;;
+      esac
+      target_parts=()
+      IFS='/' read -r -a target_parts <<< "$linktarget"
+      queue=("\${target_parts[@]}" "\${queue[@]}")
     fi
-    p="$parent"
   done
-  base=$(cd "$p" 2>/dev/null && pwd -P) || { printf ''; return; }
-  printf '%s%s\\n' "$base" "$suffix"
+
+  printf '/%s' "$(IFS=/; printf '%s' "\${resolved[*]}")"
 }
 
 target_real=$(resolve_path "$target")

@@ -101,6 +101,42 @@ describe('worktree-guard.sh', () => {
     }
   })
 
+  it('denies a write through a symlink whose target is a file outside the worktree', () => {
+    const outside = mkdtempSync(join(tmpdir(), 'guard-file-target-'))
+    try {
+      const outsideFile = join(outside, 'secret.txt')
+      writeFileSync(outsideFile, 'x')
+      symlinkSync(outsideFile, join(root, 'link-to-file'))
+      const decision = run(writePayload(join(root, 'link-to-file')))
+      expect(decision?.hookSpecificOutput?.permissionDecision).toBe('deny')
+    } finally {
+      rmSync(outside, { recursive: true, force: true })
+    }
+  })
+
+  it('denies a `..` escape through a not-yet-existing intermediate component', () => {
+    // Built via string concatenation, not path.join: path.join would collapse
+    // the `..` segments itself before the payload ever reaches the script,
+    // which defeats the point of this test — the script must do its own
+    // normalization on the literal, unresolved string it receives.
+    const target = `${root}/missing/../../escape.txt`
+    const decision = run(writePayload(target))
+    expect(decision?.hookSpecificOutput?.permissionDecision).toBe('deny')
+  })
+
+  it('denies editing settings.local.json via a `..` bypass of the exact-path check', () => {
+    mkdirSync(join(root, '.claude'), { recursive: true })
+    const settingsPath = join(root, '.claude', 'settings.local.json')
+    writeFileSync(settingsPath, '{}')
+    const target = `${root}/nope/../.claude/settings.local.json`
+    const decision = run({
+      tool_name: 'Edit',
+      tool_input: { file_path: target, old_string: '{}', new_string: '{"hooks":{}}' },
+    })
+    expect(decision?.hookSpecificOutput?.permissionDecision).toBe('deny')
+    expect(decision?.hookSpecificOutput?.permissionDecisionReason).toContain('own settings file')
+  })
+
   it('handles the NotebookEdit notebook_path field', () => {
     const outside = mkdtempSync(join(tmpdir(), 'guard-nb-'))
     try {
