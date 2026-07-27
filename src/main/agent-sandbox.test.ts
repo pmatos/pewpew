@@ -11,9 +11,15 @@ describe('buildSandboxArgs', () => {
     // reorders or dedupes these entries and silently removes the boundary.
     expect(buildSandboxArgs(PROJECT, WORKTREE)).toEqual([
       'bwrap',
-      '--dev-bind',
+      '--ro-bind',
       '/',
       '/',
+      '--dev',
+      '/dev',
+      '--proc',
+      '/proc',
+      '--tmpfs',
+      '/tmp',
       '--ro-bind',
       PROJECT,
       PROJECT,
@@ -30,6 +36,10 @@ describe('buildSandboxArgs', () => {
       WORKTREE,
       '--',
     ])
+  })
+
+  it('never falls back to --dev-bind, which would pass through the whole host read-write', () => {
+    expect(buildSandboxArgs(PROJECT, WORKTREE)).not.toContain('--dev-bind')
   })
 
   it('does not ro-bind .git/config (would break `git config --local`)', () => {
@@ -55,12 +65,14 @@ describe('buildSandboxArgs', () => {
   })
 
   it('appends extra writable paths as --bind pairs before the final --chdir/--', () => {
-    const args = buildSandboxArgs(PROJECT, WORKTREE, { extraWritablePaths: ['/tmp', '/var/tmp'] })
+    const args = buildSandboxArgs(PROJECT, WORKTREE, {
+      extraWritablePaths: ['/opt/data', '/var/tmp'],
+    })
     const chdirIdx = args.indexOf('--chdir')
-    const tmpIdx = args.indexOf('--bind', args.indexOf(`${PROJECT}/.git/hooks`))
-    expect(args.slice(tmpIdx, tmpIdx + 3)).toEqual(['--bind', '/tmp', '/tmp'])
-    expect(args.slice(tmpIdx + 3, tmpIdx + 6)).toEqual(['--bind', '/var/tmp', '/var/tmp'])
-    expect(tmpIdx).toBeLessThan(chdirIdx)
+    const extraIdx = args.indexOf('--bind', args.indexOf(`${PROJECT}/.git/hooks`))
+    expect(args.slice(extraIdx, extraIdx + 3)).toEqual(['--bind', '/opt/data', '/opt/data'])
+    expect(args.slice(extraIdx + 3, extraIdx + 6)).toEqual(['--bind', '/var/tmp', '/var/tmp'])
+    expect(extraIdx).toBeLessThan(chdirIdx)
     expect(args.slice(chdirIdx)).toEqual(['--chdir', WORKTREE, '--'])
   })
 
@@ -72,18 +84,18 @@ describe('buildSandboxArgs', () => {
 
   it('drops extraWritablePaths entries that overlap the project root', () => {
     const args = buildSandboxArgs(PROJECT, WORKTREE, {
-      extraWritablePaths: [PROJECT, `${PROJECT}/.git/hooks`, `${PROJECT}-other`, '/tmp'],
+      extraWritablePaths: [PROJECT, `${PROJECT}/.git/hooks`, `${PROJECT}-other`, '/opt/data'],
     })
     const occurrences = (value: string) => args.filter((a) => a === value).length
     // The project root and its .git/hooks carve-out already appear twice
-    // each (as the ro-bind source/target from steps 2 and 4) — a dropped
-    // overlap must not add a third occurrence via an extra --bind pair.
+    // each (as the ro-bind source/target) — a dropped overlap must not add
+    // a third occurrence via an extra --bind pair.
     expect(occurrences(PROJECT)).toBe(2)
     expect(occurrences(`${PROJECT}/.git/hooks`)).toBe(2)
     // A path that merely shares a string prefix (not a path separator) with
     // the project root, and a genuinely unrelated path, are not overlaps.
     expect(args).toContain(`${PROJECT}-other`)
-    expect(args).toContain('/tmp')
+    expect(args).toContain('/opt/data')
   })
 
   it('drops extraWritablePaths entries that are an ANCESTOR of the project root', () => {
@@ -91,12 +103,21 @@ describe('buildSandboxArgs', () => {
     // would re-mount projectPath itself read-write via the later --bind,
     // since bwrap binds are order-dependent — not just a subtree within it.
     const args = buildSandboxArgs(PROJECT, WORKTREE, {
-      extraWritablePaths: ['/home/dev', '/', '/tmp'],
+      extraWritablePaths: ['/home/dev', '/', '/opt/data'],
     })
     expect(args).not.toContain('/home/dev')
-    // '/' is also the --dev-bind target from step 1, so assert on the
-    // occurrence count rather than presence.
+    // '/' is also the --ro-bind root target, so assert on the occurrence
+    // count rather than presence.
     expect(args.filter((a) => a === '/').length).toBe(2)
-    expect(args).toContain('/tmp')
+    expect(args).toContain('/opt/data')
+  })
+
+  it('mounts a fresh /dev, /proc, and /tmp rather than passing through the host copies', () => {
+    const args = buildSandboxArgs(PROJECT, WORKTREE)
+    const rootIdx = args.indexOf('--ro-bind')
+    expect(args.slice(rootIdx, rootIdx + 3)).toEqual(['--ro-bind', '/', '/'])
+    expect(args.slice(rootIdx + 3, rootIdx + 5)).toEqual(['--dev', '/dev'])
+    expect(args.slice(rootIdx + 5, rootIdx + 7)).toEqual(['--proc', '/proc'])
+    expect(args.slice(rootIdx + 7, rootIdx + 9)).toEqual(['--tmpfs', '/tmp'])
   })
 })
