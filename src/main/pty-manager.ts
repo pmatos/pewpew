@@ -185,10 +185,14 @@ export function createPty(sessionId: string, cwd: string, options?: SpawnOptions
   const tmuxSession = `pewpew-${sessionId}`
   let sandboxPrefix: string[] = []
   if (options?.projectPath) {
+    const sandboxAvailable = isSandboxAvailable()
+    if (!sandboxAvailable) {
+      console.warn(`Session ${sessionId}: bwrap not found, spawning without sandbox containment`)
+    }
     const stateDir = agentStateDir(options.tool)
     mkdirSync(stateDir, { recursive: true })
     sandboxPrefix = buildSandboxArgs(options.projectPath, cwd, {
-      enabled: isSandboxAvailable(),
+      enabled: sandboxAvailable,
       extraWritablePaths: [stateDir],
     })
   }
