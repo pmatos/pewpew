@@ -24,6 +24,8 @@ const state = vi.hoisted(() => ({
     cwd: string
     hostId: string
     continueSession?: boolean
+    tool?: AgentTool
+    notifyHookPath?: string
   }[],
   reattachRemotePtyCalls: [] as { sessionId: string; hostId: string }[],
   createPtyCalls: [] as { sessionId: string; cwd: string }[],
@@ -53,6 +55,9 @@ const state = vi.hoisted(() => ({
   // (hasRemoteClaudeConversationHistory). true → directory present (resume),
   // false → absent (spawn fresh). Unset falls through to the default code 0.
   claudeHistoryProbeResult: new Map<string, boolean>(),
+  // Same shape as claudeHistoryProbeResult, for the remote omp equivalent
+  // (hasRemoteOmpConversationHistory).
+  ompHistoryProbeResult: new Map<string, boolean>(),
   // Toggle to simulate ensureHostConnection throwing.
   ensureHostConnectionThrows: null as null | { message: string; runtimeStateAfter: string },
   // When set, delays next ensureHostConnection resolution (used for idempotency
@@ -63,6 +68,9 @@ const state = vi.hoisted(() => ({
   // Captured emitToast payloads for assertion.
   toasts: [] as { severity: string; title: string; detail?: string }[],
   hasPtyResult: new Set<string>(),
+  // Session ids for which the mocked destroyRemotePty rejects (simulates an
+  // SSH teardown failure), for removeSession failure-path coverage.
+  destroyRemotePtyThrows: new Set<string>(),
   // Response returned by the mocked cleanup dialog: 0 = Delete worktree,
   // 1 = Keep worktree, 2 = Keep and open in file manager.
   dialogResponse: 1,
@@ -111,12 +119,14 @@ vi.mock('./notifications', () => ({
   },
 }))
 
+const showMessageBoxMock = vi.fn(async (..._args: unknown[]) => {
+  if (state.dialogThrows) throw new Error('dialog failed')
+  return { response: state.dialogResponse }
+})
+
 vi.mock('electron', () => ({
   dialog: {
-    showMessageBox: async () => {
-      if (state.dialogThrows) throw new Error('dialog failed')
-      return { response: state.dialogResponse }
-    },
+    showMessageBox: showMessageBoxMock,
   },
   shell: {
     openPath: async () => '',
@@ -163,7 +173,8 @@ vi.mock('./host-bootstrap', () => ({
   },
   bootstrapHost: vi.fn(async () => ({
     notifyScriptPath: '/tmp/notify-v1.sh',
-    agentPaths: { claude: '/r/bin/claude', codex: '/r/bin/codex' },
+    ompHookScriptPath: '/tmp/omp-notify-v1.ts',
+    agentPaths: { claude: '/r/bin/claude', codex: '/r/bin/codex', omp: '/r/bin/omp' },
   })),
 }))
 
@@ -175,7 +186,11 @@ vi.mock('./pty-manager', () => ({
     state.detachPtyCalls.push(sessionId)
   },
   destroyPty: vi.fn(),
-  destroyRemotePty: vi.fn(async () => undefined),
+  destroyRemotePty: vi.fn(async (sessionId: string) => {
+    if (state.destroyRemotePtyThrows.has(sessionId)) {
+      throw new Error('ssh teardown failed')
+    }
+  }),
   hasPty: vi.fn((sessionId: string) => state.hasPtyResult.has(sessionId)),
   hasTmuxSession: vi.fn(() => false),
   hasRemoteTmuxSession: vi.fn(async (sessionId: string) => {
@@ -208,13 +223,15 @@ vi.mock('./pty-manager', () => ({
     sessionId: string,
     cwd: string,
     host: Host,
-    options?: { continueSession?: boolean }
+    options?: { continueSession?: boolean; tool?: AgentTool; notifyHookPath?: string }
   ) => {
     state.createRemotePtyCalls.push({
       sessionId,
       cwd,
       hostId: host.hostId,
       continueSession: options?.continueSession,
+      tool: options?.tool,
+      notifyHookPath: options?.notifyHookPath,
     })
     state.runtimeRefs.set(host.hostId, (state.runtimeRefs.get(host.hostId) ?? 0) + 1)
   },
@@ -243,6 +260,17 @@ vi.mock('./host-connection', () => ({
     // multi-segment) probe command. The probed worktree path is the last arg.
     if (argv[0] === 'sh' && typeof argv[2] === 'string' && argv[2].includes('.claude/projects')) {
       const present = state.claudeHistoryProbeResult.get(argv[argv.length - 1])
+      if (present !== undefined) {
+        return { stdout: '', stderr: '', code: present ? 0 : 1, timedOut: false }
+      }
+    }
+    // Same shape as the claude probe above, for hasRemoteOmpConversationHistory.
+    if (
+      argv[0] === 'sh' &&
+      typeof argv[2] === 'string' &&
+      argv[2].includes('.omp/agent/sessions')
+    ) {
+      const present = state.ompHistoryProbeResult.get(argv[argv.length - 1])
       if (present !== undefined) {
         return { stdout: '', stderr: '', code: present ? 0 : 1, timedOut: false }
       }
@@ -358,14 +386,17 @@ beforeEach(() => {
   state.execRemoteCalls = []
   state.execRemoteResults = new Map()
   state.claudeHistoryProbeResult = new Map()
+  state.ompHistoryProbeResult = new Map()
   state.ensureHostConnectionThrows = null
   state.ensureHostConnectionGate = null
   state.unexpectedExitListener = null
   state.reconnectConfig = { enabled: true, initialDelayMs: 1000, maxDelayMs: 30000 }
   state.toasts = []
   state.hasPtyResult = new Set()
+  state.destroyRemotePtyThrows = new Set()
   state.dialogResponse = 1
   state.dialogThrows = false
+  showMessageBoxMock.mockClear()
 })
 
 afterEach(() => {
@@ -459,7 +490,13 @@ describe('createRemoteSessionForWorktree (adopt remote worktree)', () => {
     expect(session.connectionState).toBe('live')
     expect(session.tool).toBe('claude')
     expect(state.createRemotePtyCalls).toEqual([
-      { sessionId: session.id, cwd: worktreePath, hostId: 'h1' },
+      {
+        sessionId: session.id,
+        cwd: worktreePath,
+        hostId: 'h1',
+        tool: 'claude',
+        notifyHookPath: '/tmp/omp-notify-v1.ts',
+      },
     ])
     const ranWorktreeAdd = state.execRemoteCalls.some(
       (c) => c.argv[0] === 'git' && c.argv.includes('worktree') && c.argv.includes('add')
@@ -1180,6 +1217,62 @@ describe('reconnectRemoteSession', () => {
   })
 })
 
+describe('removeSession', () => {
+  // Regression: destroyPty/destroyRemotePty deliver a real kill signal to the
+  // agent process (unlike killSession's detach-only local path), and some
+  // tools' SessionEnd-equivalent hook completes fast enough over that signal
+  // to land while removeWorktree's git subprocess is still running below —
+  // before the session is even out of the `sessions` map. Without
+  // removeSession adding to cleanupInProgress up front, that races the
+  // explicit, dialog-free delete here against a "clean up worktree?" prompt
+  // for a worktree already being (or already) force-removed.
+  it('suppresses a racing session.end dialog while tearing down the worktree', async () => {
+    const local = baseLocalSession({ id: 'l1', status: 'idle' })
+    mkdirSync(local.worktreePath, { recursive: true })
+    writeSessionsJson([local])
+    const sm = await loadSessionManager()
+    sm.restoreSessions()
+
+    const removePromise = sm.removeSession('l1')
+    // removeSession's synchronous prefix (cleanupInProgress.add) has already
+    // run by this point — JS doesn't yield until removeSession's first await
+    // — so promptCleanup's own guard is guaranteed to see it below.
+    sm.handleHookEvent('session.end', { cwd: local.worktreePath }, null)
+
+    await removePromise
+
+    expect(showMessageBoxMock).not.toHaveBeenCalled()
+    expect(sm.getSessions()).toEqual([])
+  })
+
+  // Regression: cleanupInProgress.add(id) ran unconditionally with nothing to
+  // release it if a fallible step below threw — getRequiredHost throws
+  // synchronously for a removed host, destroyRemotePty throws on SSH
+  // failures, and removeSession is called directly from the
+  // sessions:remove(-batch) IPC handlers (not just via promptCleanup), which
+  // swallow the error. That left the session alive but permanently stuck in
+  // cleanupInProgress, silently no-oping every future session.end for it.
+  it('releases cleanupInProgress and keeps the session alive when teardown fails', async () => {
+    const remote = baseRemoteSession({ id: 'r1', status: 'idle' })
+    writeSessionsJson([remote])
+    state.destroyRemotePtyThrows.add('r1')
+    const sm = await loadSessionManager()
+    sm.restoreSessions()
+
+    await expect(sm.removeSession('r1')).rejects.toThrow('ssh teardown failed')
+
+    // The session must survive a failed removal.
+    expect(sm.getSessions().map((s) => s.id)).toEqual(['r1'])
+
+    // cleanupInProgress must have been released: a later session.end for this
+    // session should open the cleanup dialog normally, not silently no-op.
+    sm.handleHookEvent('session.end', { cwd: remote.worktreePath }, 'h1')
+    await new Promise((resolve) => setTimeout(resolve, 0))
+
+    expect(showMessageBoxMock).toHaveBeenCalledTimes(1)
+  })
+})
+
 describe('probePendingSessionsOnHost', () => {
   function threePendingOnH1(): Session[] {
     return [
@@ -1737,7 +1830,14 @@ describe('reviveSession — remote resume fallback', () => {
     await sm.reviveSession('r1')
 
     expect(state.createRemotePtyCalls).toEqual([
-      { sessionId: 'r1', cwd: remote.worktreePath, hostId: 'h1', continueSession: false },
+      {
+        sessionId: 'r1',
+        cwd: remote.worktreePath,
+        hostId: 'h1',
+        continueSession: false,
+        tool: 'claude',
+        notifyHookPath: '/tmp/omp-notify-v1.ts',
+      },
     ])
     expect(sm.getSessions()[0].status).toBe('idle')
   })
@@ -1752,7 +1852,57 @@ describe('reviveSession — remote resume fallback', () => {
     await sm.reviveSession('r1')
 
     expect(state.createRemotePtyCalls).toEqual([
-      { sessionId: 'r1', cwd: remote.worktreePath, hostId: 'h1', continueSession: true },
+      {
+        sessionId: 'r1',
+        cwd: remote.worktreePath,
+        hostId: 'h1',
+        continueSession: true,
+        tool: 'claude',
+        notifyHookPath: '/tmp/omp-notify-v1.ts',
+      },
+    ])
+  })
+
+  it('spawns fresh when the remote has no omp conversation history', async () => {
+    const remote = baseRemoteSession({ id: 'r1', status: 'dead', tool: 'omp' })
+    writeSessionsJson([remote])
+    state.ompHistoryProbeResult.set(remote.worktreePath, false)
+    const sm = await loadSessionManager()
+    sm.restoreSessions()
+
+    await sm.reviveSession('r1')
+
+    expect(state.createRemotePtyCalls).toEqual([
+      {
+        sessionId: 'r1',
+        cwd: remote.worktreePath,
+        hostId: 'h1',
+        continueSession: false,
+        tool: 'omp',
+        notifyHookPath: '/tmp/omp-notify-v1.ts',
+      },
+    ])
+    expect(sm.getSessions()[0].status).toBe('idle')
+  })
+
+  it('resumes when the remote has omp conversation history', async () => {
+    const remote = baseRemoteSession({ id: 'r1', status: 'dead', tool: 'omp' })
+    writeSessionsJson([remote])
+    state.ompHistoryProbeResult.set(remote.worktreePath, true)
+    const sm = await loadSessionManager()
+    sm.restoreSessions()
+
+    await sm.reviveSession('r1')
+
+    expect(state.createRemotePtyCalls).toEqual([
+      {
+        sessionId: 'r1',
+        cwd: remote.worktreePath,
+        hostId: 'h1',
+        continueSession: true,
+        tool: 'omp',
+        notifyHookPath: '/tmp/omp-notify-v1.ts',
+      },
     ])
   })
 
@@ -1765,7 +1915,14 @@ describe('reviveSession — remote resume fallback', () => {
     await sm.reviveSession('r1')
 
     expect(state.createRemotePtyCalls).toEqual([
-      { sessionId: 'r1', cwd: remote.worktreePath, hostId: 'h1', continueSession: false },
+      {
+        sessionId: 'r1',
+        cwd: remote.worktreePath,
+        hostId: 'h1',
+        continueSession: false,
+        tool: 'codex',
+        notifyHookPath: '/tmp/omp-notify-v1.ts',
+      },
     ])
   })
 })
@@ -3288,6 +3445,112 @@ describe('auto-reconnect skips normally-ended remote sessions', () => {
       expect(sm.getSessions()[0].status).toBe('completed')
     } finally {
       vi.useRealTimers()
+    }
+  })
+})
+
+describe('omp remote history probe shell/JS parity', () => {
+  // Regression: hasRemoteOmpConversationHistory's shell script (nested case
+  // branches, multiply-escaped sed substitutions) is meaningfully more
+  // complex than the single-sed Claude equivalent, and every other test in
+  // this file only mocks execRemote by matching argv patterns — nothing
+  // actually runs the script through a real shell. Run OMP_ENCODE_SHELL_SCRIPT
+  // for real (via a real `sh`, with a controlled $HOME/$TMPDIR/$TMP/$TEMP)
+  // and assert its `enc` output matches encodeOmpSessionDirName's JS output,
+  // across the same home-relative / tmp-relative / legacy-absolute cases the
+  // production code branches on, plus a path with an embedded ':' to exercise
+  // the sed character-class escaping both implementations share.
+  it('produces the same encoding as encodeOmpSessionDirName for representative paths', async () => {
+    const sm = await loadSessionManager()
+    const fakeHome = mkdtempSync(join(tmpdir(), 'omp-parity-home-'))
+    const fakeTmpRoot = mkdtempSync(join(tmpdir(), 'omp-parity-tmp-'))
+    const outsideBoth = mkdtempSync(join(tmpdir(), 'omp-parity-outside-'))
+    try {
+      const nestedInHome = join(fakeHome, 'dev', 'proj:ect')
+      mkdirSync(nestedInHome, { recursive: true })
+      const nestedInTmp = join(fakeTmpRoot, 'scratch')
+      mkdirSync(nestedInTmp, { recursive: true })
+
+      const cases = [fakeHome, nestedInHome, fakeTmpRoot, nestedInTmp, outsideBoth]
+
+      const savedHome = process.env.HOME
+      const savedTmpdir = process.env.TMPDIR
+      const savedTmp = process.env.TMP
+      const savedTemp = process.env.TEMP
+      try {
+        process.env.HOME = fakeHome
+        process.env.TMPDIR = fakeTmpRoot
+        delete process.env.TMP
+        delete process.env.TEMP
+
+        for (const target of cases) {
+          const jsEncoded = sm.encodeOmpSessionDirName(target)
+          const shellEncoded = execFileSync(
+            'sh',
+            ['-c', `${sm.OMP_ENCODE_SHELL_SCRIPT}; printf '%s' "$enc"`, '_', target],
+            { env: { ...process.env }, encoding: 'utf-8' }
+          )
+          expect(shellEncoded).toBe(jsEncoded)
+        }
+      } finally {
+        if (savedHome === undefined) delete process.env.HOME
+        else process.env.HOME = savedHome
+        if (savedTmpdir === undefined) delete process.env.TMPDIR
+        else process.env.TMPDIR = savedTmpdir
+        if (savedTmp === undefined) delete process.env.TMP
+        else process.env.TMP = savedTmp
+        if (savedTemp === undefined) delete process.env.TEMP
+        else process.env.TEMP = savedTemp
+      }
+    } finally {
+      rmSync(fakeHome, { recursive: true, force: true })
+      rmSync(fakeTmpRoot, { recursive: true, force: true })
+      rmSync(outsideBoth, { recursive: true, force: true })
+    }
+  })
+
+  // Regression for the TMPDIR/TMP/TEMP parity bug: a remote host that sets
+  // only TMP (not TMPDIR) must still classify a worktree under that root as
+  // tmp-relative, matching Node's os.tmpdir() fallback order.
+  it('resolves TMP when TMPDIR is unset, matching os.tmpdir()', async () => {
+    const sm = await loadSessionManager()
+    const fakeHome = mkdtempSync(join(tmpdir(), 'omp-parity-home-'))
+    const fakeTmpRoot = mkdtempSync(join(tmpdir(), 'omp-parity-tmp-'))
+    try {
+      const nestedInTmp = join(fakeTmpRoot, 'scratch')
+      mkdirSync(nestedInTmp, { recursive: true })
+
+      const savedHome = process.env.HOME
+      const savedTmpdir = process.env.TMPDIR
+      const savedTmp = process.env.TMP
+      const savedTemp = process.env.TEMP
+      try {
+        process.env.HOME = fakeHome
+        delete process.env.TMPDIR
+        process.env.TMP = fakeTmpRoot
+        delete process.env.TEMP
+
+        const jsEncoded = sm.encodeOmpSessionDirName(nestedInTmp)
+        expect(jsEncoded).toBe('-tmp-scratch')
+        const shellEncoded = execFileSync(
+          'sh',
+          ['-c', `${sm.OMP_ENCODE_SHELL_SCRIPT}; printf '%s' "$enc"`, '_', nestedInTmp],
+          { env: { ...process.env }, encoding: 'utf-8' }
+        )
+        expect(shellEncoded).toBe(jsEncoded)
+      } finally {
+        if (savedHome === undefined) delete process.env.HOME
+        else process.env.HOME = savedHome
+        if (savedTmpdir === undefined) delete process.env.TMPDIR
+        else process.env.TMPDIR = savedTmpdir
+        if (savedTmp === undefined) delete process.env.TMP
+        else process.env.TMP = savedTmp
+        if (savedTemp === undefined) delete process.env.TEMP
+        else process.env.TEMP = savedTemp
+      }
+    } finally {
+      rmSync(fakeHome, { recursive: true, force: true })
+      rmSync(fakeTmpRoot, { recursive: true, force: true })
     }
   })
 })

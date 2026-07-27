@@ -7,6 +7,7 @@ vi.mock('electron', () => ({
 }))
 
 import { buildAgentArgs } from './pty-manager'
+import { OMP_HOOK_SCRIPT } from './hook-installer'
 
 describe('buildAgentArgs', () => {
   it('defaults to claude with --dangerously-skip-permissions', () => {
@@ -61,5 +62,42 @@ describe('buildAgentArgs', () => {
         agentPath: '/u/.npm/codex',
       })
     ).toEqual(['/u/.npm/codex', 'resume', 'abc-123', '--dangerously-bypass-approvals-and-sandbox'])
+  })
+
+  it('omp without continueSession uses --auto-approve and the default local hook path', () => {
+    expect(buildAgentArgs({ tool: 'omp' })).toEqual([
+      'omp',
+      '--auto-approve',
+      '--hook',
+      OMP_HOOK_SCRIPT,
+    ])
+  })
+
+  it('omp with continueSession appends --continue (no session id needed)', () => {
+    expect(buildAgentArgs({ tool: 'omp', continueSession: true })).toEqual([
+      'omp',
+      '--auto-approve',
+      '--hook',
+      OMP_HOOK_SCRIPT,
+      '--continue',
+    ])
+  })
+
+  it('uses agentPath as argv[0] when provided (omp)', () => {
+    expect(buildAgentArgs({ tool: 'omp', agentPath: '/u/.bun/bin/omp' })).toEqual([
+      '/u/.bun/bin/omp',
+      '--auto-approve',
+      '--hook',
+      OMP_HOOK_SCRIPT,
+    ])
+  })
+
+  it('omp uses notifyHookPath override when provided (remote sessions)', () => {
+    expect(
+      buildAgentArgs({
+        tool: 'omp',
+        notifyHookPath: '/home/dev/.config/pewpew/hooks/omp-notify.ts',
+      })
+    ).toEqual(['omp', '--auto-approve', '--hook', '/home/dev/.config/pewpew/hooks/omp-notify.ts'])
   })
 })

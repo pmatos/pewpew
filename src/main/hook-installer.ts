@@ -20,6 +20,14 @@ const execFileAsync = promisify(execFile)
 const NOTIFY_SCRIPT = join(CONFIG_DIR, 'hooks', 'notify.sh')
 const GUARD_SCRIPT = join(CONFIG_DIR, 'hooks', 'worktree-guard.sh')
 
+// omp (oh-my-pi) loads its hook bridge directly via the CLI's `--hook <path>`
+// flag rather than a declarative JSON hooks file, so there's no install/merge
+// step analogous to installHooks/installCodexHooks — just a fixed path that
+// buildAgentArgs points `--hook` at. The file itself is copied into place by
+// installOmpNotifyScript in index.ts (mirrors installNotifyScript for
+// notify.sh), from the repo's hooks/omp-notify.ts.
+export const OMP_HOOK_SCRIPT = join(CONFIG_DIR, 'hooks', 'omp-notify.ts')
+
 // Claude Code's own sandbox only isolates Bash subprocesses; the built-in
 // Write/Edit/MultiEdit/NotebookEdit tools go through the permission system
 // instead, which --dangerously-skip-permissions (always passed by pewpew)

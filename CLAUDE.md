@@ -56,8 +56,9 @@ When debugging visual issues, **always drive the running app yourself first**: b
 
 - **Claude Code** (`claude`) — default. Uses `--continue` to resume. Hooks installed at `<worktree>/.claude/settings.local.json`.
 - **OpenAI Codex** (`codex`) — opt-in per session. Resume uses `codex resume <session_id>` (the `agentSessionId` is captured from the `SessionStart` hook payload). Hooks installed at `<worktree>/.codex/hooks.json` and gated behind `[features].codex_hooks = true` in `~/.codex/config.toml`, which pewpew enables idempotently on first codex session install.
+- **oh-my-pi** (`omp`) — opt-in per session. Non-interactive flag is `--auto-approve`; resume uses `-c`/`--continue`, which is cwd-scoped (no session ID capture needed, unlike codex) — gated by `hasOmpConversationHistory`/`hasRemoteOmpConversationHistory` in `session-manager.ts` checking `~/.omp/agent/sessions/<encoded-cwd>/` (encoding ported from omp's own `session-paths.ts`). Hooks work differently from Claude/Codex: omp loads a hook bridge directly via `--hook <path>` (see `hooks/omp-notify.ts`) rather than declarative JSON written into the project, so there's no per-worktree install, gitignore entry, or feature flag — `buildAgentArgs` just points `--hook` at the bridge script (`OMP_HOOK_SCRIPT` locally, `ompHookScriptPath` from `bootstrapHost` on remote hosts, embedded as a template in `host-bootstrap.ts` and kept in sync with `hooks/omp-notify.ts` by hand).
 
-The default tool is configurable via `defaultTool` in `~/.config/pewpew/config.json`. Per-session selection is exposed in the "New session" dialog. Both `claude` and `codex` must be in `PATH` (locally and on every remote host where the corresponding tool is selected).
+The default tool is configurable via `defaultTool` in `~/.config/pewpew/config.json`. Per-session selection is exposed in the "New session" dialog. `claude`, `codex`, and `omp` must be in `PATH` (locally and on every remote host where the corresponding tool is selected).
 
 ## Implementation
 

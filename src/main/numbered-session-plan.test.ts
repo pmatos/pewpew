@@ -98,6 +98,13 @@ describe('shouldCreateSerially', () => {
     expect(shouldCreateSerially(null, 'codex')).toBe(false)
   })
 
+  // omp's hook bridge is passed via a CLI flag (no shared per-host config file
+  // gets mutated the way ~/.codex/config.toml does), so unlike codex it never
+  // needs serialized remote creation.
+  it('parallelizes remote omp creation', () => {
+    expect(shouldCreateSerially('h1', 'omp')).toBe(false)
+  })
+
   it('parallelizes local Claude creation', () => {
     expect(shouldCreateSerially(null, 'claude')).toBe(false)
   })
