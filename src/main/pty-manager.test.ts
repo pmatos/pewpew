@@ -266,9 +266,10 @@ describe('createPty', () => {
     expect(state.mkdirCalls).not.toContain(join(homedir(), '.omp'))
     const argv = agentArgsFromCall(state.tmuxArgvCalls[0])
     // The extra writable path is bound after the project's own `.git`/`.git/hooks`
-    // binds, so search for '--bind' starting past the last fixed occurrence.
-    const bindIdx = argv.indexOf('--bind', argv.indexOf(`${PROJECT}/.git/hooks`))
-    expect(argv.slice(bindIdx, bindIdx + 3)).toEqual(['--bind', ompStateDir, ompStateDir])
+    // binds, so search for '--bind-try' starting past the last fixed occurrence.
+    // Extra paths use --bind-try so a missing source can't crash bwrap's spawn.
+    const bindIdx = argv.indexOf('--bind-try', argv.indexOf(`${PROJECT}/.git/hooks`))
+    expect(argv.slice(bindIdx, bindIdx + 3)).toEqual(['--bind-try', ompStateDir, ompStateDir])
   })
 
   it('omits the sandbox prefix and warns when bwrap is unavailable', () => {

@@ -23,6 +23,21 @@ export interface ReconnectConfig {
   maxDelayMs: number
 }
 
+export interface SandboxConfig {
+  enabled: boolean
+  // Extra paths re-opened for write access inside the bwrap sandbox, on top
+  // of the session worktree and the agent state dir. The sandbox mounts the
+  // host read-only by default (--ro-bind / /), so this is the only way a
+  // session regains write access to a host path outside its worktree, e.g.
+  // a shared build cache. Entries that equal, nest under, or are an
+  // ancestor of the project root are dropped instead (they would re-open
+  // the project read-write — see agent-sandbox.ts), and missing sources are
+  // tolerated via --bind-try. `~/` prefixes are resolved against the local
+  // home directory before use, so this has no effect on remote sessions (a
+  // remote host's home directory can't be resolved locally).
+  extraWritablePaths: string[]
+}
+
 export interface AppConfig {
   scanDirs: string[]
   pinnedPaths: string[]
@@ -42,6 +57,7 @@ export interface AppConfig {
   reduceAnimations: boolean
   bulkOpenConfirmThreshold: number
   reconnect: ReconnectConfig
+  sandbox: SandboxConfig
 }
 
 export const CONFIG_DIR = join(process.env.XDG_CONFIG_HOME || join(homedir(), '.config'), 'pewpew')
@@ -65,6 +81,7 @@ const DEFAULT_CONFIG: AppConfig = {
   reduceAnimations: false,
   bulkOpenConfirmThreshold: 20,
   reconnect: { enabled: true, initialDelayMs: 1000, maxDelayMs: 30000 },
+  sandbox: { enabled: true, extraWritablePaths: [] },
 }
 
 export function shouldWarnGitignore(projectPath: string): boolean {
@@ -106,6 +123,10 @@ export function getConfig(): AppConfig {
 // per-field so the scheduler never sees an undefined tunable.
 export function getReconnectConfig(): ReconnectConfig {
   return { ...DEFAULT_CONFIG.reconnect, ...(getConfig().reconnect ?? {}) }
+}
+
+export function getSandboxConfig(): SandboxConfig {
+  return { ...DEFAULT_CONFIG.sandbox, ...(getConfig().sandbox ?? {}) }
 }
 
 export function saveConfig(config: AppConfig): void {

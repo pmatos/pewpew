@@ -615,6 +615,28 @@ body,
   font-size: 12px;
 }
 
+.sandbox-badge {
+  font-size: 10px;
+  line-height: 1;
+  padding: 2px 5px;
+  border-radius: 3px;
+  border: 1px solid transparent;
+  text-transform: uppercase;
+  letter-spacing: 0.03em;
+  flex-shrink: 0;
+}
+
+.sandbox-badge.sandbox-on {
+  color: var(--accent-green);
+  border-color: var(--accent-green);
+}
+
+.sandbox-badge.sandbox-off {
+  color: var(--text-secondary);
+  border-color: var(--text-secondary);
+  opacity: 0.7;
+}
+
 .session-card-text-thumb.stale {
   opacity: 0.55;
   filter: saturate(0.6);

@@ -13,6 +13,7 @@ import { listenHookServerForHost } from './hook-server'
 import { bootstrapHost, HostBootstrapError, type AgentResolution } from './host-bootstrap'
 import { setHostAgentPaths } from './host-registry'
 import { emitToast } from './notifications'
+import { getSandboxConfig } from './config'
 import type { Host, ToastEvent } from '../shared/types'
 
 export interface PreparedRemoteHost {
@@ -47,6 +48,11 @@ export interface RemoteHostRuntimeDeps {
   execRemote(host: Host, argv: string[], opts?: { timeoutMs?: number }): Promise<ExecResult>
   setHostAgentPaths(hostId: string, paths: AgentResolution): void
   emitToast(event: Omit<ToastEvent, 'id'> & { id?: string }): void
+  // User config knob (sandbox.enabled in config.json). Read per call so a
+  // config edit takes effect without an app restart. When false, the
+  // "sandbox unavailable" toast is suppressed — a host missing bwrap is not
+  // a problem the user opted into hearing about.
+  sandboxEnabled(): boolean
 }
 
 export interface RemoteHostRuntime {
@@ -125,7 +131,7 @@ export function createRemoteHostRuntime(deps: RemoteHostRuntimeDeps): RemoteHost
         host.agentPaths ?? {}
       )
       deps.setHostAgentPaths(host.hostId, bootstrap.agentPaths)
-      if (!bootstrap.sandboxAvailable && !sandboxWarned.has(host.hostId)) {
+      if (deps.sandboxEnabled() && !bootstrap.sandboxAvailable && !sandboxWarned.has(host.hostId)) {
         sandboxWarned.add(host.hostId)
         const label = host.label || host.alias
         deps.emitToast({
@@ -193,4 +199,5 @@ export const remoteHostRuntime = createRemoteHostRuntime({
   execRemote,
   setHostAgentPaths,
   emitToast,
+  sandboxEnabled: () => getSandboxConfig().enabled,
 })

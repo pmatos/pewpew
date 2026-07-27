@@ -53,6 +53,12 @@ export interface Session {
   lastKnownState?: LastKnownState
   tool: AgentTool
   agentSessionId?: string
+  // Whether this session's agent process is running inside the bwrap
+  // sandbox (see agent-sandbox.ts) — undefined for sessions created before
+  // this field existed. Reflects reality at the last spawn only: reviving or
+  // reattaching an existing tmux session doesn't re-wrap it, so this doesn't
+  // change until the process itself is recreated.
+  sandboxed?: boolean
 }
 
 export interface OpenSessionsSummary {

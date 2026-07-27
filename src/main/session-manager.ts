@@ -463,7 +463,7 @@ async function adoptWorktree(
   const branch = resolveBranchFromWorktree(worktreePath, worktreeName, projectName)
 
   await installAgentHooks(tool, worktreePath)
-  createPty(id, worktreePath, { tool, projectPath })
+  const sandboxed = createPty(id, worktreePath, { tool, projectPath })
 
   const session: Session = {
     id,
@@ -480,6 +480,7 @@ async function adoptWorktree(
     lastActivity: Date.now(),
     hookEvents: [],
     tool,
+    sandboxed,
   }
 
   sessions.set(id, { session })
@@ -661,7 +662,7 @@ async function adoptRemoteWorktree(
   const id = randomUUID().slice(0, 8)
   const tmuxSession = `pewpew-${id}`
 
-  const branch = await remoteHostRuntime.withPreparedHost(
+  const { branch, sandboxed } = await remoteHostRuntime.withPreparedHost(
     host,
     async ({
       notifyScriptPath,
@@ -696,14 +697,14 @@ async function adoptRemoteWorktree(
         ).trim() || 'HEAD'
 
       await installRemoteAgentHooks(tool, host, worktreePath, notifyScriptPath, guardScriptPath)
-      await createRemotePty(id, worktreePath, host, {
+      const wasSandboxed = await createRemotePty(id, worktreePath, host, {
         tool,
         agentPath,
         projectPath,
         notifyHookPath: ompHookScriptPath,
         sandboxAvailable,
       })
-      return resolvedBranch
+      return { branch: resolvedBranch, sandboxed: wasSandboxed }
     }
   )
 
@@ -723,6 +724,7 @@ async function adoptRemoteWorktree(
     lastActivity: Date.now(),
     hookEvents: [],
     tool,
+    sandboxed,
     ...(remoteProject.repoFingerprint ? { repoFingerprint: remoteProject.repoFingerprint } : {}),
   }
 
@@ -754,7 +756,7 @@ async function createRemoteSession(
   const branchName = worktreeBranchName(remoteProject.name, worktreeName)
   const baseRef = effectiveWorktreeBase(options)
 
-  const branch = await remoteHostRuntime.withPreparedHost(
+  const { branch, sandboxed } = await remoteHostRuntime.withPreparedHost(
     host,
     async ({
       notifyScriptPath,
@@ -837,14 +839,14 @@ async function createRemoteSession(
         notifyScriptPath,
         guardScriptPath
       )
-      await createRemotePty(id, worktreePath, host, {
+      const wasSandboxed = await createRemotePty(id, worktreePath, host, {
         tool: effectiveTool,
         agentPath,
         projectPath,
         notifyHookPath: ompHookScriptPath,
         sandboxAvailable,
       })
-      return resolvedBranch
+      return { branch: resolvedBranch, sandboxed: wasSandboxed }
     }
   )
 
@@ -864,6 +866,7 @@ async function createRemoteSession(
     lastActivity: Date.now(),
     hookEvents: [],
     tool: effectiveTool,
+    sandboxed,
     ...(remoteProject.repoFingerprint ? { repoFingerprint: remoteProject.repoFingerprint } : {}),
   }
 
@@ -1015,7 +1018,7 @@ async function createRemotePrSession(
         notifyScriptPath,
         guardScriptPath
       )
-      await createRemotePty(id, worktreePath, host, {
+      const sandboxed = await createRemotePty(id, worktreePath, host, {
         tool: effectiveTool,
         agentPath,
         projectPath,
@@ -1041,6 +1044,7 @@ async function createRemotePrSession(
         lastActivity: Date.now(),
         hookEvents: [],
         tool: effectiveTool,
+        sandboxed,
         ...(remoteProject.repoFingerprint
           ? { repoFingerprint: remoteProject.repoFingerprint }
           : {}),
@@ -1547,7 +1551,7 @@ export async function reviveSession(id: string): Promise<void> {
                 `Session ${id} (${session.tool}) has no prior conversation on host ${host.alias}; spawning fresh instead of resuming`
               )
             }
-            await createRemotePty(id, session.worktreePath, host, {
+            session.sandboxed = await createRemotePty(id, session.worktreePath, host, {
               continueSession: canResume,
               tool: session.tool,
               agentSessionId: session.agentSessionId,
@@ -1583,7 +1587,7 @@ export async function reviveSession(id: string): Promise<void> {
         `Session ${id} (${session.tool}) has no prior conversation; spawning fresh instead of resuming`
       )
     }
-    createPty(id, session.worktreePath, {
+    session.sandboxed = createPty(id, session.worktreePath, {
       continueSession: canResume,
       tool: session.tool,
       agentSessionId: session.agentSessionId,
@@ -1644,7 +1648,7 @@ export async function attachLocalSession(id: string): Promise<void> {
           `Session ${id} (${session.tool}) has no prior conversation; spawning fresh instead of resuming`
         )
       }
-      createPty(id, session.worktreePath, {
+      session.sandboxed = createPty(id, session.worktreePath, {
         continueSession: canResume,
         tool: session.tool,
         agentSessionId: session.agentSessionId,
@@ -2237,7 +2241,7 @@ async function createRemoteIssueSession(
         notifyScriptPath,
         guardScriptPath
       )
-      await createRemotePty(id, worktreePath, host, {
+      const sandboxed = await createRemotePty(id, worktreePath, host, {
         tool: effectiveTool,
         agentPath,
         projectPath,
@@ -2261,6 +2265,7 @@ async function createRemoteIssueSession(
         lastActivity: Date.now(),
         hookEvents: [],
         tool: effectiveTool,
+        sandboxed,
         ...(remoteProject.repoFingerprint
           ? { repoFingerprint: remoteProject.repoFingerprint }
           : {}),
@@ -2359,7 +2364,7 @@ export async function relocateProject(
     if (hasPty(s.id)) {
       destroyPty(s.id)
       if (existsSync(s.worktreePath)) {
-        createPty(s.id, s.worktreePath, { tool: s.tool, projectPath: s.projectPath })
+        s.sandboxed = createPty(s.id, s.worktreePath, { tool: s.tool, projectPath: s.projectPath })
         s.status = 'idle'
       } else {
         s.status = 'dead'
