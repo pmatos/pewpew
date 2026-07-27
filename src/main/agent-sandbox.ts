@@ -43,6 +43,8 @@
 // --local` with "Device or resource busy", which fails husky-style `prepare`
 // scripts during `npm ci` — every session would die at install.
 
+import { normalize } from 'node:path'
+
 export interface SandboxOptions {
   enabled?: boolean
   extraWritablePaths?: string[]
@@ -92,11 +94,22 @@ export function buildSandboxArgs(
   // containing "/home/dev" when projectPath is "/home/dev/project") re-mounts
   // projectPath itself along with it. Drop any such overlap rather than
   // trusting the caller to avoid it.
-  const overlapsProject = (path: string): boolean =>
-    path === projectPath ||
-    path === '/' ||
-    path.startsWith(`${projectPath}/`) ||
-    projectPath.startsWith(`${path}/`)
+  //
+  // Both sides are normalized (lexically, via node:path — no fs access)
+  // before comparing: a non-canonical entry like "<project>/../project"
+  // collapses right back to <project> itself, which the raw string wouldn't
+  // match against a plain startsWith/=== check.
+  const normalizedProjectPath = normalize(projectPath)
+
+  const overlapsProject = (path: string): boolean => {
+    const normalizedPath = normalize(path)
+    return (
+      normalizedPath === normalizedProjectPath ||
+      normalizedPath === '/' ||
+      normalizedPath.startsWith(`${normalizedProjectPath}/`) ||
+      normalizedProjectPath.startsWith(`${normalizedPath}/`)
+    )
+  }
 
   const safeExtraWritablePaths = extraWritablePaths.filter((path) => !overlapsProject(path))
 

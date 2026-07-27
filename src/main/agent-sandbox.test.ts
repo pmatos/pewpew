@@ -112,6 +112,23 @@ describe('buildSandboxArgs', () => {
     expect(args).toContain('/opt/data')
   })
 
+  it('normalizes non-canonical extraWritablePaths before the overlap check', () => {
+    // "<project>/../project/secret" is a lexical dodge of a raw string
+    // startsWith/=== check, but normalizes right back to a path nested
+    // under PROJECT — going up one segment then back into the entry with
+    // PROJECT's exact basename always lands on PROJECT itself.
+    const args = buildSandboxArgs(PROJECT, WORKTREE, {
+      extraWritablePaths: [`${PROJECT}/../project/secret`, `${PROJECT}/../sibling`],
+    })
+    expect(args).not.toContain(`${PROJECT}/../project/secret`)
+    expect(args).not.toContain(`${PROJECT}/secret`)
+    // A path that normalizes to a genuine sibling (not nested under PROJECT)
+    // survives the filter and is bound as originally given — normalization
+    // is only used internally for the overlap comparison, not applied to
+    // the bind pair itself.
+    expect(args).toContain(`${PROJECT}/../sibling`)
+  })
+
   it('mounts a fresh /dev, /proc, and /tmp rather than passing through the host copies', () => {
     const args = buildSandboxArgs(PROJECT, WORKTREE)
     const rootIdx = args.indexOf('--ro-bind')
