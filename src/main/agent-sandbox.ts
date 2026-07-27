@@ -11,6 +11,15 @@
 // than the project tree alone: it's the actual containment boundary, not
 // just a documentation note about one.
 //
+// This is a WRITE/PERSISTENCE boundary only, not a confidentiality or
+// network one: the sandboxed process still has read access to the entire
+// host filesystem (other repos, SSH keys, cloud credentials, etc.), and
+// there's no --unshare-net/--unshare-pid/--unshare-user, so network egress
+// and process visibility are unrestricted. A compromised or prompt-injected
+// agent can still read and exfiltrate host secrets even though it can't
+// write outside its worktree — that's an explicitly accepted trade-off, not
+// an oversight.
+//
 // Verified against the real bwrap + claude CLI: a write to <project>, a
 // sibling worktree, or an arbitrary host path (e.g. $HOME) resolves EROFS
 // from both the Write tool and Bash, while worktree writes, `npm ci`,
