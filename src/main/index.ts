@@ -165,13 +165,15 @@ if (process.platform === 'linux') {
 const uiScale = getConfig().uiScale ?? 1.2
 app.commandLine.appendSwitch('force-device-scale-factor', uiScale.toString())
 
-function installNotifyScript(): void {
+function installBundledHookScripts(): void {
   const hooksDir = join(CONFIG_DIR, 'hooks')
   mkdirSync(hooksDir, { recursive: true })
-  const src = join(__dirname, '../../hooks/notify.sh')
-  const dest = join(hooksDir, 'notify.sh')
-  copyFileSync(src, dest)
-  chmodSync(dest, 0o755)
+  for (const name of ['notify.sh', 'worktree-guard.sh']) {
+    const src = join(__dirname, '../../hooks', name)
+    const dest = join(hooksDir, name)
+    copyFileSync(src, dest)
+    chmodSync(dest, 0o755)
+  }
 
   // omp's hook bridge — see OMP_HOOK_SCRIPT in hook-installer.ts. Just a file
   // copy: omp loads it directly via `--hook <path>`, no settings merge needed.
@@ -264,7 +266,7 @@ app.whenReady().then(async () => {
     }
   }
 
-  installNotifyScript()
+  installBundledHookScripts()
 
   ipcMain.handle('projects:scan', async () => {
     const config = getConfig()

@@ -12,11 +12,13 @@ import { promisify } from 'util'
 import { join } from 'path'
 import { homedir } from 'os'
 import { CONFIG_DIR } from './config'
+import { shellQuote } from './shell-quote'
 import type { ExecResult } from './host-connection'
 
 const execFileAsync = promisify(execFile)
 
 const NOTIFY_SCRIPT = join(CONFIG_DIR, 'hooks', 'notify.sh')
+const GUARD_SCRIPT = join(CONFIG_DIR, 'hooks', 'worktree-guard.sh')
 
 // omp (oh-my-pi) loads its hook bridge directly via the CLI's `--hook <path>`
 // flag rather than a declarative JSON hooks file, so there's no install/merge
@@ -26,14 +28,29 @@ const NOTIFY_SCRIPT = join(CONFIG_DIR, 'hooks', 'notify.sh')
 // notify.sh), from the repo's hooks/omp-notify.ts.
 export const OMP_HOOK_SCRIPT = join(CONFIG_DIR, 'hooks', 'omp-notify.ts')
 
-function buildHooks(notifyScript: string): Record<string, unknown[]> {
-  const hook = { type: 'command', command: notifyScript }
+// Claude Code's own sandbox only isolates Bash subprocesses; the built-in
+// Write/Edit/MultiEdit/NotebookEdit tools go through the permission system
+// instead, which --dangerously-skip-permissions (always passed by pewpew)
+// disables. This PreToolUse hook is the only thing left that stops an agent
+// from writing outside its session worktree through those tools — see
+// hooks/worktree-guard.sh. It does not cover Bash writes.
+function buildHooks(
+  notifyScript: string,
+  guardScript: string,
+  root: string
+): Record<string, unknown[]> {
+  const notifyHook = { type: 'command', command: notifyScript }
+  const guardHook = {
+    type: 'command',
+    command: `${shellQuote(guardScript)} ${shellQuote(root)}`,
+  }
   return {
-    SessionStart: [{ hooks: [hook] }],
-    Stop: [{ hooks: [hook] }],
-    PostToolUse: [{ matcher: 'Read|Write|Edit|Bash', hooks: [hook] }],
-    SessionEnd: [{ hooks: [hook] }],
-    Notification: [{ hooks: [hook] }],
+    SessionStart: [{ hooks: [notifyHook] }],
+    Stop: [{ hooks: [notifyHook] }],
+    PostToolUse: [{ matcher: 'Read|Write|Edit|Bash', hooks: [notifyHook] }],
+    SessionEnd: [{ hooks: [notifyHook] }],
+    Notification: [{ hooks: [notifyHook] }],
+    PreToolUse: [{ matcher: 'Write|Edit|MultiEdit|NotebookEdit', hooks: [guardHook] }],
   }
 }
 
@@ -46,8 +63,8 @@ function buildCodexHooks(notifyScript: string): Record<string, unknown[]> {
   }
 }
 
-function ccPewpewHookJson(notifyScript: string): string {
-  return JSON.stringify(buildHooks(notifyScript))
+function ccPewpewHookJson(notifyScript: string, guardScript: string, root: string): string {
+  return JSON.stringify(buildHooks(notifyScript, guardScript, root))
 }
 
 function ccPewpewCodexHookJson(notifyScript: string): string {
@@ -105,7 +122,7 @@ export async function installHooks(
   const raw = tryReadFile(settingsPath)
   const existing: Record<string, unknown> = raw === null ? {} : parseAsObject(raw)
 
-  const newHooks = buildHooks(NOTIFY_SCRIPT)
+  const newHooks = buildHooks(NOTIFY_SCRIPT, GUARD_SCRIPT, projectPath)
   const existingHooks = (existing.hooks || {}) as Record<string, unknown[]>
   const merged: Record<string, unknown[]> = { ...existingHooks }
 
@@ -125,9 +142,10 @@ export async function installHooks(
 export async function installRemoteHooks(
   execRemote: (argv: string[], opts?: { timeoutMs?: number }) => Promise<ExecResult>,
   worktreePath: string,
-  notifyScriptPath: string
+  notifyScriptPath: string,
+  guardScriptPath: string
 ): Promise<void> {
-  const hooksJson = ccPewpewHookJson(notifyScriptPath)
+  const hooksJson = ccPewpewHookJson(notifyScriptPath, guardScriptPath, worktreePath)
   const script =
     'set -e\n' +
     'claude_dir="$1/.claude"\n' +

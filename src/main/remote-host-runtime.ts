@@ -17,6 +17,7 @@ import type { Host, ToastEvent } from '../shared/types'
 
 export interface PreparedRemoteHost {
   notifyScriptPath: string
+  guardScriptPath: string
   ompHookScriptPath: string
   agentPaths: AgentResolution
 }
@@ -121,6 +122,7 @@ export function createRemoteHostRuntime(deps: RemoteHostRuntimeDeps): RemoteHost
       deps.setHostAgentPaths(host.hostId, bootstrap.agentPaths)
       return {
         notifyScriptPath: bootstrap.notifyScriptPath,
+        guardScriptPath: bootstrap.guardScriptPath,
         ompHookScriptPath: bootstrap.ompHookScriptPath,
         agentPaths: bootstrap.agentPaths,
       }

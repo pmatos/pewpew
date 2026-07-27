@@ -32,6 +32,110 @@ async function loadInstaller(): Promise<typeof import('./hook-installer')> {
   return import('./hook-installer')
 }
 
+describe('installHooks (Claude)', () => {
+  it('writes .claude/settings.local.json with a PreToolUse guard entry scoped to the project root', async () => {
+    const { installHooks } = await loadInstaller()
+    await installHooks(state.tmpProject, { skipGitignore: true })
+
+    const json = JSON.parse(
+      readFileSync(join(state.tmpProject, '.claude', 'settings.local.json'), 'utf-8')
+    ) as {
+      hooks: Record<string, Array<{ matcher?: string; hooks: Array<{ command: string }> }>>
+    }
+
+    expect(json.hooks.PostToolUse).toHaveLength(1)
+    expect(json.hooks.PreToolUse).toHaveLength(1)
+    expect(json.hooks.PreToolUse[0].matcher).toBe('Write|Edit|MultiEdit|NotebookEdit')
+    const guardCommand = json.hooks.PreToolUse[0].hooks[0].command
+    expect(guardCommand).toContain('worktree-guard.sh')
+    expect(guardCommand).toContain(state.tmpProject)
+  })
+
+  it('replaces a stale guard entry (different root) on re-install rather than duplicating it', async () => {
+    const { installHooks } = await loadInstaller()
+    await installHooks(state.tmpProject, { skipGitignore: true })
+    await installHooks(state.tmpProject, { skipGitignore: true })
+
+    const json = JSON.parse(
+      readFileSync(join(state.tmpProject, '.claude', 'settings.local.json'), 'utf-8')
+    ) as { hooks: Record<string, unknown[]> }
+
+    expect(json.hooks.PreToolUse).toHaveLength(1)
+    expect(json.hooks.SessionStart).toHaveLength(1)
+  })
+
+  it('preserves an existing non-pewpew PreToolUse hook when merging', async () => {
+    const claudeDir = join(state.tmpProject, '.claude')
+    mkdirSync(claudeDir, { recursive: true })
+    writeFileSync(
+      join(claudeDir, 'settings.local.json'),
+      JSON.stringify({
+        hooks: {
+          PreToolUse: [
+            {
+              matcher: 'Bash',
+              hooks: [{ type: 'command', command: '/usr/local/bin/other-guard.sh' }],
+            },
+          ],
+        },
+      })
+    )
+
+    const { installHooks } = await loadInstaller()
+    await installHooks(state.tmpProject, { skipGitignore: true })
+
+    const json = JSON.parse(
+      readFileSync(join(state.tmpProject, '.claude', 'settings.local.json'), 'utf-8')
+    ) as { hooks: Record<string, Array<{ hooks: Array<{ command: string }> }>> }
+
+    expect(json.hooks.PreToolUse).toHaveLength(2)
+    const commands = json.hooks.PreToolUse.map((g) => g.hooks[0].command)
+    expect(commands).toContain('/usr/local/bin/other-guard.sh')
+    expect(commands.some((c) => c.includes('worktree-guard.sh'))).toBe(true)
+  })
+})
+
+describe('installRemoteHooks', () => {
+  it('merges a PreToolUse guard entry scoped to the remote worktree path', async () => {
+    let hooksJsonArg = ''
+    const execRemote = vi.fn(async (argv: string[]) => {
+      hooksJsonArg = argv[argv.length - 1]
+      return { stdout: '', stderr: '', code: 0, timedOut: false }
+    })
+
+    const { installRemoteHooks } = await loadInstaller()
+    await installRemoteHooks(
+      execRemote,
+      '/home/dev/project/.claude/worktrees/wt1',
+      '/home/dev/.config/pewpew/hooks/notify-v1.sh',
+      '/home/dev/.config/pewpew/hooks/worktree-guard-v1.sh'
+    )
+
+    const hooks = JSON.parse(hooksJsonArg) as {
+      PreToolUse: Array<{ matcher?: string; hooks: Array<{ command: string }> }>
+    }
+    expect(hooks.PreToolUse).toHaveLength(1)
+    expect(hooks.PreToolUse[0].matcher).toBe('Write|Edit|MultiEdit|NotebookEdit')
+    const command = hooks.PreToolUse[0].hooks[0].command
+    expect(command).toContain('/home/dev/.config/pewpew/hooks/worktree-guard-v1.sh')
+    expect(command).toContain('/home/dev/project/.claude/worktrees/wt1')
+  })
+
+  it('throws when the remote merge command fails', async () => {
+    const execRemote = vi.fn(async () => ({
+      stdout: '',
+      stderr: 'jq: command not found',
+      code: 127,
+      timedOut: false,
+    }))
+
+    const { installRemoteHooks } = await loadInstaller()
+    await expect(installRemoteHooks(execRemote, '/wt', '/notify.sh', '/guard.sh')).rejects.toThrow(
+      'jq: command not found'
+    )
+  })
+})
+
 describe('installCodexHooks', () => {
   it('writes .codex/hooks.json with codex event shape', async () => {
     const { installCodexHooks } = await loadInstaller()

@@ -583,7 +583,8 @@ async function installRemoteAgentHooks(
   tool: AgentTool,
   host: Host,
   worktreePath: string,
-  notifyScriptPath: string
+  notifyScriptPath: string,
+  guardScriptPath: string
 ): Promise<void> {
   const remote = (argv: string[], opts?: { timeoutMs?: number }) => execRemote(host, argv, opts)
   if (tool === 'codex') {
@@ -603,7 +604,7 @@ async function installRemoteAgentHooks(
     // no settings/hooks JSON to merge into the remote worktree here.
     return
   }
-  await installRemoteHooks(remote, worktreePath, notifyScriptPath)
+  await installRemoteHooks(remote, worktreePath, notifyScriptPath, guardScriptPath)
 }
 
 // In-flight adoptions for remote worktrees, keyed by `${hostId} ${worktreePath}`.
@@ -664,7 +665,7 @@ async function adoptRemoteWorktree(
 
   const branch = await remoteHostRuntime.withPreparedHost(
     host,
-    async ({ notifyScriptPath, ompHookScriptPath, agentPaths }) => {
+    async ({ notifyScriptPath, guardScriptPath, ompHookScriptPath, agentPaths }) => {
       const agentPath = agentPaths[tool]
       if (!agentPath) {
         throw new Error(`${tool} is not installed on host ${host.label || host.alias}`)
@@ -690,7 +691,7 @@ async function adoptRemoteWorktree(
           )
         ).trim() || 'HEAD'
 
-      await installRemoteAgentHooks(tool, host, worktreePath, notifyScriptPath)
+      await installRemoteAgentHooks(tool, host, worktreePath, notifyScriptPath, guardScriptPath)
       await createRemotePty(id, worktreePath, host, {
         tool,
         agentPath,
@@ -749,7 +750,7 @@ async function createRemoteSession(
 
   const branch = await remoteHostRuntime.withPreparedHost(
     host,
-    async ({ notifyScriptPath, ompHookScriptPath, agentPaths }) => {
+    async ({ notifyScriptPath, guardScriptPath, ompHookScriptPath, agentPaths }) => {
       const agentPath = agentPaths[effectiveTool]
       if (!agentPath) {
         throw new Error(`${effectiveTool} is not installed on host ${host.label || host.alias}`)
@@ -817,7 +818,13 @@ async function createRemoteSession(
           )
         ).trim() || branchName
 
-      await installRemoteAgentHooks(effectiveTool, host, worktreePath, notifyScriptPath)
+      await installRemoteAgentHooks(
+        effectiveTool,
+        host,
+        worktreePath,
+        notifyScriptPath,
+        guardScriptPath
+      )
       await createRemotePty(id, worktreePath, host, {
         tool: effectiveTool,
         agentPath,
@@ -875,7 +882,7 @@ async function createRemotePrSession(
 
   return remoteHostRuntime.withPreparedHost(
     host,
-    async ({ notifyScriptPath, ompHookScriptPath, agentPaths }) => {
+    async ({ notifyScriptPath, guardScriptPath, ompHookScriptPath, agentPaths }) => {
       const ghProbe = await probeRemoteGh(host)
       if (!ghProbe.ok) {
         return ghProbe.error
@@ -981,7 +988,13 @@ async function createRemotePrSession(
           )
         ).trim() || branch
 
-      await installRemoteAgentHooks(effectiveTool, host, worktreePath, notifyScriptPath)
+      await installRemoteAgentHooks(
+        effectiveTool,
+        host,
+        worktreePath,
+        notifyScriptPath,
+        guardScriptPath
+      )
       await createRemotePty(id, worktreePath, host, {
         tool: effectiveTool,
         agentPath,
@@ -2113,7 +2126,7 @@ async function createRemoteIssueSession(
 
   return remoteHostRuntime.withPreparedHost(
     host,
-    async ({ notifyScriptPath, ompHookScriptPath, agentPaths }) => {
+    async ({ notifyScriptPath, guardScriptPath, ompHookScriptPath, agentPaths }) => {
       const effectiveTool: AgentTool = options.tool ?? getConfig().defaultTool
       const agentPath = agentPaths[effectiveTool]
       if (!agentPath) {
@@ -2180,7 +2193,13 @@ async function createRemoteIssueSession(
           )
         ).trim() || branch
 
-      await installRemoteAgentHooks(effectiveTool, host, worktreePath, notifyScriptPath)
+      await installRemoteAgentHooks(
+        effectiveTool,
+        host,
+        worktreePath,
+        notifyScriptPath,
+        guardScriptPath
+      )
       await createRemotePty(id, worktreePath, host, {
         tool: effectiveTool,
         agentPath,
@@ -2285,6 +2304,17 @@ export async function relocateProject(
     s.projectName = remap.projectName
     s.worktreePath = remap.worktreePath
     if (fingerprint) s.repoFingerprint = fingerprint
+
+    // worktree-guard.sh bakes the root in as an argv literal at install
+    // time; relocating the project changes that path out from under it, so
+    // the guard's own `cd "$root"` starts failing and denies every write in
+    // the relocated worktree. Reinstall the hook with the fresh worktreePath
+    // BEFORE recreating the PTY below — Claude reads its hook config at
+    // process start, so if the PTY launched first it would run its entire
+    // lifetime against the stale, now-failing guard command.
+    if (s.tool === 'claude' && existsSync(s.worktreePath)) {
+      await installHooks(s.worktreePath, { skipGitignore: true })
+    }
 
     // Recreate PTY so tmux gets the new worktree cwd
     if (hasPty(s.id)) {
