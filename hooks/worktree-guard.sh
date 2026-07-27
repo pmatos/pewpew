@@ -5,7 +5,10 @@
 # tools go through the permission system instead, which --dangerously-skip-permissions
 # (pewpew always passes) disables entirely. This hook is the only thing left
 # that stops an agent from writing outside its session worktree via those
-# tools. It does not see Bash writes — that containment is a separate layer.
+# tools, for Claude Code sessions only — Codex and omp sessions have their own
+# separate hook mechanisms and are not wired to this guard (see
+# hook-installer.ts). It does not see Bash writes — that containment is a
+# separate layer.
 #
 # Usage: worktree-guard.sh <worktree-root>
 # The root is baked in at hook-install time as an argv arg, never read from
