@@ -13,6 +13,7 @@ import {
 import { classifySshExit } from './ssh-exit-parser'
 import { captureRemotePaneTexts, type RemoteSessionEntry } from './remote-thumbnail'
 import { sanitizeChildEnv } from './appimage-env'
+import { buildSandboxArgs } from './agent-sandbox'
 import type { AgentTool, Host } from '../shared/types'
 
 interface SpawnOptions {
@@ -25,6 +26,14 @@ interface SpawnOptions {
   // pass it through here so tmux can exec it directly. Omitted for local
   // sessions where the GUI process inherits a usable PATH.
   agentPath?: string
+  // Project root — the read-only boundary the bwrap sandbox draws around the
+  // worktree (see agent-sandbox.ts). Omitted skips sandboxing entirely.
+  projectPath?: string
+  // Remote-only: whether bwrap was confirmed present on the target host by
+  // the remote bootstrap probe. Local sessions self-check via
+  // isSandboxAvailable() instead, since there's no equivalent signal for a
+  // remote host to check here.
+  sandboxAvailable?: boolean
 }
 
 export function buildAgentArgs(options?: SpawnOptions): string[] {
@@ -111,6 +120,18 @@ export function isTmuxAvailable(): boolean {
   }
 }
 
+export function isSandboxAvailable(): boolean {
+  try {
+    execFileSync('which', ['bwrap'], {
+      stdio: 'pipe',
+      env: sanitizeChildEnv() as NodeJS.ProcessEnv,
+    })
+    return true
+  } catch {
+    return false
+  }
+}
+
 export function initPtyManager(): void {
   // Flushing is self-arming (see scheduleFlush); nothing to start here.
 }
@@ -136,7 +157,10 @@ export function createPty(sessionId: string, cwd: string, options?: SpawnOptions
   }
 
   const tmuxSession = `pewpew-${sessionId}`
-  const agentArgs = buildAgentArgs(options)
+  const sandboxPrefix = options?.projectPath
+    ? buildSandboxArgs(options.projectPath, cwd, { enabled: isSandboxAvailable() })
+    : []
+  const agentArgs = [...sandboxPrefix, ...buildAgentArgs(options)]
 
   // Create a detached tmux session that directly runs the agent CLI.
   // Using tmux's shell command avoids issues with interactive shell init (omz, etc.)
@@ -185,7 +209,10 @@ export async function createRemotePty(
   options?: SpawnOptions
 ): Promise<void> {
   const tmuxSession = `pewpew-${sessionId}`
-  const agentArgs = buildAgentArgs(options)
+  const sandboxPrefix = options?.projectPath
+    ? buildSandboxArgs(options.projectPath, cwd, { enabled: options?.sandboxAvailable === true })
+    : []
+  const agentArgs = [...sandboxPrefix, ...buildAgentArgs(options)]
 
   const create = await execRemote(host, [
     'tmux',

@@ -459,7 +459,7 @@ async function adoptWorktree(
   const branch = resolveBranchFromWorktree(worktreePath, worktreeName, projectName)
 
   await installAgentHooks(tool, worktreePath)
-  createPty(id, worktreePath, { tool })
+  createPty(id, worktreePath, { tool, projectPath })
 
   const session: Session = {
     id,
@@ -680,7 +680,7 @@ async function adoptRemoteWorktree(
         ).trim() || 'HEAD'
 
       await installRemoteAgentHooks(tool, host, worktreePath, notifyScriptPath, guardScriptPath)
-      await createRemotePty(id, worktreePath, host, { tool, agentPath })
+      await createRemotePty(id, worktreePath, host, { tool, agentPath, projectPath })
       return resolvedBranch
     }
   )
@@ -809,7 +809,7 @@ async function createRemoteSession(
         notifyScriptPath,
         guardScriptPath
       )
-      await createRemotePty(id, worktreePath, host, { tool: effectiveTool, agentPath })
+      await createRemotePty(id, worktreePath, host, { tool: effectiveTool, agentPath, projectPath })
       return resolvedBranch
     }
   )
@@ -975,7 +975,7 @@ async function createRemotePrSession(
         notifyScriptPath,
         guardScriptPath
       )
-      await createRemotePty(id, worktreePath, host, { tool: effectiveTool, agentPath })
+      await createRemotePty(id, worktreePath, host, { tool: effectiveTool, agentPath, projectPath })
 
       const session: Session = {
         id,
@@ -1502,6 +1502,7 @@ export async function reviveSession(id: string): Promise<void> {
             tool: session.tool,
             agentSessionId: session.agentSessionId,
             agentPath,
+            projectPath: session.projectPath,
           })
         }
       })
@@ -1533,6 +1534,7 @@ export async function reviveSession(id: string): Promise<void> {
       continueSession: canResume,
       tool: session.tool,
       agentSessionId: session.agentSessionId,
+      projectPath: session.projectPath,
     })
   }
   updateSession(id, 'idle')
@@ -1589,6 +1591,7 @@ export async function attachLocalSession(id: string): Promise<void> {
         continueSession: canResume,
         tool: session.tool,
         agentSessionId: session.agentSessionId,
+        projectPath: session.projectPath,
       })
     }
     session.connectionState = undefined
@@ -2148,7 +2151,7 @@ async function createRemoteIssueSession(
         notifyScriptPath,
         guardScriptPath
       )
-      await createRemotePty(id, worktreePath, host, { tool: effectiveTool, agentPath })
+      await createRemotePty(id, worktreePath, host, { tool: effectiveTool, agentPath, projectPath })
 
       const session: Session = {
         id,
@@ -2253,7 +2256,7 @@ export async function relocateProject(
     if (hasPty(s.id)) {
       destroyPty(s.id)
       if (existsSync(s.worktreePath)) {
-        createPty(s.id, s.worktreePath, { tool: s.tool })
+        createPty(s.id, s.worktreePath, { tool: s.tool, projectPath: s.projectPath })
         s.status = 'idle'
       } else {
         s.status = 'dead'
