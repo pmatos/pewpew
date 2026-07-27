@@ -232,6 +232,20 @@ describe('setHostAgentPaths', () => {
     })
   })
 
+  it('persists an omp path alongside claude and codex', () => {
+    const h = addHost({ alias: 'dev', label: 'x' })
+    setHostAgentPaths(h.hostId, {
+      claude: '/u/bin/claude',
+      codex: '/u/bin/codex',
+      omp: '/u/bin/omp',
+    })
+    expect(getHost(h.hostId)?.agentPaths).toEqual({
+      claude: '/u/bin/claude',
+      codex: '/u/bin/codex',
+      omp: '/u/bin/omp',
+    })
+  })
+
   it('drops a previously cached tool when the resolver no longer finds it', () => {
     const h = addHost({ alias: 'dev', label: 'x' })
     setHostAgentPaths(h.hostId, { claude: '/u/bin/claude', codex: '/u/bin/codex' })

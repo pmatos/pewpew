@@ -1,9 +1,9 @@
 import { execFile, execFileSync } from 'child_process'
 import { promisify } from 'util'
 import { readFileSync, writeFileSync, existsSync, realpathSync } from 'fs'
-import { join, basename, sep } from 'path'
+import { join, basename, sep, relative, isAbsolute } from 'path'
 import { posix } from 'path'
-import { homedir } from 'os'
+import { homedir, tmpdir } from 'os'
 import { randomUUID } from 'crypto'
 import { dialog, shell } from 'electron'
 import { broadcastToAll, getMainWindow } from './window-registry'
@@ -68,6 +68,7 @@ import { createPrLookup, parseOwnerFromRemoteUrl } from './github'
 import { parseIssueNumber, worktreeBranchName } from './branch-naming'
 import { resolveOriginDefaultBase, type GitRunner } from './origin-base'
 import { branchRefExists } from './branch-ref'
+import { classifyAutoReconnectResult } from './reconnect-outcome'
 import { deriveSessionFields } from './session-fields'
 import {
   numbersInUse,
@@ -436,6 +437,11 @@ async function installAgentHooks(tool: AgentTool, worktreePath: string): Promise
     }
     return
   }
+  if (tool === 'omp') {
+    // omp's hook bridge is passed via `--hook <path>` in buildAgentArgs, not
+    // written into the project — nothing to install here.
+    return
+  }
   await installHooks(worktreePath, { skipGitignore: true })
 }
 
@@ -592,6 +598,12 @@ async function installRemoteAgentHooks(
     await commitRemoteCodexHooks(remote, snapshot)
     return
   }
+  if (tool === 'omp') {
+    // omp's hook bridge is installed as a plain file by bootstrapHost (see
+    // ompHookScriptPath) and passed via `--hook <path>` in buildAgentArgs —
+    // no settings/hooks JSON to merge into the remote worktree here.
+    return
+  }
   await installRemoteHooks(remote, worktreePath, notifyScriptPath, guardScriptPath)
 }
 
@@ -653,7 +665,7 @@ async function adoptRemoteWorktree(
 
   const branch = await remoteHostRuntime.withPreparedHost(
     host,
-    async ({ notifyScriptPath, guardScriptPath, agentPaths }) => {
+    async ({ notifyScriptPath, guardScriptPath, ompHookScriptPath, agentPaths }) => {
       const agentPath = agentPaths[tool]
       if (!agentPath) {
         throw new Error(`${tool} is not installed on host ${host.label || host.alias}`)
@@ -680,7 +692,12 @@ async function adoptRemoteWorktree(
         ).trim() || 'HEAD'
 
       await installRemoteAgentHooks(tool, host, worktreePath, notifyScriptPath, guardScriptPath)
-      await createRemotePty(id, worktreePath, host, { tool, agentPath, projectPath })
+      await createRemotePty(id, worktreePath, host, {
+        tool,
+        agentPath,
+        projectPath,
+        notifyHookPath: ompHookScriptPath,
+      })
       return resolvedBranch
     }
   )
@@ -734,7 +751,7 @@ async function createRemoteSession(
 
   const branch = await remoteHostRuntime.withPreparedHost(
     host,
-    async ({ notifyScriptPath, guardScriptPath, agentPaths }) => {
+    async ({ notifyScriptPath, guardScriptPath, ompHookScriptPath, agentPaths }) => {
       const agentPath = agentPaths[effectiveTool]
       if (!agentPath) {
         throw new Error(`${effectiveTool} is not installed on host ${host.label || host.alias}`)
@@ -809,7 +826,12 @@ async function createRemoteSession(
         notifyScriptPath,
         guardScriptPath
       )
-      await createRemotePty(id, worktreePath, host, { tool: effectiveTool, agentPath, projectPath })
+      await createRemotePty(id, worktreePath, host, {
+        tool: effectiveTool,
+        agentPath,
+        projectPath,
+        notifyHookPath: ompHookScriptPath,
+      })
       return resolvedBranch
     }
   )
@@ -862,7 +884,7 @@ async function createRemotePrSession(
 
   return remoteHostRuntime.withPreparedHost(
     host,
-    async ({ notifyScriptPath, guardScriptPath, agentPaths }) => {
+    async ({ notifyScriptPath, guardScriptPath, ompHookScriptPath, agentPaths }) => {
       const ghProbe = await probeRemoteGh(host)
       if (!ghProbe.ok) {
         return ghProbe.error
@@ -975,7 +997,12 @@ async function createRemotePrSession(
         notifyScriptPath,
         guardScriptPath
       )
-      await createRemotePty(id, worktreePath, host, { tool: effectiveTool, agentPath, projectPath })
+      await createRemotePty(id, worktreePath, host, {
+        tool: effectiveTool,
+        agentPath,
+        projectPath,
+        notifyHookPath: ompHookScriptPath,
+      })
 
       const session: Session = {
         id,
@@ -1308,40 +1335,40 @@ export async function attemptAutoReconnect(id: string): Promise<AttemptOutcome> 
   const after = sessions.get(id)?.session
   if (!after) return 'gave-up'
 
-  // The session resolved to terminal (a concurrent session.end → promptCleanup →
-  // Keep) while our probe was in flight; doReconnectRemoteSession left it intact.
-  // Don't toast "Reconnected" or re-drive cleanup for a session that already ended.
-  if (after.status === 'completed' || after.status === 'error') return 'gave-up'
-
-  if (after.connectionState === 'live') {
-    emitToast({ severity: 'info', title: `Reconnected to ${label}` })
-    return 'recovered'
+  const { outcome, effect } = classifyAutoReconnectResult({
+    status: after.status,
+    connectionState: after.connectionState,
+  })
+  switch (effect) {
+    case 'toast-reconnected':
+      emitToast({ severity: 'info', title: `Reconnected to ${label}` })
+      break
+    case 'prompt-cleanup':
+      // Remote tmux confirmed gone: the agent ended. The session.end hook that
+      // drives promptCleanup for a live session is unreliable over a remote link
+      // (it races the ControlMaster/reverse-forward teardown as the PTY drops, so
+      // the message is often lost before it arrives), leaving remote sessions
+      // without the "Clean up worktree?" dialog local sessions get on exit. This
+      // probe result is the dependable "session ended" signal, so prompt the same
+      // cleanup here — otherwise the card is silently left dead and the user
+      // removes it by hand, deleting the worktree with no confirmation. Fire and
+      // forget (the dialog awaits user input); promptCleanup's own in-progress
+      // guard makes a late-arriving session.end hook a no-op.
+      void promptCleanup(id).catch((err) => {
+        console.error(`promptCleanup(${id}) failed:`, err)
+        // If the dialog itself failed (no window available, Electron dialog IPC
+        // error), still surface the "session ended" signal the old synchronous
+        // toast guaranteed — a dialog failure must not silently swallow it.
+        emitToast({ severity: 'error', title: `${label}: remote session ended` })
+      })
+      break
+    case 'toast-auth-failed':
+      emitToast({ severity: 'error', title: `SSH authentication failed on ${label}` })
+      break
+    case 'none':
+      break
   }
-  if (after.status === 'dead') {
-    // Remote tmux confirmed gone: the agent ended. The session.end hook that
-    // drives promptCleanup for a live session is unreliable over a remote link
-    // (it races the ControlMaster/reverse-forward teardown as the PTY drops, so
-    // the message is often lost before it arrives), leaving remote sessions
-    // without the "Clean up worktree?" dialog local sessions get on exit. This
-    // probe result is the dependable "session ended" signal, so prompt the same
-    // cleanup here — otherwise the card is silently left dead and the user
-    // removes it by hand, deleting the worktree with no confirmation. Fire and
-    // forget (the dialog awaits user input); promptCleanup's own in-progress
-    // guard makes a late-arriving session.end hook a no-op.
-    void promptCleanup(id).catch((err) => {
-      console.error(`promptCleanup(${id}) failed:`, err)
-      // If the dialog itself failed (no window available, Electron dialog IPC
-      // error), still surface the "session ended" signal the old synchronous
-      // toast guaranteed — a dialog failure must not silently swallow it.
-      emitToast({ severity: 'error', title: `${label}: remote session ended` })
-    })
-    return 'gave-up'
-  }
-  if (after.connectionState === 'auth-failed') {
-    emitToast({ severity: 'error', title: `SSH authentication failed on ${label}` })
-    return 'gave-up'
-  }
-  return 'retry'
+  return outcome
 }
 
 const reconnectScheduler = createReconnectScheduler({
@@ -1483,7 +1510,7 @@ export async function reviveSession(id: string): Promise<void> {
     session.connectionState = 'connecting'
     onSessionsChanged()
     try {
-      await remoteHostRuntime.withPreparedHost(host, async ({ agentPaths }) => {
+      await remoteHostRuntime.withPreparedHost(host, async ({ agentPaths, ompHookScriptPath }) => {
         if (await hasRemoteTmuxSession(id, host)) {
           await reattachRemotePty(id, host)
         } else {
@@ -1503,6 +1530,7 @@ export async function reviveSession(id: string): Promise<void> {
             agentSessionId: session.agentSessionId,
             agentPath,
             projectPath: session.projectPath,
+            notifyHookPath: ompHookScriptPath,
           })
         }
       })
@@ -1543,9 +1571,12 @@ export async function reviveSession(id: string): Promise<void> {
 // Decides whether resuming an agent will work. For claude, --continue exits
 // non-zero when there's no per-worktree project directory in ~/.claude/projects,
 // killing the tmux pane on spawn. For codex, `codex resume <id>` requires the
-// captured agentSessionId from the SessionStart hook.
+// captured agentSessionId from the SessionStart hook. omp's `--continue` is
+// cwd-scoped like claude's (no session id capture needed), so it gets the same
+// filesystem-history gate, just against omp's own session directory.
 function canResumeAgent(session: Session): boolean {
   if (session.tool === 'codex') return !!session.agentSessionId
+  if (session.tool === 'omp') return hasOmpConversationHistory(session.worktreePath)
   return hasClaudeConversationHistory(session.worktreePath)
 }
 
@@ -1557,6 +1588,7 @@ function canResumeAgent(session: Session): boolean {
 // nothing to resume, matching the local guard.
 async function canResumeRemoteAgent(session: Session, host: Host): Promise<boolean> {
   if (session.tool === 'codex') return !!session.agentSessionId
+  if (session.tool === 'omp') return hasRemoteOmpConversationHistory(host, session.worktreePath)
   return hasRemoteClaudeConversationHistory(host, session.worktreePath)
 }
 
@@ -1652,15 +1684,38 @@ export async function removeWorktree(id: string): Promise<void> {
 export async function removeSession(id: string): Promise<void> {
   const entry = sessions.get(id)
   reconnectScheduler.cancel(id)
-  if (entry?.session.hostId) {
-    const host = getRequiredHost(entry.session.hostId)
-    await destroyRemotePty(id, host)
-  } else {
-    destroyPty(id)
+  // Suppress a racing session.end → promptCleanup dialog: destroyPty/
+  // destroyRemotePty below deliver a real kill signal to the agent process
+  // (unlike killSession's detach-only local path), and some tools' hooks
+  // complete fast enough over that signal to land while removeWorktree's git
+  // subprocess is still running — before this session is even out of the
+  // `sessions` map. Without this guard that races the explicit, dialog-free
+  // delete here against a "clean up worktree?" prompt for a worktree that's
+  // already being (or already was) force-removed. Released below on both paths:
+  // on failure: getRequiredHost throws synchronously for a removed host
+  // config, and destroyRemotePty throws on SSH failures — both reachable
+  // since this is called directly from the sessions:remove(-batch) IPC
+  // handlers, not just via promptCleanup, so the failure path must not leave
+  // the surviving session permanently wedged out of future cleanup-dialog
+  // prompts. The success path also releases it (rather than leaving it "safe
+  // to leak forever since the id can't be revived") so this process-lifetime
+  // Set doesn't grow by one entry for every session ever removed.
+  cleanupInProgress.add(id)
+  try {
+    if (entry?.session.hostId) {
+      const host = getRequiredHost(entry.session.hostId)
+      await destroyRemotePty(id, host)
+    } else {
+      destroyPty(id)
+    }
+    await removeWorktree(id)
+    sessions.delete(id)
+    cleanupInProgress.delete(id)
+    onSessionsChanged()
+  } catch (err) {
+    cleanupInProgress.delete(id)
+    throw err
   }
-  await removeWorktree(id)
-  sessions.delete(id)
-  onSessionsChanged()
 }
 
 // Local-only forget: detach the PTY wrapper for every session bound to the
@@ -2077,7 +2132,7 @@ async function createRemoteIssueSession(
 
   return remoteHostRuntime.withPreparedHost(
     host,
-    async ({ notifyScriptPath, guardScriptPath, agentPaths }) => {
+    async ({ notifyScriptPath, guardScriptPath, ompHookScriptPath, agentPaths }) => {
       const effectiveTool: AgentTool = options.tool ?? getConfig().defaultTool
       const agentPath = agentPaths[effectiveTool]
       if (!agentPath) {
@@ -2151,7 +2206,12 @@ async function createRemoteIssueSession(
         notifyScriptPath,
         guardScriptPath
       )
-      await createRemotePty(id, worktreePath, host, { tool: effectiveTool, agentPath, projectPath })
+      await createRemotePty(id, worktreePath, host, {
+        tool: effectiveTool,
+        agentPath,
+        projectPath,
+        notifyHookPath: ompHookScriptPath,
+      })
 
       const session: Session = {
         id,
@@ -2252,6 +2312,17 @@ export async function relocateProject(
     s.worktreePath = remap.worktreePath
     if (fingerprint) s.repoFingerprint = fingerprint
 
+    // worktree-guard.sh bakes the root in as an argv literal at install
+    // time; relocating the project changes that path out from under it, so
+    // the guard's own `cd "$root"` starts failing and denies every write in
+    // the relocated worktree. Reinstall the hook with the fresh worktreePath
+    // BEFORE recreating the PTY below — Claude reads its hook config at
+    // process start, so if the PTY launched first it would run its entire
+    // lifetime against the stale, now-failing guard command.
+    if (s.tool === 'claude' && existsSync(s.worktreePath)) {
+      await installHooks(s.worktreePath, { skipGitignore: true })
+    }
+
     // Recreate PTY so tmux gets the new worktree cwd
     if (hasPty(s.id)) {
       destroyPty(s.id)
@@ -2324,6 +2395,89 @@ async function hasRemoteClaudeConversationHistory(
     'p=$(CDPATH= cd -P -- "$1" 2>/dev/null && pwd -P); [ -n "$p" ] || p="$1"; ' +
     "enc=$(printf '%s' \"$p\" | sed 's/[^a-zA-Z0-9-]/-/g'); " +
     '[ -d "$HOME/.claude/projects/$enc" ]'
+  try {
+    const result = await execRemote(host, ['sh', '-c', script, '_', worktreePath], {
+      timeoutMs: 10000,
+    })
+    return !result.timedOut && result.code === 0
+  } catch {
+    return false
+  }
+}
+
+// omp (oh-my-pi) stores per-cwd session history under
+// `~/.omp/agent/sessions/<encoded>/`, where <encoded> is NOT a simple
+// full-path substitution like Claude's. Ported from omp's own encoder
+// (packages/coding-agent/src/session/session-paths.ts,
+// getDefaultSessionDirName/encodeRelativeSessionDirName): canonicalize both
+// cwd and $HOME, take cwd relative to home, and if that relative path doesn't
+// escape upward (i.e. cwd is under home), prefix it with '-' and replace path
+// separators with '-' (cwd === home itself encodes to just '-'). A cwd outside
+// home falls back to a tmp-root-relative or legacy `--<path>--` encoding;
+// pewpew worktrees can in principle live outside $HOME, so both are ported
+// too rather than assumed away.
+// Exported so session-manager.test.ts can assert parity against the POSIX
+// shell port below (OMP_ENCODE_SHELL_SCRIPT) by running both against the
+// same table of paths.
+export function encodeOmpSessionDirName(cwd: string): string {
+  const resolvedCwd = canonicalPath(cwd)
+  const home = canonicalPath(homedir())
+  const tempRoot = canonicalPath(tmpdir())
+  const homeRelative = relative(home, resolvedCwd)
+  if (homeRelative === '' || (!homeRelative.startsWith('..') && !isAbsolute(homeRelative))) {
+    return encodeOmpRelativeSessionDirName('-', homeRelative)
+  }
+  const tempRelative = relative(tempRoot, resolvedCwd)
+  if (tempRelative === '' || (!tempRelative.startsWith('..') && !isAbsolute(tempRelative))) {
+    return encodeOmpRelativeSessionDirName('-tmp', tempRelative)
+  }
+  return `--${resolvedCwd.replace(/^[/\\]/, '').replace(/[/\\:]/g, '-')}--`
+}
+
+function encodeOmpRelativeSessionDirName(prefix: string, relativePath: string): string {
+  const encoded = relativePath.replace(/[/\\:]/g, '-')
+  if (!encoded) return prefix
+  return prefix.endsWith('-') ? `${prefix}${encoded}` : `${prefix}-${encoded}`
+}
+
+function hasOmpConversationHistory(worktreePath: string): boolean {
+  const encoded = encodeOmpSessionDirName(worktreePath)
+  return existsSync(join(homedir(), '.omp', 'agent', 'sessions', encoded))
+}
+
+// Remote analogue of hasOmpConversationHistory, mirroring the same
+// home-relative / tmp-relative / legacy-absolute encoding in POSIX shell.
+// Canonicalizes cwd, $HOME, and the temp root with `cd -P`/`pwd -P` (portable,
+// unlike GNU-only `readlink -f`), then pattern-matches which root the cwd
+// falls under via `case`. The temp root resolves TMPDIR, then TMP, then TEMP,
+// then /tmp — matching Node's own os.tmpdir() fallback order (which the local
+// encodeOmpSessionDirName delegates to via tmpdir()), so a remote host that
+// sets only TMP or TEMP still encodes a temp-rooted worktree the same way
+// omp itself would. Any SSH/probe failure returns false, so revival falls
+// back to a fresh spawn rather than risk `omp --continue` exiting
+// immediately on a directory that doesn't exist yet.
+// The encoding half of hasRemoteOmpConversationHistory's script, split out so
+// session-manager.test.ts can run it through a real shell (echoing $enc
+// instead of testing a directory) and assert parity with
+// encodeOmpSessionDirName across a table of representative paths — the
+// production function below just appends its own `[ -d ... ]` check.
+export const OMP_ENCODE_SHELL_SCRIPT =
+  'canon() { CDPATH= cd -P -- "$1" 2>/dev/null && pwd -P; }; ' +
+  'p=$(canon "$1"); [ -n "$p" ] || p="$1"; ' +
+  'h=$(canon "$HOME"); [ -n "$h" ] || h="$HOME"; ' +
+  'case "$p" in ' +
+  '"$h") enc="-" ;; ' +
+  '"$h"/*) rel=${p#"$h"/}; enc="-$(printf \'%s\' "$rel" | sed \'s/[\\/\\\\:]/-/g\')" ;; ' +
+  '*) t=$(canon "${TMPDIR:-${TMP:-${TEMP:-/tmp}}}"); [ -n "$t" ] || t="${TMPDIR:-${TMP:-${TEMP:-/tmp}}}"; ' +
+  'case "$p" in ' +
+  '"$t") enc="-tmp" ;; ' +
+  '"$t"/*) rel=${p#"$t"/}; enc="-tmp-$(printf \'%s\' "$rel" | sed \'s/[\\/\\\\:]/-/g\')" ;; ' +
+  '*) enc="--$(printf \'%s\' "$p" | sed \'s/^[\\/\\\\]//; s/[\\/\\\\:]/-/g\')--" ;; ' +
+  'esac ;; ' +
+  'esac'
+
+async function hasRemoteOmpConversationHistory(host: Host, worktreePath: string): Promise<boolean> {
+  const script = `${OMP_ENCODE_SHELL_SCRIPT}; [ -d "$h/.omp/agent/sessions/$enc" ]`
   try {
     const result = await execRemote(host, ['sh', '-c', script, '_', worktreePath], {
       timeoutMs: 10000,

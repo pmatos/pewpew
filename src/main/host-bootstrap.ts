@@ -3,13 +3,13 @@ import type { ExecResult } from './host-connection'
 import type { AgentTool } from '../shared/types'
 
 export const NOTIFY_SCRIPT_VERSION = 1
-export const WORKTREE_GUARD_SCRIPT_VERSION = 1
+export const WORKTREE_GUARD_SCRIPT_VERSION = 5
 
 // Tools pewpew strictly requires on a remote host for sessions and the notify
 // hook to work. Exported so the connection-test flow can surface missing ones
 // up front instead of letting a session/mirror fail deep in bootstrap.
 export const STRICT_DEPS = ['tmux', 'git', 'jq', 'socat'] as const
-export const AGENT_TOOLS: readonly AgentTool[] = ['claude', 'codex'] as const
+export const AGENT_TOOLS: readonly AgentTool[] = ['claude', 'codex', 'omp'] as const
 
 const notifyScript = `#!/usr/bin/env bash
 # pewpew notify script v${NOTIFY_SCRIPT_VERSION}
@@ -50,54 +50,166 @@ PEWPEW_WORKTREE_GUARD_VERSION=${WORKTREE_GUARD_SCRIPT_VERSION}
 root="$1"
 [ -z "$root" ] && exit 0
 
-# Canonicalize the root itself (resolves any symlinks in the worktree path).
-root_real=$(cd "$root" 2>/dev/null && pwd -P) || exit 0
-
 payload=$(cat)
+
+if ! command -v jq >/dev/null 2>&1; then
+  # jq is required for every decision this hook makes, so its absence can't
+  # be treated as "nothing to guard here" — that would silently disable the
+  # guard for the rest of the session. Deny with a hand-built JSON reason
+  # (there's no jq available to build one) instead of failing open.
+  printf '%s' '{"hookSpecificOutput":{"hookEventName":"PreToolUse","permissionDecision":"deny","permissionDecisionReason":"pewpew: worktree guard cannot run because jq is not installed on this host; blocking the write (fail-closed)"}}'
+  exit 0
+fi
+
+# A payload that isn't valid JSON at all is indistinguishable, further down,
+# from "a tool call with no file_path" (both make the later jq extractions
+# come back empty) — which exits allow. That's the wrong default for
+# malformed input: legitimate Write/Edit/MultiEdit/NotebookEdit calls from
+# Claude Code are always well-formed JSON, so anything else must fail closed.
+if ! printf '%s' "$payload" | jq -e . >/dev/null 2>&1; then
+  jq -nc --arg reason "pewpew: the hook payload is not valid JSON; blocking the write (fail-closed)" \\
+    '{hookSpecificOutput:{hookEventName:"PreToolUse",permissionDecision:"deny",permissionDecisionReason:$reason}}'
+  exit 0
+fi
+
+# Canonicalize the root itself (resolves any symlinks in the worktree path).
+# A cd failure means the baked-in root no longer matches reality (e.g. the
+# worktree was relocated or deleted after this hook was installed) — deny
+# rather than silently allowing every write, the same fail-closed posture
+# used for every other failure mode below.
+root_real=$(cd "$root" 2>/dev/null && pwd -P)
+if [ -z "$root_real" ]; then
+  jq -nc --arg reason "pewpew: could not resolve the worktree root ($root) — it may have been moved or deleted; blocking the write (fail-closed)" \\
+    '{hookSpecificOutput:{hookEventName:"PreToolUse",permissionDecision:"deny",permissionDecisionReason:$reason}}'
+  exit 0
+fi
+
+# Check for an embedded/trailing newline in the raw JSON string BEFORE ever
+# assigning it into a shell variable: \`target=$(...)\` below would silently
+# strip a trailing newline via command substitution, so validating $target
+# after the fact can't detect it — a file literally named "evil\\n" would
+# then be checked as the (different, likely nonexistent) path "evil" while
+# Write/Edit still operates on the real newline-suffixed name. jq's \`test()\`
+# runs against the full string value jq parsed from the JSON, unaffected by
+# shell stripping.
+has_newline=$(printf '%s' "$payload" | jq -r '(.tool_input.file_path // .tool_input.notebook_path // "") | test("\\n")' 2>/dev/null)
+if [ "$has_newline" = "true" ]; then
+  jq -nc --arg reason "pewpew: the write target contains a newline; blocking the write (fail-closed)" \\
+    '{hookSpecificOutput:{hookEventName:"PreToolUse",permissionDecision:"deny",permissionDecisionReason:$reason}}'
+  exit 0
+fi
+
 target=$(printf '%s' "$payload" | jq -r '.tool_input.file_path // .tool_input.notebook_path // empty' 2>/dev/null)
 [ -z "$target" ] && exit 0
 
-# Resolve an absolute, symlink-free path even when the target doesn't exist
-# yet (a new file's parent directory may not have been created). Walk up from
-# the target until an existing *directory* ancestor is found (an existing
-# regular file can't be cd'd into, so -d rather than -e), canonicalize that,
-# then re-append the unresolved remainder.
+# Resolve an absolute, symlink-free, \`.\`/\`..\`-normalized path even when the
+# target doesn't exist yet (a new file's parent directory may not have been
+# created). Processes path components left to right through a work queue:
+# \`..\` pops the last resolved component lexically, independent of whether
+# that component currently exists on disk; any component that resolves to an
+# existing symlink — including the FINAL component, and including a symlink
+# to a regular file rather than a directory — has its target re-queued for
+# the same treatment, so a chain of symlinks and \`..\` segments is fully
+# unwound rather than left partially resolved (which previously let a
+# final-component symlink, or a \`..\` past a not-yet-created component,
+# through unresolved).
 resolve_path() {
   p="$1"
   case "$p" in
     /*) ;;
     *) p="$root_real/$p" ;;
   esac
-  suffix=""
-  while [ ! -d "$p" ]; do
-    suffix="/\${p##*/}$suffix"
-    parent="\${p%/*}"
-    if [ "$parent" = "$p" ] || [ -z "$parent" ]; then
-      p="/"
-      break
+
+  queue=()
+  IFS='/' read -r -a queue <<< "$p"
+
+  resolved=()
+  symlink_hops=0
+  iterations=0
+  while [ "\${#queue[@]}" -gt 0 ]; do
+    iterations=$((iterations + 1))
+    # Backstop against a pathological number of path components; ordinary
+    # paths never come close to this.
+    [ "$iterations" -gt 10000 ] && return 1
+
+    part="\${queue[0]}"
+    queue=("\${queue[@]:1}")
+
+    case "$part" in
+      '' | '.') continue ;;
+      '..')
+        last=$((\${#resolved[@]} - 1))
+        [ "$last" -ge 0 ] && unset 'resolved[last]'
+        continue
+        ;;
+    esac
+
+    resolved+=("$part")
+    candidate="/$(IFS=/; printf '%s' "\${resolved[*]}")"
+
+    if [ -L "$candidate" ]; then
+      symlink_hops=$((symlink_hops + 1))
+      # Bound symlink dereferences specifically (matching Linux's own
+      # MAXSYMLINKS), not ordinary path components, so a genuinely deep but
+      # legitimate path can't spuriously hit this cap — only a symlink cycle
+      # can.
+      [ "$symlink_hops" -gt 40 ] && return 1
+      last=$((\${#resolved[@]} - 1))
+      unset 'resolved[last]'
+      # Same newline-truncation class as the target extraction above: a
+      # symlink whose target string itself contains a newline would have
+      # that newline silently dropped by \`$(readlink ...)\`, potentially
+      # collapsing an out-of-worktree target onto an in-worktree-looking
+      # string. \`readlink\` normally emits exactly one line (the target plus
+      # its own terminator); more than one line means the target contains an
+      # embedded or trailing newline. Piped directly to \`wc -l\`, unaffected
+      # by command-substitution stripping.
+      [ "$(readlink "$candidate" | wc -l)" -gt 1 ] && return 1
+      linktarget=$(readlink "$candidate") || return 1
+      case "$linktarget" in
+        /*) resolved=() ;;
+      esac
+      target_parts=()
+      IFS='/' read -r -a target_parts <<< "$linktarget"
+      queue=("\${target_parts[@]}" "\${queue[@]}")
     fi
-    p="$parent"
   done
-  base=$(cd "$p" 2>/dev/null && pwd -P) || { printf ''; return; }
-  printf '%s%s\\n' "$base" "$suffix"
+
+  printf '/%s' "$(IFS=/; printf '%s' "\${resolved[*]}")"
 }
 
 target_real=$(resolve_path "$target")
-[ -z "$target_real" ] && exit 0
-
-# Path-boundary check: target must be the root itself, or start with "root/".
-# A plain string-prefix check would let a sibling like "<root>-evil" through.
-case "$target_real" in
-  "$root_real") allowed=1 ;;
-  "$root_real"/*) allowed=1 ;;
-  *) allowed=0 ;;
-esac
 
 reason=""
-guard_settings="$root_real/.claude/settings.local.json"
-if [ "$target_real" = "$guard_settings" ]; then
-  allowed=0
-  reason="pewpew: this hook's own settings file ($guard_settings) may not be edited"
+allowed=0
+
+if [ -z "$target_real" ]; then
+  # resolve_path failed (symlink-cycle cap, a component vanishing mid-walk,
+  # or similar) — the same fail-closed reasoning as everywhere else in this
+  # script: if the guard can't determine whether a target is safe, it must
+  # not let it through.
+  reason="pewpew: could not canonicalize the write target ($target); blocking the write (fail-closed)"
+else
+  # Path-boundary check: target must be the root itself, or start with "root/".
+  # A plain string-prefix check would let a sibling like "<root>-evil" through.
+  case "$target_real" in
+    "$root_real") allowed=1 ;;
+    "$root_real"/*) allowed=1 ;;
+    *) allowed=0 ;;
+  esac
+
+  guard_settings="$root_real/.claude/settings.local.json"
+  # \`-ef\` (same file, via inode/device) catches what the exact string match
+  # above misses on a case-insensitive-but-case-preserving filesystem (e.g.
+  # macOS's default APFS mode): a differently-cased path like
+  # ".claude/Settings.local.json" opens the identical on-disk file without
+  # matching the string comparison. \`-ef\` requires both operands to exist,
+  # so it only ever adds a match — it can't be tricked by a nonexistent path.
+  if [ "$target_real" = "$guard_settings" ] || \\
+    { [ -e "$target_real" ] && [ -e "$guard_settings" ] && [ "$target_real" -ef "$guard_settings" ]; }; then
+    allowed=0
+    reason="pewpew: this hook's own settings file ($guard_settings) may not be edited"
+  fi
 fi
 
 [ "\${allowed:-0}" = "1" ] && exit 0
@@ -110,6 +222,79 @@ jq -nc --arg reason "$reason" \\
   '{hookSpecificOutput:{hookEventName:"PreToolUse",permissionDecision:"deny",permissionDecisionReason:$reason}}'
 exit 0
 `
+
+export const OMP_HOOK_SCRIPT_VERSION = 1
+
+// Matches hooks/omp-notify.ts's NOTIFY_TIMEOUT_MS — kept in sync by hand
+// alongside the rest of this duplicated bridge logic (see the comment below).
+const OMP_HOOK_NOTIFY_TIMEOUT_MS = 2000
+
+// omp loads its hook bridge via `--hook <path>` (a real file, not a piece of
+// declarative JSON), so unlike notifyScript above this has to be installed as
+// its own file rather than merged into a settings/hooks JSON blob. This is a
+// duplicate of hooks/omp-notify.ts's logic (kept in sync by hand) rather than
+// reading that file at runtime, because the remote install has to inline the
+// script text into a single ssh round trip the same way notifyScript does —
+// with the resolved absolute notifyScriptPath baked in directly instead of
+// recomputed from CONFIG_DIR/XDG_CONFIG_HOME (which only makes sense for a
+// local install where "this machine's home dir" is unambiguous).
+//
+// MANUAL SYNC CHECKLIST — host-bootstrap.test.ts asserts this generated
+// script registers the same pi.on(...) event set and the same
+// NOTIFY_TIMEOUT_MS value as hooks/omp-notify.ts, but NOT full handler-body
+// behavior, so when changing hooks/omp-notify.ts also mirror here:
+//   - add/remove/rename a pi.on(...) event
+//   - change NOTIFY_TIMEOUT_MS (OMP_HOOK_NOTIFY_TIMEOUT_MS below)
+//   - change the willContinue skip (or any other handler conditional)
+//   - change the notify() payload shape
+//
+// The generated script's `import` line is built via string concatenation
+// (not a literal `import ... from ...` substring in this file) so it can't
+// be statically pattern-matched as a real import by electron-vite's ESM
+// __dirname/__filename/require shim injector — that injector scans the
+// bundled *output* text for import-looking lines and once mistook this
+// template literal's embedded import statement for a real one, inserting
+// its CommonJS-shim boilerplate here instead of at this file's actual top,
+// leaving every real `__dirname` use elsewhere in the bundle undefined.
+const OMP_HOOK_IMPORT_LINE = ['import', '{ execFileSync }', 'from', "'node:child_process'"].join(
+  ' '
+)
+
+function buildOmpHookScript(notifyScriptPath: string): string {
+  return `// pewpew omp hook bridge v${OMP_HOOK_SCRIPT_VERSION}
+// PEWPEW_OMP_HOOK_VERSION=${OMP_HOOK_SCRIPT_VERSION}
+${OMP_HOOK_IMPORT_LINE}
+
+const NOTIFY_SCRIPT = ${JSON.stringify(notifyScriptPath)}
+// Bounds notify() so a hung notify.sh/socat can't stall the omp agent loop —
+// this runs on every tool_result, not just at session start/end.
+const NOTIFY_TIMEOUT_MS = ${OMP_HOOK_NOTIFY_TIMEOUT_MS}
+
+function notify(hookEventName, params) {
+  const payload = JSON.stringify({ hook_event_name: hookEventName, ...params })
+  try {
+    execFileSync(NOTIFY_SCRIPT, [], {
+      input: payload,
+      stdio: ['pipe', 'ignore', 'ignore'],
+      timeout: NOTIFY_TIMEOUT_MS,
+    })
+  } catch {
+    // Best effort — pewpew may not be running, the socket may be gone, or
+    // the call timed out.
+  }
+}
+
+export default function (pi) {
+  pi.on('session_start', (_event, ctx) => notify('SessionStart', { cwd: ctx.cwd }))
+  pi.on('agent_end', (event, ctx) => {
+    if (event.willContinue) return
+    notify('Stop', { cwd: ctx.cwd })
+  })
+  pi.on('tool_result', (_event, ctx) => notify('PostToolUse', { cwd: ctx.cwd }))
+  pi.on('session_shutdown', (_event, ctx) => notify('SessionEnd', { cwd: ctx.cwd, reason: 'other' }))
+}
+`
+}
 
 export type HostBootstrapErrorKind = 'missing-deps' | 'stream-local-bind' | 'install-failed'
 
@@ -139,12 +324,14 @@ export type AgentResolution = Partial<Record<AgentTool, string>>
 interface CachedBootstrap {
   notifyScriptPath: string
   guardScriptPath: string
+  ompHookScriptPath: string
   remoteSocketPath: string
 }
 
 export interface HostBootstrapResult {
   notifyScriptPath: string
   guardScriptPath: string
+  ompHookScriptPath: string
   remoteSocketPath: string
   agentPaths: AgentResolution
 }
@@ -159,8 +346,12 @@ const bootstrapped = new Map<string, CachedBootstrap>()
 // users who only export PATH in their interactive rc — sshd's non-interactive
 // command exec doesn't source those.
 //
-// Output is two lines (claude, then codex), each containing the absolute path
-// or empty.
+// Output is one line per AGENT_TOOLS entry (claude, codex, omp — in that
+// order), each containing the absolute path or empty. The order here, the
+// resolve_one calls below, and the positional args passed into the script by
+// resolveRemoteAgents must all stay in lockstep — resolveRemoteAgents maps
+// stdout lines back to tools by array index, so a mismatch silently
+// mis-assigns a resolved path to the wrong tool.
 const RESOLVE_SCRIPT = `set +e
 augment_path() {
   for d in "$HOME/.local/bin" "$HOME/.npm-global/bin" "$HOME/bin" "$HOME/.cargo/bin" "$HOME/.deno/bin" "$HOME/go/bin"; do
@@ -187,6 +378,7 @@ resolve_one() {
 }
 resolve_one claude "$1"
 resolve_one codex "$2"
+resolve_one omp "$3"
 `
 
 export async function resolveRemoteAgents(
@@ -194,7 +386,15 @@ export async function resolveRemoteAgents(
   cachedAgentPaths: AgentResolution = {}
 ): Promise<AgentResolution> {
   const result = await connection.exec(
-    ['sh', '-c', RESOLVE_SCRIPT, '_', cachedAgentPaths.claude ?? '', cachedAgentPaths.codex ?? ''],
+    [
+      'sh',
+      '-c',
+      RESOLVE_SCRIPT,
+      '_',
+      cachedAgentPaths.claude ?? '',
+      cachedAgentPaths.codex ?? '',
+      cachedAgentPaths.omp ?? '',
+    ],
     { timeoutMs: 15000 }
   )
   // Surface probe failures as a typed bootstrap error rather than masquerading
@@ -306,6 +506,7 @@ export async function bootstrapHost(
 
   const hooksDir = posix.join(configRoot, 'pewpew', 'hooks')
   const notifyScriptPath = posix.join(hooksDir, `notify-v${NOTIFY_SCRIPT_VERSION}.sh`)
+  const ompHookScriptPath = posix.join(hooksDir, `omp-notify-v${OMP_HOOK_SCRIPT_VERSION}.ts`)
   const breadcrumbPath = posix.join(hooksDir, 'socket-path')
   const guardScriptPath = posix.join(
     hooksDir,
@@ -321,7 +522,7 @@ export async function bootstrapHost(
     'printf "%s\\n" "$3" > "$6"\n' +
     'if [ ! -f "$7" ] || ! grep -q "PEWPEW_WORKTREE_GUARD_VERSION=$9" "$7"; then\n' +
     '  printf "%s" "$8" > "$7"\n' +
-    '  chmod 755 "$7"\n' +
+    '  chmod 700 "$7"\n' +
     'fi\n'
   const install = await connection.exec(
     [
@@ -347,6 +548,42 @@ export async function bootstrapHost(
     'Unable to install remote notify hook and worktree guard'
   )
 
-  bootstrapped.set(hostId, { notifyScriptPath, guardScriptPath, remoteSocketPath })
-  return { notifyScriptPath, guardScriptPath, remoteSocketPath, agentPaths }
+  // Separate install step: the omp hook bridge is a plain file (loaded via
+  // `--hook <path>`, not merged JSON), so it doesn't share installScript's
+  // socket-breadcrumb/notify.sh write above. The reinstall guard checks BOTH
+  // the bridge's own version marker AND that the current notifyScriptPath is
+  // still baked in as a literal — otherwise bumping NOTIFY_SCRIPT_VERSION
+  // alone (without also touching OMP_HOOK_SCRIPT_VERSION) would leave an
+  // already-installed bridge silently pointing at a notify.sh path that no
+  // longer exists, and omp events would go nowhere on already-bootstrapped
+  // hosts.
+  const ompHookInstallScript =
+    'set -e\n' +
+    'mkdir -p "$1"\n' +
+    'if [ ! -f "$2" ] || ! grep -qF "PEWPEW_OMP_HOOK_VERSION=$4" "$2" || ! grep -qF "$5" "$2"; then\n' +
+    '  printf "%s" "$3" > "$2"\n' +
+    'fi\n'
+  const ompHookInstall = await connection.exec(
+    [
+      'sh',
+      '-c',
+      ompHookInstallScript,
+      '_',
+      hooksDir,
+      ompHookScriptPath,
+      buildOmpHookScript(notifyScriptPath),
+      String(OMP_HOOK_SCRIPT_VERSION),
+      notifyScriptPath,
+    ],
+    { timeoutMs: 15000 }
+  )
+  await expectOk(ompHookInstall, 'install-failed', 'Unable to install remote omp hook bridge')
+
+  bootstrapped.set(hostId, {
+    notifyScriptPath,
+    guardScriptPath,
+    ompHookScriptPath,
+    remoteSocketPath,
+  })
+  return { notifyScriptPath, guardScriptPath, ompHookScriptPath, remoteSocketPath, agentPaths }
 }

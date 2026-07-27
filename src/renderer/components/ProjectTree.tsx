@@ -787,6 +787,16 @@ function useProjectTreeElement({ onOpenSession }: TreeProps) {
               />
               Codex
             </label>
+            <label>
+              <input
+                type="radio"
+                name="tool"
+                value="omp"
+                checked={pendingTool === 'omp'}
+                onChange={() => setUi({ pendingTool: 'omp' })}
+              />
+              oh-my-pi
+            </label>
           </div>
           <label className="session-base-checkbox">
             <input
@@ -858,6 +868,16 @@ function useProjectTreeElement({ onOpenSession }: TreeProps) {
                 onChange={() => setUi({ pendingPrTool: 'codex' })}
               />
               Codex
+            </label>
+            <label>
+              <input
+                type="radio"
+                name="pr-tool"
+                value="omp"
+                checked={pendingPrTool === 'omp'}
+                onChange={() => setUi({ pendingPrTool: 'omp' })}
+              />
+              oh-my-pi
             </label>
           </div>
           {prError && <div className="pr-error">{prError}</div>}
