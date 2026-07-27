@@ -68,6 +68,7 @@ import { createPrLookup, parseOwnerFromRemoteUrl } from './github'
 import { parseIssueNumber, worktreeBranchName } from './branch-naming'
 import { resolveOriginDefaultBase, type GitRunner } from './origin-base'
 import { branchRefExists } from './branch-ref'
+import { classifyAutoReconnectResult } from './reconnect-outcome'
 import { deriveSessionFields } from './session-fields'
 import {
   numbersInUse,
@@ -1290,40 +1291,40 @@ export async function attemptAutoReconnect(id: string): Promise<AttemptOutcome> 
   const after = sessions.get(id)?.session
   if (!after) return 'gave-up'
 
-  // The session resolved to terminal (a concurrent session.end → promptCleanup →
-  // Keep) while our probe was in flight; doReconnectRemoteSession left it intact.
-  // Don't toast "Reconnected" or re-drive cleanup for a session that already ended.
-  if (after.status === 'completed' || after.status === 'error') return 'gave-up'
-
-  if (after.connectionState === 'live') {
-    emitToast({ severity: 'info', title: `Reconnected to ${label}` })
-    return 'recovered'
+  const { outcome, effect } = classifyAutoReconnectResult({
+    status: after.status,
+    connectionState: after.connectionState,
+  })
+  switch (effect) {
+    case 'toast-reconnected':
+      emitToast({ severity: 'info', title: `Reconnected to ${label}` })
+      break
+    case 'prompt-cleanup':
+      // Remote tmux confirmed gone: the agent ended. The session.end hook that
+      // drives promptCleanup for a live session is unreliable over a remote link
+      // (it races the ControlMaster/reverse-forward teardown as the PTY drops, so
+      // the message is often lost before it arrives), leaving remote sessions
+      // without the "Clean up worktree?" dialog local sessions get on exit. This
+      // probe result is the dependable "session ended" signal, so prompt the same
+      // cleanup here — otherwise the card is silently left dead and the user
+      // removes it by hand, deleting the worktree with no confirmation. Fire and
+      // forget (the dialog awaits user input); promptCleanup's own in-progress
+      // guard makes a late-arriving session.end hook a no-op.
+      void promptCleanup(id).catch((err) => {
+        console.error(`promptCleanup(${id}) failed:`, err)
+        // If the dialog itself failed (no window available, Electron dialog IPC
+        // error), still surface the "session ended" signal the old synchronous
+        // toast guaranteed — a dialog failure must not silently swallow it.
+        emitToast({ severity: 'error', title: `${label}: remote session ended` })
+      })
+      break
+    case 'toast-auth-failed':
+      emitToast({ severity: 'error', title: `SSH authentication failed on ${label}` })
+      break
+    case 'none':
+      break
   }
-  if (after.status === 'dead') {
-    // Remote tmux confirmed gone: the agent ended. The session.end hook that
-    // drives promptCleanup for a live session is unreliable over a remote link
-    // (it races the ControlMaster/reverse-forward teardown as the PTY drops, so
-    // the message is often lost before it arrives), leaving remote sessions
-    // without the "Clean up worktree?" dialog local sessions get on exit. This
-    // probe result is the dependable "session ended" signal, so prompt the same
-    // cleanup here — otherwise the card is silently left dead and the user
-    // removes it by hand, deleting the worktree with no confirmation. Fire and
-    // forget (the dialog awaits user input); promptCleanup's own in-progress
-    // guard makes a late-arriving session.end hook a no-op.
-    void promptCleanup(id).catch((err) => {
-      console.error(`promptCleanup(${id}) failed:`, err)
-      // If the dialog itself failed (no window available, Electron dialog IPC
-      // error), still surface the "session ended" signal the old synchronous
-      // toast guaranteed — a dialog failure must not silently swallow it.
-      emitToast({ severity: 'error', title: `${label}: remote session ended` })
-    })
-    return 'gave-up'
-  }
-  if (after.connectionState === 'auth-failed') {
-    emitToast({ severity: 'error', title: `SSH authentication failed on ${label}` })
-    return 'gave-up'
-  }
-  return 'retry'
+  return outcome
 }
 
 const reconnectScheduler = createReconnectScheduler({
