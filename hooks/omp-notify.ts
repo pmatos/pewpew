@@ -30,13 +30,26 @@ import { join } from 'node:path'
 const CONFIG_DIR = join(process.env.XDG_CONFIG_HOME || join(homedir(), '.config'), 'pewpew')
 const NOTIFY_SCRIPT = join(CONFIG_DIR, 'hooks', 'notify.sh')
 
+// notify() runs synchronously on every tool_result — i.e. once per tool call,
+// not just at session start/end — so an unbounded execFileSync could stall
+// the whole omp agent loop if notify.sh/socat ever hung (e.g. hook-server
+// accepting but not promptly reading/closing under load). The timeout bounds
+// that; the existing catch below already treats any failure, including a
+// timeout's SIGTERM, as best-effort.
+const NOTIFY_TIMEOUT_MS = 2000
+
 function notify(hookEventName: string, params: Record<string, unknown>): void {
   const payload = JSON.stringify({ hook_event_name: hookEventName, ...params })
   try {
-    execFileSync(NOTIFY_SCRIPT, [], { input: payload, stdio: ['pipe', 'ignore', 'ignore'] })
+    execFileSync(NOTIFY_SCRIPT, [], {
+      input: payload,
+      stdio: ['pipe', 'ignore', 'ignore'],
+      timeout: NOTIFY_TIMEOUT_MS,
+    })
   } catch {
-    // Best effort — pewpew may not be running, or the notify script/socket
-    // may be missing. Never let a notification failure interrupt the agent.
+    // Best effort — pewpew may not be running, the notify script/socket may
+    // be missing, or the call timed out. Never let a notification failure
+    // interrupt the agent.
   }
 }
 

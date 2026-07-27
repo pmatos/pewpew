@@ -42,6 +42,10 @@ echo "$PAYLOAD" | socat - UNIX-CONNECT:"$SOCKET" >/dev/null 2>/dev/null || true
 
 export const OMP_HOOK_SCRIPT_VERSION = 1
 
+// Matches hooks/omp-notify.ts's NOTIFY_TIMEOUT_MS — kept in sync by hand
+// alongside the rest of this duplicated bridge logic (see the comment below).
+const OMP_HOOK_NOTIFY_TIMEOUT_MS = 2000
+
 // omp loads its hook bridge via `--hook <path>` (a real file, not a piece of
 // declarative JSON), so unlike notifyScript above this has to be installed as
 // its own file rather than merged into a settings/hooks JSON blob. This is a
@@ -70,13 +74,21 @@ function buildOmpHookScript(notifyScriptPath: string): string {
 ${OMP_HOOK_IMPORT_LINE}
 
 const NOTIFY_SCRIPT = ${JSON.stringify(notifyScriptPath)}
+// Bounds notify() so a hung notify.sh/socat can't stall the omp agent loop —
+// this runs on every tool_result, not just at session start/end.
+const NOTIFY_TIMEOUT_MS = ${OMP_HOOK_NOTIFY_TIMEOUT_MS}
 
 function notify(hookEventName, params) {
   const payload = JSON.stringify({ hook_event_name: hookEventName, ...params })
   try {
-    execFileSync(NOTIFY_SCRIPT, [], { input: payload, stdio: ['pipe', 'ignore', 'ignore'] })
+    execFileSync(NOTIFY_SCRIPT, [], {
+      input: payload,
+      stdio: ['pipe', 'ignore', 'ignore'],
+      timeout: NOTIFY_TIMEOUT_MS,
+    })
   } catch {
-    // Best effort — pewpew may not be running, or the socket may be gone.
+    // Best effort — pewpew may not be running, the socket may be gone, or
+    // the call timed out.
   }
 }
 

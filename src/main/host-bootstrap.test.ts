@@ -148,6 +148,36 @@ describe('bootstrapHost', () => {
     expect(ompInstallCall?.[2]).toContain('grep -qF "$5"')
   })
 
+  // Regression: buildOmpHookScript hand-duplicates hooks/omp-notify.ts's
+  // event-mapping logic (necessarily — the remote install has to inline the
+  // script text into a single ssh round trip rather than read the local file
+  // at runtime), and nothing previously asserted the two stay equivalent.
+  // Extract the event names each one registers via pi.on(...) and compare:
+  // the generated remote copy from the actual install-call argv, the local
+  // copy by invoking hooks/omp-notify.ts's real default export against a fake
+  // `pi` that just records what it's asked to subscribe to.
+  it('registers the same pi.on(...) events as the local bridge (hooks/omp-notify.ts)', async () => {
+    const calls: string[][] = []
+    await bootstrapHost('host-bootstrap-omp-event-parity', fakeConnection(calls), '/tmp/ipc')
+    const ompInstallCall = calls.find((argv) => argv[2]?.includes('PEWPEW_OMP_HOOK_VERSION'))
+    const generatedSource = ompInstallCall?.[6] ?? ''
+    const generatedEvents = [...generatedSource.matchAll(/pi\.on\('([a-zA-Z_.]+)'/g)]
+      .map((m) => m[1])
+      .sort()
+
+    const { default: localHook } = await import('../../hooks/omp-notify')
+    const localEvents: string[] = []
+    localHook({
+      on: (event: string) => {
+        localEvents.push(event)
+      },
+    })
+    localEvents.sort()
+
+    expect(generatedEvents.length).toBeGreaterThan(0)
+    expect(generatedEvents).toEqual(localEvents)
+  })
+
   it('resolves omp in addition to claude and codex, at the correct ordinal position', async () => {
     const calls: string[][] = []
     const result = await bootstrapHost(
