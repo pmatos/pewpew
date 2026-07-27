@@ -68,6 +68,9 @@ const state = vi.hoisted(() => ({
   // Captured emitToast payloads for assertion.
   toasts: [] as { severity: string; title: string; detail?: string }[],
   hasPtyResult: new Set<string>(),
+  // Session ids for which the mocked destroyRemotePty rejects (simulates an
+  // SSH teardown failure), for removeSession failure-path coverage.
+  destroyRemotePtyThrows: new Set<string>(),
   // Response returned by the mocked cleanup dialog: 0 = Delete worktree,
   // 1 = Keep worktree, 2 = Keep and open in file manager.
   dialogResponse: 1,
@@ -183,7 +186,11 @@ vi.mock('./pty-manager', () => ({
     state.detachPtyCalls.push(sessionId)
   },
   destroyPty: vi.fn(),
-  destroyRemotePty: vi.fn(async () => undefined),
+  destroyRemotePty: vi.fn(async (sessionId: string) => {
+    if (state.destroyRemotePtyThrows.has(sessionId)) {
+      throw new Error('ssh teardown failed')
+    }
+  }),
   hasPty: vi.fn((sessionId: string) => state.hasPtyResult.has(sessionId)),
   hasTmuxSession: vi.fn(() => false),
   hasRemoteTmuxSession: vi.fn(async (sessionId: string) => {
@@ -386,6 +393,7 @@ beforeEach(() => {
   state.reconnectConfig = { enabled: true, initialDelayMs: 1000, maxDelayMs: 30000 }
   state.toasts = []
   state.hasPtyResult = new Set()
+  state.destroyRemotePtyThrows = new Set()
   state.dialogResponse = 1
   state.dialogThrows = false
   showMessageBoxMock.mockClear()
@@ -1235,6 +1243,33 @@ describe('removeSession', () => {
 
     expect(showMessageBoxMock).not.toHaveBeenCalled()
     expect(sm.getSessions()).toEqual([])
+  })
+
+  // Regression: cleanupInProgress.add(id) ran unconditionally with nothing to
+  // release it if a fallible step below threw — getRequiredHost throws
+  // synchronously for a removed host, destroyRemotePty throws on SSH
+  // failures, and removeSession is called directly from the
+  // sessions:remove(-batch) IPC handlers (not just via promptCleanup), which
+  // swallow the error. That left the session alive but permanently stuck in
+  // cleanupInProgress, silently no-oping every future session.end for it.
+  it('releases cleanupInProgress and keeps the session alive when teardown fails', async () => {
+    const remote = baseRemoteSession({ id: 'r1', status: 'idle' })
+    writeSessionsJson([remote])
+    state.destroyRemotePtyThrows.add('r1')
+    const sm = await loadSessionManager()
+    sm.restoreSessions()
+
+    await expect(sm.removeSession('r1')).rejects.toThrow('ssh teardown failed')
+
+    // The session must survive a failed removal.
+    expect(sm.getSessions().map((s) => s.id)).toEqual(['r1'])
+
+    // cleanupInProgress must have been released: a later session.end for this
+    // session should open the cleanup dialog normally, not silently no-op.
+    sm.handleHookEvent('session.end', { cwd: remote.worktreePath }, 'h1')
+    await new Promise((resolve) => setTimeout(resolve, 0))
+
+    expect(showMessageBoxMock).toHaveBeenCalledTimes(1)
   })
 })
 

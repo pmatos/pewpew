@@ -1671,19 +1671,29 @@ export async function removeSession(id: string): Promise<void> {
   // subprocess is still running — before this session is even out of the
   // `sessions` map. Without this guard that races the explicit, dialog-free
   // delete here against a "clean up worktree?" prompt for a worktree that's
-  // already being (or already was) force-removed. Safe to leave set forever
-  // once we reach here — the session is deleted from `sessions` below and can
-  // never be revived, unlike a killSession'd one.
+  // already being (or already was) force-removed. Released in the catch below
+  // on failure: getRequiredHost throws synchronously for a removed host
+  // config, and destroyRemotePty throws on SSH failures — both reachable
+  // since this is called directly from the sessions:remove(-batch) IPC
+  // handlers, not just via promptCleanup. On success the session is deleted
+  // from `sessions` below and can never be revived, so nothing needs to
+  // release the guard; on failure the session survives and must not stay
+  // permanently wedged out of future cleanup-dialog prompts.
   cleanupInProgress.add(id)
-  if (entry?.session.hostId) {
-    const host = getRequiredHost(entry.session.hostId)
-    await destroyRemotePty(id, host)
-  } else {
-    destroyPty(id)
+  try {
+    if (entry?.session.hostId) {
+      const host = getRequiredHost(entry.session.hostId)
+      await destroyRemotePty(id, host)
+    } else {
+      destroyPty(id)
+    }
+    await removeWorktree(id)
+    sessions.delete(id)
+    onSessionsChanged()
+  } catch (err) {
+    cleanupInProgress.delete(id)
+    throw err
   }
-  await removeWorktree(id)
-  sessions.delete(id)
-  onSessionsChanged()
 }
 
 // Local-only forget: detach the PTY wrapper for every session bound to the
