@@ -28,6 +28,7 @@ function deps(): RemoteHostRuntimeDeps {
       guardScriptPath: '/tmp/worktree-guard.sh',
       ompHookScriptPath: '/tmp/omp-notify.ts',
       remoteSocketPath: '/tmp/remote.sock',
+      sandboxAvailable: true,
       agentPaths: { claude: '/bin/claude' },
     })),
     execRemote: vi.fn(async () => ({ stdout: '', stderr: '', code: 0, timedOut: false })),
@@ -45,6 +46,7 @@ describe('remote host runtime ownership', () => {
       expect(prepared.notifyScriptPath).toBe('/tmp/notify.sh')
       expect(prepared.guardScriptPath).toBe('/tmp/worktree-guard.sh')
       expect(prepared.ompHookScriptPath).toBe('/tmp/omp-notify.ts')
+      expect(prepared.sandboxAvailable).toBe(true)
       expect(prepared.agentPaths.claude).toBe('/bin/claude')
       return 'created'
     })
@@ -53,6 +55,7 @@ describe('remote host runtime ownership', () => {
     expect(fakes.retainHostConnection).toHaveBeenCalledWith('h1')
     expect(fakes.releaseHostConnection).toHaveBeenCalledWith('h1')
     expect(fakes.releaseHostConnection).toHaveBeenCalledTimes(1)
+    expect(fakes.emitToast).not.toHaveBeenCalled()
   })
 
   it('represents prepared host ownership as an idempotent lease', async () => {
@@ -68,5 +71,36 @@ describe('remote host runtime ownership', () => {
     expect(fakes.retainHostConnection).toHaveBeenCalledWith('h1')
     expect(fakes.releaseHostConnection).toHaveBeenCalledWith('h1')
     expect(fakes.releaseHostConnection).toHaveBeenCalledTimes(1)
+  })
+})
+
+describe('sandbox availability', () => {
+  it('threads sandboxAvailable=false through and warns once per host', async () => {
+    const fakes = deps()
+    fakes.bootstrapHost = vi.fn(async () => ({
+      notifyScriptPath: '/tmp/notify.sh',
+      guardScriptPath: '/tmp/worktree-guard.sh',
+      ompHookScriptPath: '/tmp/omp-notify.ts',
+      remoteSocketPath: '/tmp/remote.sock',
+      sandboxAvailable: false,
+      agentPaths: { claude: '/bin/claude' },
+    }))
+    const runtime = createRemoteHostRuntime(fakes)
+    const noBwrapHost = host({ hostId: 'no-bwrap-host', label: 'No Bwrap Box' })
+
+    await runtime.withPreparedHost(noBwrapHost, async (prepared) => {
+      expect(prepared.sandboxAvailable).toBe(false)
+      return null
+    })
+    await runtime.withPreparedHost(noBwrapHost, async () => null)
+
+    expect(fakes.emitToast).toHaveBeenCalledTimes(1)
+    expect(fakes.emitToast).toHaveBeenCalledWith(
+      expect.objectContaining({
+        severity: 'info',
+        hostLabel: 'No Bwrap Box',
+        detail: expect.stringContaining('Claude sessions still block'),
+      })
+    )
   })
 })

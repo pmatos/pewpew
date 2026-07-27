@@ -12,6 +12,13 @@ const state = {
   tmuxArgvCalls: [] as string[][],
   remoteArgvCalls: [] as string[][],
   mkdirCalls: [] as string[],
+  // Controls what resolveRemoteGitDir returns (empty → fallback to
+  // `<project>/.git`).
+  remoteGitDir: '' as string,
+  // Controls what resolveRemoteAgentStateDir returns (undefined → sandbox
+  // disabled, since a missing state bind would make the agent's first write
+  // hit EROFS under --ro-bind / /).
+  remoteStateDir: '/home/dev/.claude/projects/encoded-wt1' as string | undefined,
 }
 
 function fakePty() {
@@ -64,6 +71,30 @@ vi.mock('node-pty', () => ({
 vi.mock('./host-connection', () => ({
   exec: async (_host: unknown, argv: string[]) => {
     state.remoteArgvCalls.push(argv)
+    // resolveRemoteGitDir: `git -C <projectPath> rev-parse --git-common-dir`
+    if (argv[0] === 'git' && argv.includes('--git-common-dir')) {
+      return { stdout: state.remoteGitDir ?? '', stderr: '', code: 0, timedOut: false }
+    }
+    // resolveRemoteAgentStateDir: `sh -c <script> _ <worktreePath>` — the
+    // script prints the state dir path after mkdir'ing it. Return a fixed
+    // path so sandboxing can be enabled; tests that need it disabled set
+    // state.remoteStateDir to undefined.
+    if (argv[0] === 'sh' && typeof argv[2] === 'string') {
+      const script = argv[2]
+      if (
+        script.includes('.claude/projects') ||
+        script.includes('.codex') ||
+        script.includes('.omp/agent/sessions')
+      ) {
+        const dir = state.remoteStateDir
+        return {
+          stdout: dir ?? '',
+          stderr: '',
+          code: dir ? 0 : 1,
+          timedOut: false,
+        }
+      }
+    }
     return { stdout: '', stderr: '', code: 0, timedOut: false }
   },
   retainHostConnection: () => undefined,
@@ -262,25 +293,63 @@ describe('createPty', () => {
 
 describe('createRemotePty', () => {
   const host = { hostId: 'h1', alias: 'dev', label: 'Dev' } as Host
+  const STATE_DIR = '/home/dev/.claude/projects/encoded-wt1'
 
   beforeEach(() => {
     state.remoteArgvCalls = []
+    state.remoteGitDir = ''
+    state.remoteStateDir = STATE_DIR
   })
 
-  it('includes the sandbox prefix only when sandboxAvailable is exactly true', async () => {
+  // The tmux new-session call is the one whose argv starts with 'tmux' — the
+  // git/state-dir resolution calls precede it and pollute remoteArgvCalls.
+  function tmuxCall(): string[] {
+    return state.remoteArgvCalls.find((argv) => argv[0] === 'tmux') ?? []
+  }
+
+  it('includes the sandbox prefix with gitDir and extraWritablePaths when sandboxAvailable is true', async () => {
     await createRemotePty('s1', WORKTREE, host, {
       tool: 'claude',
       projectPath: PROJECT,
       sandboxAvailable: true,
     })
-    const argv = remoteAgentArgsFromCall(state.remoteArgvCalls[0])
-    const expectedPrefix = buildSandboxArgs(PROJECT, WORKTREE, { enabled: true })
+    const argv = remoteAgentArgsFromCall(tmuxCall())
+    const expectedPrefix = buildSandboxArgs(PROJECT, WORKTREE, {
+      enabled: true,
+      extraWritablePaths: [STATE_DIR],
+      gitDir: `${PROJECT}/.git`,
+    })
     expect(argv).toEqual([...expectedPrefix, ...buildAgentArgs({ tool: 'claude' })])
   })
 
-  it('omits the sandbox prefix when sandboxAvailable is not set (today, no remote call site sets it)', async () => {
+  it('uses the resolved gitDir when the remote reports a gitfile root', async () => {
+    state.remoteGitDir = '/home/dev/real-repo/.git'
+    await createRemotePty('s1', WORKTREE, host, {
+      tool: 'claude',
+      projectPath: PROJECT,
+      sandboxAvailable: true,
+    })
+    const argv = remoteAgentArgsFromCall(tmuxCall())
+    expect(argv).toContain('--bind')
+    expect(argv).toContain('/home/dev/real-repo/.git')
+    expect(argv).not.toContain(`${PROJECT}/.git`)
+  })
+
+  it('disables sandboxing when the remote state dir cannot be resolved', async () => {
+    state.remoteStateDir = undefined
+    await createRemotePty('s1', WORKTREE, host, {
+      tool: 'claude',
+      projectPath: PROJECT,
+      sandboxAvailable: true,
+    })
+    const argv = remoteAgentArgsFromCall(tmuxCall())
+    expect(argv).toEqual(buildAgentArgs({ tool: 'claude' }))
+    expect(argv).not.toContain('bwrap')
+  })
+
+  it('omits the sandbox prefix when sandboxAvailable is not set', async () => {
     await createRemotePty('s1', WORKTREE, host, { tool: 'claude', projectPath: PROJECT })
-    const argv = remoteAgentArgsFromCall(state.remoteArgvCalls[0])
+    const argv = remoteAgentArgsFromCall(tmuxCall())
     expect(argv).toEqual(buildAgentArgs({ tool: 'claude' }))
     expect(argv).not.toContain('bwrap')
   })
@@ -290,7 +359,7 @@ describe('createRemotePty', () => {
       tool: 'claude',
       sandboxAvailable: true,
     })
-    const argv = remoteAgentArgsFromCall(state.remoteArgvCalls[0])
+    const argv = remoteAgentArgsFromCall(tmuxCall())
     expect(argv).toEqual(buildAgentArgs({ tool: 'claude' }))
   })
 })

@@ -48,6 +48,23 @@ describe('buildSandboxArgs', () => {
     expect(args).not.toContain(`${PROJECT}/.git/config`)
   })
 
+  it('uses the provided gitDir instead of <project>/.git for the .git binds', () => {
+    const realGitDir = '/home/dev/real-repo/.git'
+    const args = buildSandboxArgs(PROJECT, WORKTREE, { gitDir: realGitDir })
+    expect(args).toContain(realGitDir)
+    expect(args).toContain(`${realGitDir}/hooks`)
+    // Must NOT contain the default <project>/.git path — that's a file for a
+    // gitfile root, and bwrap can't bind a file as a directory mount.
+    expect(args).not.toContain(`${PROJECT}/.git`)
+    expect(args).not.toContain(`${PROJECT}/.git/hooks`)
+  })
+
+  it('defaults to <project>/.git when gitDir is not provided', () => {
+    const args = buildSandboxArgs(PROJECT, WORKTREE)
+    expect(args).toContain(`${PROJECT}/.git`)
+    expect(args).toContain(`${PROJECT}/.git/hooks`)
+  })
+
   it('defaults to enabled when opts is omitted', () => {
     expect(buildSandboxArgs(PROJECT, WORKTREE).length).toBeGreaterThan(0)
   })

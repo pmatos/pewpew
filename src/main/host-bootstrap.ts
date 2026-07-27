@@ -11,6 +11,12 @@ export const WORKTREE_GUARD_SCRIPT_VERSION = 5
 export const STRICT_DEPS = ['tmux', 'git', 'jq', 'socat'] as const
 export const AGENT_TOOLS: readonly AgentTool[] = ['claude', 'codex', 'omp'] as const
 
+// Soft dependency: bubblewrap confines the agent's Bash subprocesses to the
+// worktree (see agent-sandbox.ts). Unlike STRICT_DEPS, its absence doesn't
+// block the session — it just runs unsandboxed against Bash, same as a host
+// without bwrap has always run.
+export const SANDBOX_DEPS = ['bwrap'] as const
+
 const notifyScript = `#!/usr/bin/env bash
 # pewpew notify script v${NOTIFY_SCRIPT_VERSION}
 PEWPEW_NOTIFY_VERSION=${NOTIFY_SCRIPT_VERSION}
@@ -333,6 +339,7 @@ export interface HostBootstrapResult {
   guardScriptPath: string
   ompHookScriptPath: string
   remoteSocketPath: string
+  sandboxAvailable: boolean
   agentPaths: AgentResolution
 }
 
@@ -440,6 +447,34 @@ export async function probeMissingDeps(
   return deps.filter((d) => missing.has(d))
 }
 
+// Remote counterpart of pty-manager.ts's local probeSandboxUsable(): runs a
+// minimal real bwrap invocation over SSH instead of just `command -v bwrap`.
+// Presence on PATH doesn't prove bwrap can create the namespaces/mounts it
+// needs — unprivileged userns can be disabled host-wide, or an LSM/container
+// policy can block it — and a host that fails that way would get a session
+// that dies instantly instead of falling back to unsandboxed. The argv here
+// is a strict subset of buildSandboxArgs's production prefix, so a pass here
+// isn't a false positive on a host that can list bwrap but can't run it.
+// Non-fatal: any failure (missing binary, nonzero exit, timeout) resolves to
+// false so sandboxing degrades gracefully and never blocks session creation.
+export async function probeRemoteSandboxUsable(
+  connection: HostBootstrapConnection
+): Promise<boolean> {
+  try {
+    const result = await connection.exec(
+      [
+        'sh',
+        '-c',
+        'bwrap --ro-bind / / --dev /dev --unshare-pid --proc /proc --tmpfs /tmp -- /bin/true',
+      ],
+      { timeoutMs: 8000 }
+    )
+    return !result.timedOut && result.code === 0
+  } catch {
+    return false
+  }
+}
+
 async function expectOk(
   result: ExecResult,
   kind: HostBootstrapErrorKind,
@@ -464,8 +499,15 @@ export async function bootstrapHost(
     // installed claude/codex (or one moved out from under the cached path) is
     // picked up. The resolve script verifies the cached path with `[ -x ]`
     // before falling back to a search, so the common case stays a single ssh.
-    const agentPaths = await resolveRemoteAgents(connection, cachedAgentPaths)
-    return { ...cached, agentPaths }
+    // sandboxAvailable is re-probed too (not cached) because it's a mutable
+    // host capability, not a static install-time fact: bwrap can be installed
+    // or removed, or a kernel/LSM policy can change, between sessions on the
+    // same host within one app run.
+    const [agentPaths, sandboxAvailable] = await Promise.all([
+      resolveRemoteAgents(connection, cachedAgentPaths),
+      probeRemoteSandboxUsable(connection),
+    ])
+    return { ...cached, sandboxAvailable, agentPaths }
   }
 
   const missingStrict = await probeMissingDeps(connection)
@@ -477,11 +519,16 @@ export async function bootstrapHost(
     )
   }
 
-  const [agentPaths, socketProbe] = await Promise.all([
+  const [agentPaths, socketProbe, sandboxAvailable] = await Promise.all([
     resolveRemoteAgents(connection, cachedAgentPaths),
     connection.exec(['sh', '-c', 'test -S "$1"', '_', remoteSocketPath], {
       timeoutMs: 5000,
     }),
+    // Non-fatal: a probe failure (ssh hiccup, bwrap missing, or bwrap present
+    // but unable to create namespaces) is treated the same as "sandbox
+    // unavailable" — sandboxing degrades gracefully, it never blocks session
+    // creation the way a STRICT_DEPS miss does.
+    probeRemoteSandboxUsable(connection),
   ])
   if (socketProbe.code !== 0 || socketProbe.timedOut) {
     throw new HostBootstrapError(
@@ -585,5 +632,12 @@ export async function bootstrapHost(
     ompHookScriptPath,
     remoteSocketPath,
   })
-  return { notifyScriptPath, guardScriptPath, ompHookScriptPath, remoteSocketPath, agentPaths }
+  return {
+    notifyScriptPath,
+    guardScriptPath,
+    ompHookScriptPath,
+    remoteSocketPath,
+    sandboxAvailable,
+    agentPaths,
+  }
 }
