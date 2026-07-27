@@ -411,7 +411,7 @@ describe('testConnection', () => {
     resultResolver = (args) => {
       const joined = args.join(' ')
       if (joined.includes('resolve_one claude'))
-        return okResult('/usr/bin/claude\n/usr/bin/codex\n')
+        return okResult('/usr/bin/claude\n/usr/bin/codex\n/usr/bin/omp\n')
       if (joined.includes('command -v') && joined.includes('missing=')) return okResult('\n')
       return okResult() // connectivity `true`
     }
@@ -426,13 +426,14 @@ describe('testConnection', () => {
     expect(result.agentTools).toEqual([
       { name: 'claude', installed: true },
       { name: 'codex', installed: true },
+      { name: 'omp', installed: true },
     ])
   })
 
   it('flags a missing required tool (socat) while staying connected', async () => {
     resultResolver = (args) => {
       const joined = args.join(' ')
-      if (joined.includes('resolve_one claude')) return okResult('/usr/bin/claude\n\n')
+      if (joined.includes('resolve_one claude')) return okResult('/usr/bin/claude\n\n\n')
       if (joined.includes('command -v') && joined.includes('missing=')) return okResult(' socat\n')
       return okResult()
     }
@@ -442,6 +443,7 @@ describe('testConnection', () => {
     expect(result.agentTools).toEqual([
       { name: 'claude', installed: true },
       { name: 'codex', installed: false },
+      { name: 'omp', installed: false },
     ])
   })
 

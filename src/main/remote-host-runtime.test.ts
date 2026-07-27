@@ -25,6 +25,7 @@ function deps(): RemoteHostRuntimeDeps {
     startBootstrapWindow: vi.fn(() => vi.fn()),
     bootstrapHost: vi.fn(async () => ({
       notifyScriptPath: '/tmp/notify.sh',
+      ompHookScriptPath: '/tmp/omp-notify.ts',
       remoteSocketPath: '/tmp/remote.sock',
       agentPaths: { claude: '/bin/claude' },
     })),
@@ -41,6 +42,7 @@ describe('remote host runtime ownership', () => {
 
     const result = await runtime.withPreparedHost(host(), async (prepared) => {
       expect(prepared.notifyScriptPath).toBe('/tmp/notify.sh')
+      expect(prepared.ompHookScriptPath).toBe('/tmp/omp-notify.ts')
       expect(prepared.agentPaths.claude).toBe('/bin/claude')
       return 'created'
     })

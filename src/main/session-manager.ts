@@ -1,9 +1,9 @@
 import { execFile, execFileSync } from 'child_process'
 import { promisify } from 'util'
 import { readFileSync, writeFileSync, existsSync, realpathSync } from 'fs'
-import { join, basename, sep } from 'path'
+import { join, basename, sep, relative, isAbsolute } from 'path'
 import { posix } from 'path'
-import { homedir } from 'os'
+import { homedir, tmpdir } from 'os'
 import { randomUUID } from 'crypto'
 import { dialog, shell } from 'electron'
 import { broadcastToAll, getMainWindow } from './window-registry'
@@ -436,6 +436,11 @@ async function installAgentHooks(tool: AgentTool, worktreePath: string): Promise
     }
     return
   }
+  if (tool === 'omp') {
+    // omp's hook bridge is passed via `--hook <path>` in buildAgentArgs, not
+    // written into the project — nothing to install here.
+    return
+  }
   await installHooks(worktreePath, { skipGitignore: true })
 }
 
@@ -591,6 +596,12 @@ async function installRemoteAgentHooks(
     await commitRemoteCodexHooks(remote, snapshot)
     return
   }
+  if (tool === 'omp') {
+    // omp's hook bridge is installed as a plain file by bootstrapHost (see
+    // ompHookScriptPath) and passed via `--hook <path>` in buildAgentArgs —
+    // no settings/hooks JSON to merge into the remote worktree here.
+    return
+  }
   await installRemoteHooks(remote, worktreePath, notifyScriptPath)
 }
 
@@ -652,7 +663,7 @@ async function adoptRemoteWorktree(
 
   const branch = await remoteHostRuntime.withPreparedHost(
     host,
-    async ({ notifyScriptPath, agentPaths }) => {
+    async ({ notifyScriptPath, ompHookScriptPath, agentPaths }) => {
       const agentPath = agentPaths[tool]
       if (!agentPath) {
         throw new Error(`${tool} is not installed on host ${host.label || host.alias}`)
@@ -679,7 +690,11 @@ async function adoptRemoteWorktree(
         ).trim() || 'HEAD'
 
       await installRemoteAgentHooks(tool, host, worktreePath, notifyScriptPath)
-      await createRemotePty(id, worktreePath, host, { tool, agentPath })
+      await createRemotePty(id, worktreePath, host, {
+        tool,
+        agentPath,
+        notifyHookPath: ompHookScriptPath,
+      })
       return resolvedBranch
     }
   )
@@ -733,7 +748,7 @@ async function createRemoteSession(
 
   const branch = await remoteHostRuntime.withPreparedHost(
     host,
-    async ({ notifyScriptPath, agentPaths }) => {
+    async ({ notifyScriptPath, ompHookScriptPath, agentPaths }) => {
       const agentPath = agentPaths[effectiveTool]
       if (!agentPath) {
         throw new Error(`${effectiveTool} is not installed on host ${host.label || host.alias}`)
@@ -802,7 +817,11 @@ async function createRemoteSession(
         ).trim() || branchName
 
       await installRemoteAgentHooks(effectiveTool, host, worktreePath, notifyScriptPath)
-      await createRemotePty(id, worktreePath, host, { tool: effectiveTool, agentPath })
+      await createRemotePty(id, worktreePath, host, {
+        tool: effectiveTool,
+        agentPath,
+        notifyHookPath: ompHookScriptPath,
+      })
       return resolvedBranch
     }
   )
@@ -853,140 +872,149 @@ async function createRemotePrSession(
   const existing = findSessionOnWorktree(allSessions(), hostId, worktreePath)
   if (existing) return existing
 
-  return remoteHostRuntime.withPreparedHost(host, async ({ notifyScriptPath, agentPaths }) => {
-    const ghProbe = await probeRemoteGh(host)
-    if (!ghProbe.ok) {
-      return ghProbe.error
+  return remoteHostRuntime.withPreparedHost(
+    host,
+    async ({ notifyScriptPath, ompHookScriptPath, agentPaths }) => {
+      const ghProbe = await probeRemoteGh(host)
+      if (!ghProbe.ok) {
+        return ghProbe.error
+      }
+
+      // Target an explicit repo (a fork's upstream) when given so gh doesn't
+      // resolve the wrong default repo; the repo is passed as $3 and inlined only
+      // when present.
+      const externalRepo = options.repo || undefined
+      let prInfo: PrViewInfo
+      const viewResult = await execRemote(host, [
+        'sh',
+        '-c',
+        `cd "$1" && gh pr view "$2" --json ${PR_VIEW_FIELDS}${externalRepo ? ' --repo "$3"' : ''}`,
+        '_',
+        projectPath,
+        String(prNumber),
+        externalRepo ?? '',
+      ])
+      if (viewResult.timedOut || viewResult.code !== 0) {
+        const detail =
+          viewResult.stderr.trim() || viewResult.stdout.trim() || `exit ${viewResult.code}`
+        return describePrLookupFailure(prNumber, detail)
+      }
+      try {
+        prInfo = JSON.parse(viewResult.stdout)
+      } catch {
+        return `Failed to parse PR metadata for #${prNumber}.`
+      }
+
+      const planResult = planPrWorktree(prNumber, prInfo, externalRepo)
+      if (!planResult.ok) return planResult.message
+      const { branch, localBranch, isFork, forkFields, fetchRemote, fetchRefspec } = planResult.plan
+
+      const effectiveTool: AgentTool = options.tool ?? getConfig().defaultTool
+      const agentPath = agentPaths[effectiveTool]
+      if (!agentPath) {
+        return `${effectiveTool} is not installed on host ${host.label || host.alias}.`
+      }
+
+      const id = randomUUID().slice(0, 8)
+      const tmuxSession = `pewpew-${id}`
+
+      // Fetch the PR head into the local branch we'll check out; planPrWorktree
+      // picked the remote (origin, or the overridden repo's URL when a fork clone
+      // opens an upstream PR) and the refspec (a head-elsewhere PR head is
+      // force-fetched from refs/pull/<n>/head into its pewpew-namespaced branch, a
+      // same-repo head from origin/<branch>). A failure is tolerated — the branch
+      // may already be present locally, and a head-elsewhere PR that genuinely
+      // couldn't fetch is caught by the probe below.
+      const fetchResult = await execRemote(host, [
+        'git',
+        '-C',
+        projectPath,
+        'fetch',
+        fetchRemote,
+        fetchRefspec,
+      ]).catch(() => undefined)
+      // Keep the fetch's stderr: an override fetch runs over the upstream repo's
+      // URL (not origin), so an auth/transport failure surfaces here and would
+      // otherwise be lost behind the generic "could not fetch" message.
+      const fetchError =
+        fetchResult && fetchResult.code !== 0
+          ? fetchResult.stderr.trim() || `git fetch exited ${fetchResult.code}`
+          : undefined
+
+      // Pick the worktree-add form by probing for the local branch first instead
+      // of try-then-fallback. The fallback masked real failures (e.g. branch
+      // already checked out in a stale worktree) by surfacing the second
+      // attempt's misleading "branch already exists" error.
+      const branchExistsLocally = await remoteBranchExists(host, projectPath, localBranch)
+      if (isFork && !branchExistsLocally) {
+        // The pull-ref fetch should have created the pewpew/ branch; if it didn't
+        // there's no valid origin fallback for a head-elsewhere PR (origin/<branch>
+        // isn't the PR head).
+        return forkPullRefUnavailableMessage(branch, prNumber, fetchError)
+      }
+      const addArgv = branchExistsLocally
+        ? ['git', '-C', projectPath, 'worktree', 'add', worktreePath, localBranch]
+        : [
+            'git',
+            '-C',
+            projectPath,
+            'worktree',
+            'add',
+            worktreePath,
+            '-b',
+            localBranch,
+            `origin/${branch}`,
+          ]
+      try {
+        await expectRemoteOk(host, addArgv, 'Failed to create remote worktree')
+      } catch (err) {
+        return `Failed to create worktree for branch "${branch}": ${(err as Error).message}`
+      }
+
+      const resolvedBranch =
+        (
+          await expectRemoteOk(
+            host,
+            ['git', '-C', worktreePath, 'rev-parse', '--abbrev-ref', 'HEAD'],
+            'Failed to resolve remote branch'
+          )
+        ).trim() || branch
+
+      await installRemoteAgentHooks(effectiveTool, host, worktreePath, notifyScriptPath)
+      await createRemotePty(id, worktreePath, host, {
+        tool: effectiveTool,
+        agentPath,
+        notifyHookPath: ompHookScriptPath,
+      })
+
+      const session: Session = {
+        id,
+        hostId,
+        projectPath,
+        projectName: remoteProject.name,
+        worktreeName,
+        worktreePath,
+        branch: resolvedBranch,
+        prNumber,
+        ...forkFields,
+        issueNumber: parseIssueNumber(worktreeName, resolvedBranch, prInfo.title),
+        pid: 0,
+        tmuxSession,
+        status: 'running',
+        connectionState: 'live',
+        lastActivity: Date.now(),
+        hookEvents: [],
+        tool: effectiveTool,
+        ...(remoteProject.repoFingerprint
+          ? { repoFingerprint: remoteProject.repoFingerprint }
+          : {}),
+      }
+
+      sessions.set(id, { session })
+      onSessionsChanged()
+      return session
     }
-
-    // Target an explicit repo (a fork's upstream) when given so gh doesn't
-    // resolve the wrong default repo; the repo is passed as $3 and inlined only
-    // when present.
-    const externalRepo = options.repo || undefined
-    let prInfo: PrViewInfo
-    const viewResult = await execRemote(host, [
-      'sh',
-      '-c',
-      `cd "$1" && gh pr view "$2" --json ${PR_VIEW_FIELDS}${externalRepo ? ' --repo "$3"' : ''}`,
-      '_',
-      projectPath,
-      String(prNumber),
-      externalRepo ?? '',
-    ])
-    if (viewResult.timedOut || viewResult.code !== 0) {
-      const detail =
-        viewResult.stderr.trim() || viewResult.stdout.trim() || `exit ${viewResult.code}`
-      return describePrLookupFailure(prNumber, detail)
-    }
-    try {
-      prInfo = JSON.parse(viewResult.stdout)
-    } catch {
-      return `Failed to parse PR metadata for #${prNumber}.`
-    }
-
-    const planResult = planPrWorktree(prNumber, prInfo, externalRepo)
-    if (!planResult.ok) return planResult.message
-    const { branch, localBranch, isFork, forkFields, fetchRemote, fetchRefspec } = planResult.plan
-
-    const effectiveTool: AgentTool = options.tool ?? getConfig().defaultTool
-    const agentPath = agentPaths[effectiveTool]
-    if (!agentPath) {
-      return `${effectiveTool} is not installed on host ${host.label || host.alias}.`
-    }
-
-    const id = randomUUID().slice(0, 8)
-    const tmuxSession = `pewpew-${id}`
-
-    // Fetch the PR head into the local branch we'll check out; planPrWorktree
-    // picked the remote (origin, or the overridden repo's URL when a fork clone
-    // opens an upstream PR) and the refspec (a head-elsewhere PR head is
-    // force-fetched from refs/pull/<n>/head into its pewpew-namespaced branch, a
-    // same-repo head from origin/<branch>). A failure is tolerated — the branch
-    // may already be present locally, and a head-elsewhere PR that genuinely
-    // couldn't fetch is caught by the probe below.
-    const fetchResult = await execRemote(host, [
-      'git',
-      '-C',
-      projectPath,
-      'fetch',
-      fetchRemote,
-      fetchRefspec,
-    ]).catch(() => undefined)
-    // Keep the fetch's stderr: an override fetch runs over the upstream repo's
-    // URL (not origin), so an auth/transport failure surfaces here and would
-    // otherwise be lost behind the generic "could not fetch" message.
-    const fetchError =
-      fetchResult && fetchResult.code !== 0
-        ? fetchResult.stderr.trim() || `git fetch exited ${fetchResult.code}`
-        : undefined
-
-    // Pick the worktree-add form by probing for the local branch first instead
-    // of try-then-fallback. The fallback masked real failures (e.g. branch
-    // already checked out in a stale worktree) by surfacing the second
-    // attempt's misleading "branch already exists" error.
-    const branchExistsLocally = await remoteBranchExists(host, projectPath, localBranch)
-    if (isFork && !branchExistsLocally) {
-      // The pull-ref fetch should have created the pewpew/ branch; if it didn't
-      // there's no valid origin fallback for a head-elsewhere PR (origin/<branch>
-      // isn't the PR head).
-      return forkPullRefUnavailableMessage(branch, prNumber, fetchError)
-    }
-    const addArgv = branchExistsLocally
-      ? ['git', '-C', projectPath, 'worktree', 'add', worktreePath, localBranch]
-      : [
-          'git',
-          '-C',
-          projectPath,
-          'worktree',
-          'add',
-          worktreePath,
-          '-b',
-          localBranch,
-          `origin/${branch}`,
-        ]
-    try {
-      await expectRemoteOk(host, addArgv, 'Failed to create remote worktree')
-    } catch (err) {
-      return `Failed to create worktree for branch "${branch}": ${(err as Error).message}`
-    }
-
-    const resolvedBranch =
-      (
-        await expectRemoteOk(
-          host,
-          ['git', '-C', worktreePath, 'rev-parse', '--abbrev-ref', 'HEAD'],
-          'Failed to resolve remote branch'
-        )
-      ).trim() || branch
-
-    await installRemoteAgentHooks(effectiveTool, host, worktreePath, notifyScriptPath)
-    await createRemotePty(id, worktreePath, host, { tool: effectiveTool, agentPath })
-
-    const session: Session = {
-      id,
-      hostId,
-      projectPath,
-      projectName: remoteProject.name,
-      worktreeName,
-      worktreePath,
-      branch: resolvedBranch,
-      prNumber,
-      ...forkFields,
-      issueNumber: parseIssueNumber(worktreeName, resolvedBranch, prInfo.title),
-      pid: 0,
-      tmuxSession,
-      status: 'running',
-      connectionState: 'live',
-      lastActivity: Date.now(),
-      hookEvents: [],
-      tool: effectiveTool,
-      ...(remoteProject.repoFingerprint ? { repoFingerprint: remoteProject.repoFingerprint } : {}),
-    }
-
-    sessions.set(id, { session })
-    onSessionsChanged()
-    return session
-  })
+  )
 }
 
 export async function createSession(
@@ -1465,7 +1493,7 @@ export async function reviveSession(id: string): Promise<void> {
     session.connectionState = 'connecting'
     onSessionsChanged()
     try {
-      await remoteHostRuntime.withPreparedHost(host, async ({ agentPaths }) => {
+      await remoteHostRuntime.withPreparedHost(host, async ({ agentPaths, ompHookScriptPath }) => {
         if (await hasRemoteTmuxSession(id, host)) {
           await reattachRemotePty(id, host)
         } else {
@@ -1484,6 +1512,7 @@ export async function reviveSession(id: string): Promise<void> {
             tool: session.tool,
             agentSessionId: session.agentSessionId,
             agentPath,
+            notifyHookPath: ompHookScriptPath,
           })
         }
       })
@@ -1523,9 +1552,12 @@ export async function reviveSession(id: string): Promise<void> {
 // Decides whether resuming an agent will work. For claude, --continue exits
 // non-zero when there's no per-worktree project directory in ~/.claude/projects,
 // killing the tmux pane on spawn. For codex, `codex resume <id>` requires the
-// captured agentSessionId from the SessionStart hook.
+// captured agentSessionId from the SessionStart hook. omp's `--continue` is
+// cwd-scoped like claude's (no session id capture needed), so it gets the same
+// filesystem-history gate, just against omp's own session directory.
 function canResumeAgent(session: Session): boolean {
   if (session.tool === 'codex') return !!session.agentSessionId
+  if (session.tool === 'omp') return hasOmpConversationHistory(session.worktreePath)
   return hasClaudeConversationHistory(session.worktreePath)
 }
 
@@ -1537,6 +1569,7 @@ function canResumeAgent(session: Session): boolean {
 // nothing to resume, matching the local guard.
 async function canResumeRemoteAgent(session: Session, host: Host): Promise<boolean> {
   if (session.tool === 'codex') return !!session.agentSessionId
+  if (session.tool === 'omp') return hasRemoteOmpConversationHistory(host, session.worktreePath)
   return hasRemoteClaudeConversationHistory(host, session.worktreePath)
 }
 
@@ -1631,6 +1664,17 @@ export async function removeWorktree(id: string): Promise<void> {
 export async function removeSession(id: string): Promise<void> {
   const entry = sessions.get(id)
   reconnectScheduler.cancel(id)
+  // Suppress a racing session.end → promptCleanup dialog: destroyPty/
+  // destroyRemotePty below deliver a real kill signal to the agent process
+  // (unlike killSession's detach-only local path), and some tools' hooks
+  // complete fast enough over that signal to land while removeWorktree's git
+  // subprocess is still running — before this session is even out of the
+  // `sessions` map. Without this guard that races the explicit, dialog-free
+  // delete here against a "clean up worktree?" prompt for a worktree that's
+  // already being (or already was) force-removed. Safe to leave set forever
+  // once we reach here — the session is deleted from `sessions` below and can
+  // never be revived, unlike a killSession'd one.
+  cleanupInProgress.add(id)
   if (entry?.session.hostId) {
     const host = getRequiredHost(entry.session.hostId)
     await destroyRemotePty(id, host)
@@ -2054,96 +2098,108 @@ async function createRemoteIssueSession(
   const existing = findSessionOnWorktree(allSessions(), hostId, worktreePath)
   if (existing) return existing
 
-  return remoteHostRuntime.withPreparedHost(host, async ({ notifyScriptPath, agentPaths }) => {
-    const effectiveTool: AgentTool = options.tool ?? getConfig().defaultTool
-    const agentPath = agentPaths[effectiveTool]
-    if (!agentPath) {
-      return `${effectiveTool} is not installed on host ${host.label || host.alias}.`
-    }
-
-    const id = randomUUID().slice(0, 8)
-    const tmuxSession = `pewpew-${id}`
-    let originRef: string
-    try {
-      originRef = await resolveOriginDefaultBase((argv) =>
-        expectRemoteOk(host, ['git', '-C', projectPath, ...argv], 'git failed').then((stdout) => ({
-          stdout,
-        }))
-      )
-    } catch (err) {
-      const msg = (err as Error).message
-      if (msg === 'no-origin-remote') return 'This project has no origin remote.'
-      if (msg === 'no-origin-default-branch') return "Could not determine origin's default branch."
-      return `Failed to resolve origin default: ${msg}`
-    }
-
-    try {
-      await expectRemoteOk(
-        host,
-        [
-          'git',
-          '-C',
-          projectPath,
-          'worktree',
-          'add',
-          worktreePath,
-          '--no-track',
-          '-b',
-          branch,
-          originRef,
-        ],
-        'Failed to create remote worktree'
-      )
-    } catch (err) {
-      if (!(await remoteBranchExists(host, projectPath, branch))) {
-        return `Failed to create worktree for branch "${branch}": ${(err as Error).message}`
+  return remoteHostRuntime.withPreparedHost(
+    host,
+    async ({ notifyScriptPath, ompHookScriptPath, agentPaths }) => {
+      const effectiveTool: AgentTool = options.tool ?? getConfig().defaultTool
+      const agentPath = agentPaths[effectiveTool]
+      if (!agentPath) {
+        return `${effectiveTool} is not installed on host ${host.label || host.alias}.`
       }
+
+      const id = randomUUID().slice(0, 8)
+      const tmuxSession = `pewpew-${id}`
+      let originRef: string
+      try {
+        originRef = await resolveOriginDefaultBase((argv) =>
+          expectRemoteOk(host, ['git', '-C', projectPath, ...argv], 'git failed').then(
+            (stdout) => ({
+              stdout,
+            })
+          )
+        )
+      } catch (err) {
+        const msg = (err as Error).message
+        if (msg === 'no-origin-remote') return 'This project has no origin remote.'
+        if (msg === 'no-origin-default-branch')
+          return "Could not determine origin's default branch."
+        return `Failed to resolve origin default: ${msg}`
+      }
+
       try {
         await expectRemoteOk(
           host,
-          ['git', '-C', projectPath, 'worktree', 'add', worktreePath, branch],
+          [
+            'git',
+            '-C',
+            projectPath,
+            'worktree',
+            'add',
+            worktreePath,
+            '--no-track',
+            '-b',
+            branch,
+            originRef,
+          ],
           'Failed to create remote worktree'
         )
-      } catch (fallbackErr) {
-        return `Failed to create worktree for branch "${branch}": ${(fallbackErr as Error).message}`
+      } catch (err) {
+        if (!(await remoteBranchExists(host, projectPath, branch))) {
+          return `Failed to create worktree for branch "${branch}": ${(err as Error).message}`
+        }
+        try {
+          await expectRemoteOk(
+            host,
+            ['git', '-C', projectPath, 'worktree', 'add', worktreePath, branch],
+            'Failed to create remote worktree'
+          )
+        } catch (fallbackErr) {
+          return `Failed to create worktree for branch "${branch}": ${(fallbackErr as Error).message}`
+        }
       }
+
+      const resolvedBranch =
+        (
+          await expectRemoteOk(
+            host,
+            ['git', '-C', worktreePath, 'rev-parse', '--abbrev-ref', 'HEAD'],
+            'Failed to resolve remote branch'
+          )
+        ).trim() || branch
+
+      await installRemoteAgentHooks(effectiveTool, host, worktreePath, notifyScriptPath)
+      await createRemotePty(id, worktreePath, host, {
+        tool: effectiveTool,
+        agentPath,
+        notifyHookPath: ompHookScriptPath,
+      })
+
+      const session: Session = {
+        id,
+        hostId,
+        projectPath,
+        projectName: remoteProject.name,
+        worktreeName,
+        worktreePath,
+        branch: resolvedBranch,
+        issueNumber,
+        pid: 0,
+        tmuxSession,
+        status: 'running',
+        connectionState: 'live',
+        lastActivity: Date.now(),
+        hookEvents: [],
+        tool: effectiveTool,
+        ...(remoteProject.repoFingerprint
+          ? { repoFingerprint: remoteProject.repoFingerprint }
+          : {}),
+      }
+
+      sessions.set(id, { session })
+      onSessionsChanged()
+      return session
     }
-
-    const resolvedBranch =
-      (
-        await expectRemoteOk(
-          host,
-          ['git', '-C', worktreePath, 'rev-parse', '--abbrev-ref', 'HEAD'],
-          'Failed to resolve remote branch'
-        )
-      ).trim() || branch
-
-    await installRemoteAgentHooks(effectiveTool, host, worktreePath, notifyScriptPath)
-    await createRemotePty(id, worktreePath, host, { tool: effectiveTool, agentPath })
-
-    const session: Session = {
-      id,
-      hostId,
-      projectPath,
-      projectName: remoteProject.name,
-      worktreeName,
-      worktreePath,
-      branch: resolvedBranch,
-      issueNumber,
-      pid: 0,
-      tmuxSession,
-      status: 'running',
-      connectionState: 'live',
-      lastActivity: Date.now(),
-      hookEvents: [],
-      tool: effectiveTool,
-      ...(remoteProject.repoFingerprint ? { repoFingerprint: remoteProject.repoFingerprint } : {}),
-    }
-
-    sessions.set(id, { session })
-    onSessionsChanged()
-    return session
-  })
+  )
 }
 
 export async function openSessionsForOpenPrs(
@@ -2289,6 +2345,76 @@ async function hasRemoteClaudeConversationHistory(
     'p=$(CDPATH= cd -P -- "$1" 2>/dev/null && pwd -P); [ -n "$p" ] || p="$1"; ' +
     "enc=$(printf '%s' \"$p\" | sed 's/[^a-zA-Z0-9-]/-/g'); " +
     '[ -d "$HOME/.claude/projects/$enc" ]'
+  try {
+    const result = await execRemote(host, ['sh', '-c', script, '_', worktreePath], {
+      timeoutMs: 10000,
+    })
+    return !result.timedOut && result.code === 0
+  } catch {
+    return false
+  }
+}
+
+// omp (oh-my-pi) stores per-cwd session history under
+// `~/.omp/agent/sessions/<encoded>/`, where <encoded> is NOT a simple
+// full-path substitution like Claude's. Ported from omp's own encoder
+// (packages/coding-agent/src/session/session-paths.ts,
+// getDefaultSessionDirName/encodeRelativeSessionDirName): canonicalize both
+// cwd and $HOME, take cwd relative to home, and if that relative path doesn't
+// escape upward (i.e. cwd is under home), prefix it with '-' and replace path
+// separators with '-' (cwd === home itself encodes to just '-'). A cwd outside
+// home falls back to a tmp-root-relative or legacy `--<path>--` encoding;
+// pewpew worktrees can in principle live outside $HOME, so both are ported
+// too rather than assumed away.
+function encodeOmpSessionDirName(cwd: string): string {
+  const resolvedCwd = canonicalPath(cwd)
+  const home = canonicalPath(homedir())
+  const tempRoot = canonicalPath(tmpdir())
+  const homeRelative = relative(home, resolvedCwd)
+  if (homeRelative === '' || (!homeRelative.startsWith('..') && !isAbsolute(homeRelative))) {
+    return encodeOmpRelativeSessionDirName('-', homeRelative)
+  }
+  const tempRelative = relative(tempRoot, resolvedCwd)
+  if (tempRelative === '' || (!tempRelative.startsWith('..') && !isAbsolute(tempRelative))) {
+    return encodeOmpRelativeSessionDirName('-tmp', tempRelative)
+  }
+  return `--${resolvedCwd.replace(/^[/\\]/, '').replace(/[/\\:]/g, '-')}--`
+}
+
+function encodeOmpRelativeSessionDirName(prefix: string, relativePath: string): string {
+  const encoded = relativePath.replace(/[/\\:]/g, '-')
+  if (!encoded) return prefix
+  return prefix.endsWith('-') ? `${prefix}${encoded}` : `${prefix}-${encoded}`
+}
+
+function hasOmpConversationHistory(worktreePath: string): boolean {
+  const encoded = encodeOmpSessionDirName(worktreePath)
+  return existsSync(join(homedir(), '.omp', 'agent', 'sessions', encoded))
+}
+
+// Remote analogue of hasOmpConversationHistory, mirroring the same
+// home-relative / tmp-relative / legacy-absolute encoding in POSIX shell.
+// Canonicalizes cwd, $HOME, and the temp root with `cd -P`/`pwd -P` (portable,
+// unlike GNU-only `readlink -f`), then pattern-matches which root the cwd
+// falls under via `case`. Any SSH/probe failure returns false, so revival
+// falls back to a fresh spawn rather than risk `omp --continue` exiting
+// immediately on a directory that doesn't exist yet.
+async function hasRemoteOmpConversationHistory(host: Host, worktreePath: string): Promise<boolean> {
+  const script =
+    'canon() { CDPATH= cd -P -- "$1" 2>/dev/null && pwd -P; }; ' +
+    'p=$(canon "$1"); [ -n "$p" ] || p="$1"; ' +
+    'h=$(canon "$HOME"); [ -n "$h" ] || h="$HOME"; ' +
+    'case "$p" in ' +
+    '"$h") enc="-" ;; ' +
+    '"$h"/*) rel=${p#"$h"/}; enc="-$(printf \'%s\' "$rel" | sed \'s/[\\/\\\\:]/-/g\')" ;; ' +
+    '*) t=$(canon "${TMPDIR:-/tmp}"); [ -n "$t" ] || t="${TMPDIR:-/tmp}"; ' +
+    'case "$p" in ' +
+    '"$t") enc="-tmp" ;; ' +
+    '"$t"/*) rel=${p#"$t"/}; enc="-tmp-$(printf \'%s\' "$rel" | sed \'s/[\\/\\\\:]/-/g\')" ;; ' +
+    '*) enc="--$(printf \'%s\' "$p" | sed \'s/^[\\/\\\\]//; s/[\\/\\\\:]/-/g\')--" ;; ' +
+    'esac ;; ' +
+    'esac; ' +
+    '[ -d "$h/.omp/agent/sessions/$enc" ]'
   try {
     const result = await execRemote(host, ['sh', '-c', script, '_', worktreePath], {
       timeoutMs: 10000,

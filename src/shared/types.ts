@@ -1,6 +1,11 @@
 export type SessionStatus = 'running' | 'needs_input' | 'idle' | 'completed' | 'error' | 'dead'
 export type ConnectionState =
-  'connecting' | 'live' | 'offline' | 'pending' | 'auth-failed' | 'unreachable'
+  | 'connecting'
+  | 'live'
+  | 'offline'
+  | 'pending'
+  | 'auth-failed'
+  | 'unreachable'
 
 export interface LastKnownState {
   text: string
@@ -23,7 +28,7 @@ export interface Worktree {
   isMain: boolean
 }
 
-export type AgentTool = 'claude' | 'codex'
+export type AgentTool = 'claude' | 'codex' | 'omp'
 
 export type Theme = 'dark' | 'light'
 
@@ -141,7 +146,7 @@ export interface TestConnectionResult {
   message?: string
   // Populated when the connection succeeds and the host could be probed.
   // requiredDeps are the tools pewpew strictly needs (tmux, git, jq, socat);
-  // agentTools are the optional agent CLIs (claude, codex), shown for info.
+  // agentTools are the optional agent CLIs (claude, codex, omp), shown for info.
   requiredDeps?: DependencyStatus[]
   agentTools?: DependencyStatus[]
 }
@@ -154,7 +159,11 @@ export interface RemoteProject {
 }
 
 export type ValidateRemoteRepoReason =
-  'not-a-git-repo' | 'auth-failed' | 'network' | 'dep-missing' | 'unknown'
+  | 'not-a-git-repo'
+  | 'auth-failed'
+  | 'network'
+  | 'dep-missing'
+  | 'unknown'
 
 export interface ValidateRemoteRepoResult {
   ok: boolean

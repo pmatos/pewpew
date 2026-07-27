@@ -3,6 +3,7 @@ import {
   bootstrapHost,
   HostBootstrapError,
   NOTIFY_SCRIPT_VERSION,
+  OMP_HOOK_SCRIPT_VERSION,
   probeMissingDeps,
   resolveRemoteAgents,
   STRICT_DEPS,
@@ -16,14 +17,22 @@ function ok(stdout = ''): ExecResult {
 }
 
 interface FakeOpts {
-  // Per-agent path the resolve script "discovers". '' means not found.
-  resolved?: { claude?: string; codex?: string }
+  // Per-agent path the resolve script "discovers". '' or absent means not found.
+  resolved?: { claude?: string; codex?: string; omp?: string }
   // Override what the resolve script sees as cached input on each call.
-  onResolve?: (cachedClaude: string, cachedCodex: string) => { claude: string; codex: string }
+  onResolve?: (
+    cachedClaude: string,
+    cachedCodex: string,
+    cachedOmp: string
+  ) => { claude: string; codex: string; omp: string }
 }
 
 function fakeConnection(calls: string[][], opts: FakeOpts = {}): HostBootstrapConnection {
-  const resolved = opts.resolved ?? { claude: '/usr/bin/claude', codex: '/usr/bin/codex' }
+  const resolved = {
+    claude: opts.resolved?.claude ?? '/usr/bin/claude',
+    codex: opts.resolved?.codex ?? '/usr/bin/codex',
+    omp: opts.resolved?.omp ?? '',
+  }
   return {
     exec: async (argv) => {
       calls.push(argv)
@@ -36,10 +45,9 @@ function fakeConnection(calls: string[][], opts: FakeOpts = {}): HostBootstrapCo
       if (script.includes('resolve_one claude')) {
         const cachedClaude = argv[4] ?? ''
         const cachedCodex = argv[5] ?? ''
-        const out = opts.onResolve
-          ? opts.onResolve(cachedClaude, cachedCodex)
-          : { claude: resolved.claude ?? '', codex: resolved.codex ?? '' }
-        return ok(`${out.claude}\n${out.codex}\n`)
+        const cachedOmp = argv[6] ?? ''
+        const out = opts.onResolve ? opts.onResolve(cachedClaude, cachedCodex, cachedOmp) : resolved
+        return ok(`${out.claude}\n${out.codex}\n${out.omp}\n`)
       }
       if (script === 'test -S "$1"') return ok()
       if (script.includes('XDG_CONFIG_HOME')) return ok('/home/dev/.config')
@@ -60,6 +68,7 @@ describe('bootstrapHost', () => {
 
     expect(result).toEqual({
       notifyScriptPath: '/home/dev/.config/pewpew/hooks/notify-v1.sh',
+      ompHookScriptPath: '/home/dev/.config/pewpew/hooks/omp-notify-v1.ts',
       remoteSocketPath: '/tmp/ipc',
       agentPaths: { claude: '/usr/bin/claude', codex: '/usr/bin/codex' },
     })
@@ -106,6 +115,45 @@ describe('bootstrapHost', () => {
       '/tmp/ipc'
     )
     expect(result.agentPaths).toEqual({ codex: '/usr/bin/codex' })
+  })
+
+  it('installs the omp hook bridge as a separate file with the notify script path baked in', async () => {
+    const calls: string[][] = []
+    const result = await bootstrapHost('host-bootstrap-omp-hook', fakeConnection(calls), '/tmp/ipc')
+
+    expect(result.ompHookScriptPath).toBe('/home/dev/.config/pewpew/hooks/omp-notify-v1.ts')
+    const ompInstallCall = calls.find((argv) => argv[2]?.includes('PEWPEW_OMP_HOOK_VERSION'))
+    expect(ompInstallCall).toBeDefined()
+    expect(ompInstallCall?.[4]).toBe('/home/dev/.config/pewpew/hooks')
+    expect(ompInstallCall?.[5]).toBe(result.ompHookScriptPath)
+    // The bridge source has the resolved notify.sh path baked in as a literal.
+    expect(ompInstallCall?.[6]).toContain(JSON.stringify(result.notifyScriptPath))
+    expect(ompInstallCall?.[7]).toBe(String(OMP_HOOK_SCRIPT_VERSION))
+    // Reinstall guard also keys on the current notifyScriptPath (arg $5), not
+    // just the bridge's own version marker — so bumping NOTIFY_SCRIPT_VERSION
+    // alone still forces a reinstall of an already-installed bridge that would
+    // otherwise keep pointing at a notify.sh path that no longer exists.
+    expect(ompInstallCall?.[8]).toBe(result.notifyScriptPath)
+    expect(ompInstallCall?.[2]).toContain('grep -qF "$5"')
+  })
+
+  it('resolves omp in addition to claude and codex, at the correct ordinal position', async () => {
+    const calls: string[][] = []
+    const result = await bootstrapHost(
+      'host-bootstrap-with-omp',
+      fakeConnection(calls, {
+        resolved: { claude: '/usr/bin/claude', codex: '/usr/bin/codex', omp: '/usr/bin/omp' },
+      }),
+      '/tmp/ipc'
+    )
+
+    expect(result.agentPaths).toEqual({
+      claude: '/usr/bin/claude',
+      codex: '/usr/bin/codex',
+      omp: '/usr/bin/omp',
+    })
+    const resolveCall = calls.find((argv) => argv.some((a) => a.includes('resolve_one omp')))
+    expect(resolveCall?.[2]).toContain('resolve_one omp "$3"')
   })
 
   it('installs through a version guard so already-installed notify scripts are kept', async () => {
@@ -170,10 +218,12 @@ describe('bootstrapHost', () => {
       codex: '/u/.npm/codex',
     })
 
-    // Heavy install path should have run only once.
-    const installCalls = calls.filter((argv) =>
-      argv.some((part) => part.includes(`notify-v${NOTIFY_SCRIPT_VERSION}.sh`))
-    )
+    // Heavy install path should have run only once. Matched on the notify.sh
+    // installer's own version-guard marker in its script body (argv[2]) rather
+    // than a `notify-v1.sh` substring anywhere in argv — the omp hook install
+    // call also carries that path (embedded inside its bridge source as the
+    // NOTIFY_SCRIPT constant), which a substring match would double-count.
+    const installCalls = calls.filter((argv) => argv[2]?.includes('PEWPEW_NOTIFY_VERSION'))
     expect(installCalls).toHaveLength(1)
   })
 
@@ -251,36 +301,42 @@ describe('resolveRemoteAgents', () => {
     const conn: HostBootstrapConnection = {
       exec: async (argv) => {
         calls.push(argv)
-        return ok('/u/bin/claude\n/u/bin/codex\n')
+        return ok('/u/bin/claude\n/u/bin/codex\n/u/bin/omp\n')
       },
     }
     const result = await resolveRemoteAgents(conn)
-    expect(result).toEqual({ claude: '/u/bin/claude', codex: '/u/bin/codex' })
+    expect(result).toEqual({ claude: '/u/bin/claude', codex: '/u/bin/codex', omp: '/u/bin/omp' })
     // Cached args default to empty.
     expect(calls[0][4]).toBe('')
     expect(calls[0][5]).toBe('')
+    expect(calls[0][6]).toBe('')
   })
 
   it('omits agents the script returned empty for', async () => {
     const conn: HostBootstrapConnection = {
-      exec: async () => ok('\n/u/bin/codex\n'),
+      exec: async () => ok('\n/u/bin/codex\n\n'),
     }
     const result = await resolveRemoteAgents(conn)
     expect(result).toEqual({ codex: '/u/bin/codex' })
   })
 
-  it('threads cached paths through to the script as positional args', async () => {
+  it('threads cached paths through to the script as positional args, in AGENT_TOOLS order', async () => {
     const calls: string[][] = []
     const conn: HostBootstrapConnection = {
       exec: async (argv) => {
         calls.push(argv)
-        return ok('/cached/claude\n/cached/codex\n')
+        return ok('/cached/claude\n/cached/codex\n/cached/omp\n')
       },
     }
-    const cached: AgentResolution = { claude: '/cached/claude', codex: '/cached/codex' }
+    const cached: AgentResolution = {
+      claude: '/cached/claude',
+      codex: '/cached/codex',
+      omp: '/cached/omp',
+    }
     const result = await resolveRemoteAgents(conn, cached)
     expect(calls[0][4]).toBe('/cached/claude')
     expect(calls[0][5]).toBe('/cached/codex')
+    expect(calls[0][6]).toBe('/cached/omp')
     expect(result).toEqual(cached)
   })
 

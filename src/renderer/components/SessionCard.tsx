@@ -1,10 +1,16 @@
 import { useState, useEffect } from 'react'
-import type { Session } from '../../shared/types'
+import type { AgentTool, Session } from '../../shared/types'
 import { useProjectsStore } from '../stores/projects'
 import { useSessionsStore } from '../stores/sessions'
 import { useHostsStore } from '../stores/hosts'
 import { STATUS_CONFIG } from '../utils/status-config'
 import ContextMenu, { type MenuItem } from './ContextMenu'
+
+const TOOL_BADGE: Record<AgentTool, { label: string; letter: string }> = {
+  claude: { label: 'Claude', letter: 'C' },
+  codex: { label: 'Codex', letter: 'X' },
+  omp: { label: 'oh-my-pi', letter: 'O' },
+}
 
 function timeAgo(ts: number): string {
   const diff = Math.floor((Date.now() - ts) / 1000)
@@ -232,9 +238,9 @@ export default function SessionCard({ session, thumbnail, style, onOpenSession, 
           <span>{label}</span>
           <span
             className={`tool-badge tool-${session.tool}`}
-            title={session.tool === 'codex' ? 'Codex' : 'Claude'}
+            title={TOOL_BADGE[session.tool].label}
           >
-            {session.tool === 'codex' ? 'X' : 'C'}
+            {TOOL_BADGE[session.tool].letter}
           </span>
           {host && connectionState && <span className="connection-label">{connectionState}</span>}
         </div>

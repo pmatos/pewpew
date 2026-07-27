@@ -172,6 +172,12 @@ function installNotifyScript(): void {
   const dest = join(hooksDir, 'notify.sh')
   copyFileSync(src, dest)
   chmodSync(dest, 0o755)
+
+  // omp's hook bridge — see OMP_HOOK_SCRIPT in hook-installer.ts. Just a file
+  // copy: omp loads it directly via `--hook <path>`, no settings merge needed.
+  const ompSrc = join(__dirname, '../../hooks/omp-notify.ts')
+  const ompDest = join(hooksDir, 'omp-notify.ts')
+  copyFileSync(ompSrc, ompDest)
 }
 
 // Tracks the last auto-reload per window so a renderer that crashes again right

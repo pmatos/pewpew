@@ -24,6 +24,8 @@ const state = vi.hoisted(() => ({
     cwd: string
     hostId: string
     continueSession?: boolean
+    tool?: AgentTool
+    notifyHookPath?: string
   }[],
   reattachRemotePtyCalls: [] as { sessionId: string; hostId: string }[],
   createPtyCalls: [] as { sessionId: string; cwd: string }[],
@@ -53,6 +55,9 @@ const state = vi.hoisted(() => ({
   // (hasRemoteClaudeConversationHistory). true → directory present (resume),
   // false → absent (spawn fresh). Unset falls through to the default code 0.
   claudeHistoryProbeResult: new Map<string, boolean>(),
+  // Same shape as claudeHistoryProbeResult, for the remote omp equivalent
+  // (hasRemoteOmpConversationHistory).
+  ompHistoryProbeResult: new Map<string, boolean>(),
   // Toggle to simulate ensureHostConnection throwing.
   ensureHostConnectionThrows: null as null | { message: string; runtimeStateAfter: string },
   // When set, delays next ensureHostConnection resolution (used for idempotency
@@ -111,12 +116,14 @@ vi.mock('./notifications', () => ({
   },
 }))
 
+const showMessageBoxMock = vi.fn(async (..._args: unknown[]) => {
+  if (state.dialogThrows) throw new Error('dialog failed')
+  return { response: state.dialogResponse }
+})
+
 vi.mock('electron', () => ({
   dialog: {
-    showMessageBox: async () => {
-      if (state.dialogThrows) throw new Error('dialog failed')
-      return { response: state.dialogResponse }
-    },
+    showMessageBox: showMessageBoxMock,
   },
   shell: {
     openPath: async () => '',
@@ -163,7 +170,8 @@ vi.mock('./host-bootstrap', () => ({
   },
   bootstrapHost: vi.fn(async () => ({
     notifyScriptPath: '/tmp/notify-v1.sh',
-    agentPaths: { claude: '/r/bin/claude', codex: '/r/bin/codex' },
+    ompHookScriptPath: '/tmp/omp-notify-v1.ts',
+    agentPaths: { claude: '/r/bin/claude', codex: '/r/bin/codex', omp: '/r/bin/omp' },
   })),
 }))
 
@@ -208,13 +216,15 @@ vi.mock('./pty-manager', () => ({
     sessionId: string,
     cwd: string,
     host: Host,
-    options?: { continueSession?: boolean }
+    options?: { continueSession?: boolean; tool?: AgentTool; notifyHookPath?: string }
   ) => {
     state.createRemotePtyCalls.push({
       sessionId,
       cwd,
       hostId: host.hostId,
       continueSession: options?.continueSession,
+      tool: options?.tool,
+      notifyHookPath: options?.notifyHookPath,
     })
     state.runtimeRefs.set(host.hostId, (state.runtimeRefs.get(host.hostId) ?? 0) + 1)
   },
@@ -243,6 +253,17 @@ vi.mock('./host-connection', () => ({
     // multi-segment) probe command. The probed worktree path is the last arg.
     if (argv[0] === 'sh' && typeof argv[2] === 'string' && argv[2].includes('.claude/projects')) {
       const present = state.claudeHistoryProbeResult.get(argv[argv.length - 1])
+      if (present !== undefined) {
+        return { stdout: '', stderr: '', code: present ? 0 : 1, timedOut: false }
+      }
+    }
+    // Same shape as the claude probe above, for hasRemoteOmpConversationHistory.
+    if (
+      argv[0] === 'sh' &&
+      typeof argv[2] === 'string' &&
+      argv[2].includes('.omp/agent/sessions')
+    ) {
+      const present = state.ompHistoryProbeResult.get(argv[argv.length - 1])
       if (present !== undefined) {
         return { stdout: '', stderr: '', code: present ? 0 : 1, timedOut: false }
       }
@@ -358,6 +379,7 @@ beforeEach(() => {
   state.execRemoteCalls = []
   state.execRemoteResults = new Map()
   state.claudeHistoryProbeResult = new Map()
+  state.ompHistoryProbeResult = new Map()
   state.ensureHostConnectionThrows = null
   state.ensureHostConnectionGate = null
   state.unexpectedExitListener = null
@@ -366,6 +388,7 @@ beforeEach(() => {
   state.hasPtyResult = new Set()
   state.dialogResponse = 1
   state.dialogThrows = false
+  showMessageBoxMock.mockClear()
 })
 
 afterEach(() => {
@@ -459,7 +482,13 @@ describe('createRemoteSessionForWorktree (adopt remote worktree)', () => {
     expect(session.connectionState).toBe('live')
     expect(session.tool).toBe('claude')
     expect(state.createRemotePtyCalls).toEqual([
-      { sessionId: session.id, cwd: worktreePath, hostId: 'h1' },
+      {
+        sessionId: session.id,
+        cwd: worktreePath,
+        hostId: 'h1',
+        tool: 'claude',
+        notifyHookPath: '/tmp/omp-notify-v1.ts',
+      },
     ])
     const ranWorktreeAdd = state.execRemoteCalls.some(
       (c) => c.argv[0] === 'git' && c.argv.includes('worktree') && c.argv.includes('add')
@@ -1180,6 +1209,35 @@ describe('reconnectRemoteSession', () => {
   })
 })
 
+describe('removeSession', () => {
+  // Regression: destroyPty/destroyRemotePty deliver a real kill signal to the
+  // agent process (unlike killSession's detach-only local path), and some
+  // tools' SessionEnd-equivalent hook completes fast enough over that signal
+  // to land while removeWorktree's git subprocess is still running below —
+  // before the session is even out of the `sessions` map. Without
+  // removeSession adding to cleanupInProgress up front, that races the
+  // explicit, dialog-free delete here against a "clean up worktree?" prompt
+  // for a worktree already being (or already) force-removed.
+  it('suppresses a racing session.end dialog while tearing down the worktree', async () => {
+    const local = baseLocalSession({ id: 'l1', status: 'idle' })
+    mkdirSync(local.worktreePath, { recursive: true })
+    writeSessionsJson([local])
+    const sm = await loadSessionManager()
+    sm.restoreSessions()
+
+    const removePromise = sm.removeSession('l1')
+    // removeSession's synchronous prefix (cleanupInProgress.add) has already
+    // run by this point — JS doesn't yield until removeSession's first await
+    // — so promptCleanup's own guard is guaranteed to see it below.
+    sm.handleHookEvent('session.end', { cwd: local.worktreePath }, null)
+
+    await removePromise
+
+    expect(showMessageBoxMock).not.toHaveBeenCalled()
+    expect(sm.getSessions()).toEqual([])
+  })
+})
+
 describe('probePendingSessionsOnHost', () => {
   function threePendingOnH1(): Session[] {
     return [
@@ -1737,7 +1795,14 @@ describe('reviveSession — remote resume fallback', () => {
     await sm.reviveSession('r1')
 
     expect(state.createRemotePtyCalls).toEqual([
-      { sessionId: 'r1', cwd: remote.worktreePath, hostId: 'h1', continueSession: false },
+      {
+        sessionId: 'r1',
+        cwd: remote.worktreePath,
+        hostId: 'h1',
+        continueSession: false,
+        tool: 'claude',
+        notifyHookPath: '/tmp/omp-notify-v1.ts',
+      },
     ])
     expect(sm.getSessions()[0].status).toBe('idle')
   })
@@ -1752,7 +1817,57 @@ describe('reviveSession — remote resume fallback', () => {
     await sm.reviveSession('r1')
 
     expect(state.createRemotePtyCalls).toEqual([
-      { sessionId: 'r1', cwd: remote.worktreePath, hostId: 'h1', continueSession: true },
+      {
+        sessionId: 'r1',
+        cwd: remote.worktreePath,
+        hostId: 'h1',
+        continueSession: true,
+        tool: 'claude',
+        notifyHookPath: '/tmp/omp-notify-v1.ts',
+      },
+    ])
+  })
+
+  it('spawns fresh when the remote has no omp conversation history', async () => {
+    const remote = baseRemoteSession({ id: 'r1', status: 'dead', tool: 'omp' })
+    writeSessionsJson([remote])
+    state.ompHistoryProbeResult.set(remote.worktreePath, false)
+    const sm = await loadSessionManager()
+    sm.restoreSessions()
+
+    await sm.reviveSession('r1')
+
+    expect(state.createRemotePtyCalls).toEqual([
+      {
+        sessionId: 'r1',
+        cwd: remote.worktreePath,
+        hostId: 'h1',
+        continueSession: false,
+        tool: 'omp',
+        notifyHookPath: '/tmp/omp-notify-v1.ts',
+      },
+    ])
+    expect(sm.getSessions()[0].status).toBe('idle')
+  })
+
+  it('resumes when the remote has omp conversation history', async () => {
+    const remote = baseRemoteSession({ id: 'r1', status: 'dead', tool: 'omp' })
+    writeSessionsJson([remote])
+    state.ompHistoryProbeResult.set(remote.worktreePath, true)
+    const sm = await loadSessionManager()
+    sm.restoreSessions()
+
+    await sm.reviveSession('r1')
+
+    expect(state.createRemotePtyCalls).toEqual([
+      {
+        sessionId: 'r1',
+        cwd: remote.worktreePath,
+        hostId: 'h1',
+        continueSession: true,
+        tool: 'omp',
+        notifyHookPath: '/tmp/omp-notify-v1.ts',
+      },
     ])
   })
 
@@ -1765,7 +1880,14 @@ describe('reviveSession — remote resume fallback', () => {
     await sm.reviveSession('r1')
 
     expect(state.createRemotePtyCalls).toEqual([
-      { sessionId: 'r1', cwd: remote.worktreePath, hostId: 'h1', continueSession: false },
+      {
+        sessionId: 'r1',
+        cwd: remote.worktreePath,
+        hostId: 'h1',
+        continueSession: false,
+        tool: 'codex',
+        notifyHookPath: '/tmp/omp-notify-v1.ts',
+      },
     ])
   })
 })

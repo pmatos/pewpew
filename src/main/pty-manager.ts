@@ -13,6 +13,7 @@ import {
 import { classifySshExit } from './ssh-exit-parser'
 import { captureRemotePaneTexts, type RemoteSessionEntry } from './remote-thumbnail'
 import { sanitizeChildEnv } from './appimage-env'
+import { OMP_HOOK_SCRIPT } from './hook-installer'
 import type { AgentTool, Host } from '../shared/types'
 
 interface SpawnOptions {
@@ -25,6 +26,11 @@ interface SpawnOptions {
   // pass it through here so tmux can exec it directly. Omitted for local
   // sessions where the GUI process inherits a usable PATH.
   agentPath?: string
+  // Absolute path (on the target host) to the omp hook bridge script passed
+  // via `--hook`. Defaults to OMP_HOOK_SCRIPT for local sessions; remote
+  // sessions must pass the path returned by bootstrapHost/withPreparedHost
+  // since it lives under the remote host's own config dir.
+  notifyHookPath?: string
 }
 
 export function buildAgentArgs(options?: SpawnOptions): string[] {
@@ -35,6 +41,12 @@ export function buildAgentArgs(options?: SpawnOptions): string[] {
       return [cmd, 'resume', options.agentSessionId, '--dangerously-bypass-approvals-and-sandbox']
     }
     return [cmd, '--dangerously-bypass-approvals-and-sandbox']
+  }
+  if (tool === 'omp') {
+    const hookPath = options?.notifyHookPath ?? OMP_HOOK_SCRIPT
+    const args = [cmd, '--auto-approve', '--hook', hookPath]
+    if (options?.continueSession) args.push('--continue')
+    return args
   }
   const args = [cmd, '--dangerously-skip-permissions']
   if (options?.continueSession) args.push('--continue')
