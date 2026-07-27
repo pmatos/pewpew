@@ -238,9 +238,9 @@ export default function SessionCard({ session, thumbnail, style, onOpenSession, 
           <span>{label}</span>
           <span
             className={`tool-badge tool-${session.tool}`}
-            title={TOOL_BADGE[session.tool].label}
+            title={(TOOL_BADGE[session.tool] ?? TOOL_BADGE.claude).label}
           >
-            {TOOL_BADGE[session.tool].letter}
+            {(TOOL_BADGE[session.tool] ?? TOOL_BADGE.claude).letter}
           </span>
           {host && connectionState && <span className="connection-label">{connectionState}</span>}
         </div>
