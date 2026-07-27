@@ -54,6 +54,15 @@
 
 import { normalize } from 'node:path'
 
+// normalize() alone doesn't strip a trailing separator, so a projectPath of
+// "/foo/bar/" would leave `${normalizedProjectPath}/` as a double slash that
+// a legitimately-nested single-slash path wouldn't match. Every comparison
+// in this file goes through this helper instead of bare normalize().
+const normalizePath = (path: string): string => {
+  const normalized = normalize(path)
+  return normalized.length > 1 && normalized.endsWith('/') ? normalized.slice(0, -1) : normalized
+}
+
 export interface SandboxOptions {
   enabled?: boolean
   extraWritablePaths?: string[]
@@ -69,8 +78,12 @@ export function buildSandboxArgs(
 
   // Nothing to confine to when the "worktree" IS the project root (e.g. a
   // session opened directly on the main checkout rather than a linked
-  // worktree) — there's no narrower boundary to enforce.
-  if (worktreePath === projectPath) return []
+  // worktree) — there's no narrower boundary to enforce. Normalized: an
+  // unnormalized comparison here would miss equivalent non-canonical forms
+  // (trailing slash, "./") and fall through to emitting both a read-only
+  // and a read-write bind for the same directory, with the read-write one
+  // winning — silently making the entire project writable.
+  if (normalizePath(worktreePath) === normalizePath(projectPath)) return []
 
   const args = [
     'bwrap',
@@ -108,10 +121,10 @@ export function buildSandboxArgs(
   // before comparing: a non-canonical entry like "<project>/../project"
   // collapses right back to <project> itself, which the raw string wouldn't
   // match against a plain startsWith/=== check.
-  const normalizedProjectPath = normalize(projectPath)
+  const normalizedProjectPath = normalizePath(projectPath)
 
   const overlapsProject = (path: string): boolean => {
-    const normalizedPath = normalize(path)
+    const normalizedPath = normalizePath(path)
     return (
       normalizedPath === normalizedProjectPath ||
       normalizedPath === '/' ||

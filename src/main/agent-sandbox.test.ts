@@ -64,6 +64,17 @@ describe('buildSandboxArgs', () => {
     expect(buildSandboxArgs(PROJECT, PROJECT, { enabled: true })).toEqual([])
   })
 
+  it('returns no args when worktreePath equals projectPath in a non-canonical form', () => {
+    // A raw === comparison would miss this and fall through to emitting both
+    // a --ro-bind (read-only) and a --bind (read-write) for the same
+    // underlying directory, with the read-write one winning — silently
+    // making the entire project writable while still returning a
+    // seemingly-valid confining argv.
+    expect(buildSandboxArgs(PROJECT, `${PROJECT}/`)).toEqual([])
+    expect(buildSandboxArgs(`${PROJECT}/`, PROJECT)).toEqual([])
+    expect(buildSandboxArgs(PROJECT, `${PROJECT}/./`)).toEqual([])
+  })
+
   it('appends extra writable paths as --bind pairs before the final --chdir/--', () => {
     const args = buildSandboxArgs(PROJECT, WORKTREE, {
       extraWritablePaths: ['/opt/data', '/var/tmp'],
@@ -127,6 +138,17 @@ describe('buildSandboxArgs', () => {
     // is only used internally for the overlap comparison, not applied to
     // the bind pair itself.
     expect(args).toContain(`${PROJECT}/../sibling`)
+  })
+
+  it('drops a nested extraWritablePaths entry even when projectPath has a trailing slash', () => {
+    // normalize() alone preserves a pre-existing trailing separator, so
+    // `${normalizedProjectPath}/` would become a double slash that a
+    // legitimately-nested single-slash path wouldn't match — letting it
+    // incorrectly survive the filter instead of being dropped.
+    const args = buildSandboxArgs(`${PROJECT}/`, `${PROJECT}/wt`, {
+      extraWritablePaths: [`${PROJECT}/cache`],
+    })
+    expect(args).not.toContain(`${PROJECT}/cache`)
   })
 
   it('mounts a fresh /dev, /proc, and /tmp rather than passing through the host copies', () => {
