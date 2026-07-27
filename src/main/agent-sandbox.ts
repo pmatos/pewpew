@@ -14,11 +14,22 @@
 // This is a WRITE/PERSISTENCE boundary only, not a confidentiality or
 // network one: the sandboxed process still has read access to the entire
 // host filesystem (other repos, SSH keys, cloud credentials, etc.), and
-// there's no --unshare-net/--unshare-pid/--unshare-user, so network egress
-// and process visibility are unrestricted. A compromised or prompt-injected
-// agent can still read and exfiltrate host secrets even though it can't
-// write outside its worktree — that's an explicitly accepted trade-off, not
-// an oversight.
+// there's no --unshare-net/--unshare-user, so network egress is
+// unrestricted. A compromised or prompt-injected agent can still read and
+// exfiltrate host secrets even though it can't write outside its worktree —
+// that's an explicitly accepted trade-off, not an oversight.
+//
+// PID namespace IS unshared (--unshare-pid before --proc): mounting a fresh
+// procfs without it would still populate from the host's shared pid
+// namespace, making every host process visible, and — on a host with
+// kernel.yama.ptrace_scope=0 (unrestricted; 1/"restricted" is only a distro
+// default, not a guarantee) — reachable via /proc/<host-pid>/root, which
+// resolves through THAT process's own mount namespace and bypasses the
+// --ro-bind / / restriction entirely. Verified empirically with real bwrap:
+// with only --proc (no --unshare-pid), 729 host PIDs were visible from
+// inside the sandbox; with --unshare-pid added, only the sandbox's own
+// process tree (5 entries) is visible, and worktree writes, git operations,
+// and /tmp scratch space all continue to work normally.
 //
 // Verified against the real bwrap + claude CLI: a write to <project>, a
 // sibling worktree, or an arbitrary host path (e.g. $HOME) resolves EROFS
@@ -28,24 +39,28 @@
 // Bind order is load-bearing — later binds override earlier ones:
 //   1. --ro-bind / /                       host filesystem, read-only
 //   2. --dev /dev                          minimal, safe device nodes
-//   3. --proc /proc                        fresh procfs
-//   4. --tmpfs /tmp                        session-scoped scratch space
+//   3. --unshare-pid                       fresh pid namespace — must precede
+//      --proc below, or the procfs it mounts still reflects the shared host
+//      pid namespace instead of this one
+//   4. --proc /proc                        fresh procfs, scoped to the
+//      unshared pid namespace above
+//   5. --tmpfs /tmp                        session-scoped scratch space
 //      (build tools, npm, editors all assume /tmp is writable; a fresh
 //      tmpfs keeps it isolated from the host's /tmp and other sessions')
-//   5. --ro-bind <project> <project>       lock the project root read-only
+//   6. --ro-bind <project> <project>       lock the project root read-only
 //      (redundant with step 1 but kept explicit — the project's own
 //      protection shouldn't depend on the root strategy staying this way)
-//   6. --bind <project>/.git <project>/.git    ...except the shared .git,
+//   7. --bind <project>/.git <project>/.git    ...except the shared .git,
 //      writable again (git commit/checkout need it for the linked worktree)
-//   7. --ro-bind-try <project>/.git/hooks ...  ...except hooks/, which stays
+//   8. --ro-bind-try <project>/.git/hooks ...  ...except hooks/, which stays
 //      read-only (kills the code-exec-persistence path through .git/hooks).
 //      "-try" degrades gracefully when hooks/ doesn't exist (e.g. a repo with
 //      core.hooksPath pointed elsewhere) instead of hard-failing bwrap's spawn.
-//   8. extra caller-granted writable paths — any path that equals, is
+//   9. extra caller-granted writable paths — any path that equals, is
 //      nested under, or is an ancestor of <project> is dropped, since it
-//      would re-open the read-only guarantees from steps 1 and 5-7
-//   9. --bind <worktree> <worktree>        the session's own worktree, r/w
-//   10. --chdir <worktree> --              land in the worktree; `--`
+//      would re-open the read-only guarantees from steps 1 and 6-8
+//   10. --bind <worktree> <worktree>       the session's own worktree, r/w
+//   11. --chdir <worktree> --              land in the worktree; `--`
 //      separates bwrap's own options from the command to run inside it
 //
 // Deliberately NOT ro-binding <project>/.git/config: that breaks `git config
@@ -92,6 +107,7 @@ export function buildSandboxArgs(
     '/',
     '--dev',
     '/dev',
+    '--unshare-pid',
     '--proc',
     '/proc',
     '--tmpfs',

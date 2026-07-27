@@ -16,6 +16,7 @@ describe('buildSandboxArgs', () => {
       '/',
       '--dev',
       '/dev',
+      '--unshare-pid',
       '--proc',
       '/proc',
       '--tmpfs',
@@ -156,7 +157,22 @@ describe('buildSandboxArgs', () => {
     const rootIdx = args.indexOf('--ro-bind')
     expect(args.slice(rootIdx, rootIdx + 3)).toEqual(['--ro-bind', '/', '/'])
     expect(args.slice(rootIdx + 3, rootIdx + 5)).toEqual(['--dev', '/dev'])
-    expect(args.slice(rootIdx + 5, rootIdx + 7)).toEqual(['--proc', '/proc'])
-    expect(args.slice(rootIdx + 7, rootIdx + 9)).toEqual(['--tmpfs', '/tmp'])
+    expect(args.slice(rootIdx + 5, rootIdx + 6)).toEqual(['--unshare-pid'])
+    expect(args.slice(rootIdx + 6, rootIdx + 8)).toEqual(['--proc', '/proc'])
+    expect(args.slice(rootIdx + 8, rootIdx + 10)).toEqual(['--tmpfs', '/tmp'])
+  })
+
+  it('unshares the pid namespace before mounting procfs', () => {
+    // A --proc mount without a preceding --unshare-pid still reflects the
+    // shared host pid namespace, making every host process visible and — on
+    // a host with kernel.yama.ptrace_scope=0 — reachable via
+    // /proc/<host-pid>/root, which bypasses --ro-bind / / entirely by
+    // resolving through that other process's own mount namespace. Verified
+    // empirically with real bwrap: without --unshare-pid, 729 host PIDs were
+    // visible from inside the sandbox; with it, only the sandbox's own
+    // process tree (5 entries) was.
+    const args = buildSandboxArgs(PROJECT, WORKTREE)
+    const procIdx = args.indexOf('--proc')
+    expect(args[procIdx - 1]).toBe('--unshare-pid')
   })
 })
