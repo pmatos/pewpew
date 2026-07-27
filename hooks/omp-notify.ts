@@ -19,6 +19,18 @@
 // and ExtensionContext is a strict superset of HookContext including `cwd` —
 // this file only ever calls `.on()` and reads `ctx.cwd`, so it works
 // identically under either loader.
+//
+// MANUAL SYNC CHECKLIST — src/main/host-bootstrap.ts's buildOmpHookScript
+// hand-duplicates this file's logic for the remote install (it has to inline
+// script text into a single ssh round trip, so it can't read this file at
+// runtime). host-bootstrap.test.ts asserts the two copies register the same
+// pi.on(...) event set and the same NOTIFY_TIMEOUT_MS value, but NOT full
+// handler-body behavior — so when changing anything below, also update
+// buildOmpHookScript's generated text:
+//   - add/remove/rename a pi.on(...) event
+//   - change NOTIFY_TIMEOUT_MS
+//   - change the willContinue skip (or any other handler conditional)
+//   - change the notify() payload shape
 
 import { execFileSync } from 'node:child_process'
 import { homedir } from 'node:os'

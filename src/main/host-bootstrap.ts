@@ -56,6 +56,15 @@ const OMP_HOOK_NOTIFY_TIMEOUT_MS = 2000
 // recomputed from CONFIG_DIR/XDG_CONFIG_HOME (which only makes sense for a
 // local install where "this machine's home dir" is unambiguous).
 //
+// MANUAL SYNC CHECKLIST — host-bootstrap.test.ts asserts this generated
+// script registers the same pi.on(...) event set and the same
+// NOTIFY_TIMEOUT_MS value as hooks/omp-notify.ts, but NOT full handler-body
+// behavior, so when changing hooks/omp-notify.ts also mirror here:
+//   - add/remove/rename a pi.on(...) event
+//   - change NOTIFY_TIMEOUT_MS (OMP_HOOK_NOTIFY_TIMEOUT_MS below)
+//   - change the willContinue skip (or any other handler conditional)
+//   - change the notify() payload shape
+//
 // The generated script's `import` line is built via string concatenation
 // (not a literal `import ... from ...` substring in this file) so it can't
 // be statically pattern-matched as a real import by electron-vite's ESM
@@ -351,7 +360,7 @@ export async function bootstrapHost(
   const ompHookInstallScript =
     'set -e\n' +
     'mkdir -p "$1"\n' +
-    'if [ ! -f "$2" ] || ! grep -q "PEWPEW_OMP_HOOK_VERSION=$4" "$2" || ! grep -qF "$5" "$2"; then\n' +
+    'if [ ! -f "$2" ] || ! grep -qF "PEWPEW_OMP_HOOK_VERSION=$4" "$2" || ! grep -qF "$5" "$2"; then\n' +
     '  printf "%s" "$3" > "$2"\n' +
     'fi\n'
   const ompHookInstall = await connection.exec(
