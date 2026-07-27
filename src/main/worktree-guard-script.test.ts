@@ -1,6 +1,6 @@
 import { describe, it, expect, beforeEach, afterEach } from 'vitest'
 import { execFileSync } from 'child_process'
-import { mkdtempSync, mkdirSync, symlinkSync, rmSync, writeFileSync } from 'fs'
+import { mkdtempSync, mkdirSync, symlinkSync, rmSync, writeFileSync, linkSync } from 'fs'
 import { tmpdir } from 'os'
 import { join } from 'path'
 
@@ -132,6 +132,59 @@ describe('worktree-guard.sh', () => {
     const decision = run({
       tool_name: 'Edit',
       tool_input: { file_path: target, old_string: '{}', new_string: '{"hooks":{}}' },
+    })
+    expect(decision?.hookSpecificOutput?.permissionDecision).toBe('deny')
+    expect(decision?.hookSpecificOutput?.permissionDecisionReason).toContain('own settings file')
+  })
+
+  it('denies a write whose target contains a newline', () => {
+    // A file/symlink literally named with a trailing newline: command
+    // substitution would silently strip it from a naively-captured $target,
+    // so this must be caught before the value ever reaches a shell variable.
+    const target = `${join(root, 'evil')}\n`
+    const decision = run(writePayload(target))
+    expect(decision?.hookSpecificOutput?.permissionDecision).toBe('deny')
+    expect(decision?.hookSpecificOutput?.permissionDecisionReason).toContain('newline')
+  })
+
+  it('denies a write through a symlink whose target contains a newline', () => {
+    const outside = mkdtempSync(join(tmpdir(), 'guard-symlink-newline-'))
+    try {
+      symlinkSync(`${outside}/secret\n`, join(root, 'link-newline'))
+      const decision = run(writePayload(join(root, 'link-newline')))
+      expect(decision?.hookSpecificOutput?.permissionDecision).toBe('deny')
+    } finally {
+      rmSync(outside, { recursive: true, force: true })
+    }
+  })
+
+  it('fails closed (denies) when target resolution hits a symlink cycle', () => {
+    const a = join(root, 'a')
+    const b = join(root, 'b')
+    symlinkSync(b, a)
+    symlinkSync(a, b)
+    const decision = run(writePayload(a))
+    expect(decision?.hookSpecificOutput?.permissionDecision).toBe('deny')
+  })
+
+  it('fails closed (denies) when the baked-in worktree root no longer exists', () => {
+    const missingRoot = join(root, 'relocated-away')
+    const decision = run(writePayload(join(missingRoot, 'file.txt')), missingRoot)
+    expect(decision?.hookSpecificOutput?.permissionDecision).toBe('deny')
+    expect(decision?.hookSpecificOutput?.permissionDecisionReason).toContain(
+      'could not resolve the worktree root'
+    )
+  })
+
+  it('denies editing the settings file through a hard link with a different name (-ef check)', () => {
+    mkdirSync(join(root, '.claude'), { recursive: true })
+    const settingsPath = join(root, '.claude', 'settings.local.json')
+    writeFileSync(settingsPath, '{}')
+    const hardLinkPath = join(root, '.claude', 'settings-alias.json')
+    linkSync(settingsPath, hardLinkPath)
+    const decision = run({
+      tool_name: 'Edit',
+      tool_input: { file_path: hardLinkPath, old_string: '{}', new_string: '{"hooks":{}}' },
     })
     expect(decision?.hookSpecificOutput?.permissionDecision).toBe('deny')
     expect(decision?.hookSpecificOutput?.permissionDecisionReason).toContain('own settings file')

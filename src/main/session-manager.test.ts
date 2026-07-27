@@ -2037,6 +2037,80 @@ describe('removeSessionsForHost (issue #14)', () => {
     expect(state.sessionsUpdatedBroadcasts).toBe(0)
   })
 })
+
+describe('relocateProject', () => {
+  it('reinstalls the guard hook with the new worktreePath for remapped Claude sessions', async () => {
+    const oldProjectPath = mkdtempSync(join(tmpdir(), 'reloc-old-'))
+    const newProjectPath = mkdtempSync(join(tmpdir(), 'reloc-new-'))
+    writeFileSync(join(newProjectPath, '.git'), '')
+
+    const oldWorktreePath = join(oldProjectPath, '.claude', 'worktrees', 'feat-x')
+    mkdirSync(oldWorktreePath, { recursive: true })
+    const newWorktreePath = join(newProjectPath, '.claude', 'worktrees', 'feat-x')
+    mkdirSync(newWorktreePath, { recursive: true })
+
+    writeSessionsJson([
+      baseLocalSession({
+        id: 'l1',
+        projectPath: oldProjectPath,
+        worktreePath: oldWorktreePath,
+        tool: 'claude',
+      }),
+    ])
+
+    const sm = await loadSessionManager()
+    sm.restoreSessions()
+    const { installHooks } = await import('./hook-installer')
+    vi.mocked(installHooks).mockClear()
+
+    try {
+      await sm.relocateProject(oldProjectPath, newProjectPath)
+
+      expect(installHooks).toHaveBeenCalledWith(newWorktreePath, { skipGitignore: true })
+      expect(sm.getSessions()[0].worktreePath).toBe(newWorktreePath)
+    } finally {
+      rmSync(oldProjectPath, { recursive: true, force: true })
+      rmSync(newProjectPath, { recursive: true, force: true })
+    }
+  })
+
+  it('does not reinstall hooks for a remapped worktree that no longer exists on disk', async () => {
+    const oldProjectPath = mkdtempSync(join(tmpdir(), 'reloc-old-'))
+    const newProjectPath = mkdtempSync(join(tmpdir(), 'reloc-new-'))
+    writeFileSync(join(newProjectPath, '.git'), '')
+
+    const oldWorktreePath = join(oldProjectPath, '.claude', 'worktrees', 'feat-y')
+    mkdirSync(oldWorktreePath, { recursive: true })
+    // Deliberately do not create the new worktree directory.
+
+    writeSessionsJson([
+      baseLocalSession({
+        id: 'l1',
+        projectPath: oldProjectPath,
+        worktreePath: oldWorktreePath,
+        tool: 'claude',
+      }),
+    ])
+
+    const sm = await loadSessionManager()
+    sm.restoreSessions()
+    const { installHooks } = await import('./hook-installer')
+    vi.mocked(installHooks).mockClear()
+
+    try {
+      await sm.relocateProject(oldProjectPath, newProjectPath)
+
+      expect(installHooks).not.toHaveBeenCalledWith(
+        join(newProjectPath, '.claude', 'worktrees', 'feat-y'),
+        { skipGitignore: true }
+      )
+    } finally {
+      rmSync(oldProjectPath, { recursive: true, force: true })
+      rmSync(newProjectPath, { recursive: true, force: true })
+    }
+  })
+})
+
 describe('codex agent integration', () => {
   it('backfills tool="claude" on legacy sessions missing the field', async () => {
     // Persisted JSON omits `tool` to simulate a session created before the

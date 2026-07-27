@@ -2315,6 +2315,15 @@ export async function relocateProject(
         s.status = 'dead'
       }
     }
+
+    // worktree-guard.sh bakes the root in as an argv literal at install
+    // time; relocating the project changes that path out from under it, so
+    // the guard's own `cd "$root"` starts failing and denies every write in
+    // the relocated worktree. Reinstall the hook here with the fresh
+    // worktreePath so relocated Claude sessions keep working.
+    if (s.tool === 'claude' && existsSync(s.worktreePath)) {
+      await installHooks(s.worktreePath, { skipGitignore: true })
+    }
   }
 
   const config = getConfig()

@@ -3,7 +3,7 @@ import type { ExecResult } from './host-connection'
 import type { AgentTool } from '../shared/types'
 
 export const NOTIFY_SCRIPT_VERSION = 1
-export const WORKTREE_GUARD_SCRIPT_VERSION = 2
+export const WORKTREE_GUARD_SCRIPT_VERSION = 4
 
 // Tools pewpew strictly requires on a remote host for sessions and the notify
 // hook to work. Exported so the connection-test flow can surface missing ones
@@ -50,9 +50,6 @@ PEWPEW_WORKTREE_GUARD_VERSION=${WORKTREE_GUARD_SCRIPT_VERSION}
 root="$1"
 [ -z "$root" ] && exit 0
 
-# Canonicalize the root itself (resolves any symlinks in the worktree path).
-root_real=$(cd "$root" 2>/dev/null && pwd -P) || exit 0
-
 payload=$(cat)
 
 if ! command -v jq >/dev/null 2>&1; then
@@ -61,6 +58,33 @@ if ! command -v jq >/dev/null 2>&1; then
   # guard for the rest of the session. Deny with a hand-built JSON reason
   # (there's no jq available to build one) instead of failing open.
   printf '%s' '{"hookSpecificOutput":{"hookEventName":"PreToolUse","permissionDecision":"deny","permissionDecisionReason":"pewpew: worktree guard cannot run because jq is not installed on this host; blocking the write (fail-closed)"}}'
+  exit 0
+fi
+
+# Canonicalize the root itself (resolves any symlinks in the worktree path).
+# A cd failure means the baked-in root no longer matches reality (e.g. the
+# worktree was relocated or deleted after this hook was installed) — deny
+# rather than silently allowing every write, the same fail-closed posture
+# used for every other failure mode below.
+root_real=$(cd "$root" 2>/dev/null && pwd -P)
+if [ -z "$root_real" ]; then
+  jq -nc --arg reason "pewpew: could not resolve the worktree root ($root) — it may have been moved or deleted; blocking the write (fail-closed)" \\
+    '{hookSpecificOutput:{hookEventName:"PreToolUse",permissionDecision:"deny",permissionDecisionReason:$reason}}'
+  exit 0
+fi
+
+# Check for an embedded/trailing newline in the raw JSON string BEFORE ever
+# assigning it into a shell variable: \`target=$(...)\` below would silently
+# strip a trailing newline via command substitution, so validating $target
+# after the fact can't detect it — a file literally named "evil\\n" would
+# then be checked as the (different, likely nonexistent) path "evil" while
+# Write/Edit still operates on the real newline-suffixed name. jq's \`test()\`
+# runs against the full string value jq parsed from the JSON, unaffected by
+# shell stripping.
+has_newline=$(printf '%s' "$payload" | jq -r '(.tool_input.file_path // .tool_input.notebook_path // "") | test("\\n")' 2>/dev/null)
+if [ "$has_newline" = "true" ]; then
+  jq -nc --arg reason "pewpew: the write target contains a newline; blocking the write (fail-closed)" \\
+    '{hookSpecificOutput:{hookEventName:"PreToolUse",permissionDecision:"deny",permissionDecisionReason:$reason}}'
   exit 0
 fi
 
@@ -89,11 +113,13 @@ resolve_path() {
   IFS='/' read -r -a queue <<< "$p"
 
   resolved=()
+  symlink_hops=0
   iterations=0
   while [ "\${#queue[@]}" -gt 0 ]; do
     iterations=$((iterations + 1))
-    # Bound total work so a symlink cycle can't hang the hook indefinitely.
-    [ "$iterations" -gt 256 ] && return 1
+    # Backstop against a pathological number of path components; ordinary
+    # paths never come close to this.
+    [ "$iterations" -gt 10000 ] && return 1
 
     part="\${queue[0]}"
     queue=("\${queue[@]:1}")
@@ -111,8 +137,23 @@ resolve_path() {
     candidate="/$(IFS=/; printf '%s' "\${resolved[*]}")"
 
     if [ -L "$candidate" ]; then
+      symlink_hops=$((symlink_hops + 1))
+      # Bound symlink dereferences specifically (matching Linux's own
+      # MAXSYMLINKS), not ordinary path components, so a genuinely deep but
+      # legitimate path can't spuriously hit this cap — only a symlink cycle
+      # can.
+      [ "$symlink_hops" -gt 40 ] && return 1
       last=$((\${#resolved[@]} - 1))
       unset 'resolved[last]'
+      # Same newline-truncation class as the target extraction above: a
+      # symlink whose target string itself contains a newline would have
+      # that newline silently dropped by \`$(readlink ...)\`, potentially
+      # collapsing an out-of-worktree target onto an in-worktree-looking
+      # string. \`readlink\` normally emits exactly one line (the target plus
+      # its own terminator); more than one line means the target contains an
+      # embedded or trailing newline. Piped directly to \`wc -l\`, unaffected
+      # by command-substitution stripping.
+      [ "$(readlink "$candidate" | wc -l)" -gt 1 ] && return 1
       linktarget=$(readlink "$candidate") || return 1
       case "$linktarget" in
         /*) resolved=() ;;
@@ -127,21 +168,37 @@ resolve_path() {
 }
 
 target_real=$(resolve_path "$target")
-[ -z "$target_real" ] && exit 0
-
-# Path-boundary check: target must be the root itself, or start with "root/".
-# A plain string-prefix check would let a sibling like "<root>-evil" through.
-case "$target_real" in
-  "$root_real") allowed=1 ;;
-  "$root_real"/*) allowed=1 ;;
-  *) allowed=0 ;;
-esac
 
 reason=""
-guard_settings="$root_real/.claude/settings.local.json"
-if [ "$target_real" = "$guard_settings" ]; then
-  allowed=0
-  reason="pewpew: this hook's own settings file ($guard_settings) may not be edited"
+allowed=0
+
+if [ -z "$target_real" ]; then
+  # resolve_path failed (symlink-cycle cap, a component vanishing mid-walk,
+  # or similar) — the same fail-closed reasoning as everywhere else in this
+  # script: if the guard can't determine whether a target is safe, it must
+  # not let it through.
+  reason="pewpew: could not canonicalize the write target ($target); blocking the write (fail-closed)"
+else
+  # Path-boundary check: target must be the root itself, or start with "root/".
+  # A plain string-prefix check would let a sibling like "<root>-evil" through.
+  case "$target_real" in
+    "$root_real") allowed=1 ;;
+    "$root_real"/*) allowed=1 ;;
+    *) allowed=0 ;;
+  esac
+
+  guard_settings="$root_real/.claude/settings.local.json"
+  # \`-ef\` (same file, via inode/device) catches what the exact string match
+  # above misses on a case-insensitive-but-case-preserving filesystem (e.g.
+  # macOS's default APFS mode): a differently-cased path like
+  # ".claude/Settings.local.json" opens the identical on-disk file without
+  # matching the string comparison. \`-ef\` requires both operands to exist,
+  # so it only ever adds a match — it can't be tricked by a nonexistent path.
+  if [ "$target_real" = "$guard_settings" ] || \\
+    { [ -e "$target_real" ] && [ -e "$guard_settings" ] && [ "$target_real" -ef "$guard_settings" ]; }; then
+    allowed=0
+    reason="pewpew: this hook's own settings file ($guard_settings) may not be edited"
+  fi
 fi
 
 [ "\${allowed:-0}" = "1" ] && exit 0
@@ -454,7 +511,7 @@ export async function bootstrapHost(
     'printf "%s\\n" "$3" > "$6"\n' +
     'if [ ! -f "$7" ] || ! grep -q "PEWPEW_WORKTREE_GUARD_VERSION=$9" "$7"; then\n' +
     '  printf "%s" "$8" > "$7"\n' +
-    '  chmod 755 "$7"\n' +
+    '  chmod 700 "$7"\n' +
     'fi\n'
   const install = await connection.exec(
     [
