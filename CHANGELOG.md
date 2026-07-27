@@ -1,3 +1,10 @@
+# [0.6.0](https://github.com/pmatos/pewpew/compare/v0.5.0...v0.6.0) (2026-07-27)
+
+
+### Features
+
+* **sessions:** add pure bubblewrap argv planner for worktree containment ([#237](https://github.com/pmatos/pewpew/issues/237)) ([242e864](https://github.com/pmatos/pewpew/commit/242e864217f0401f6ed87ce657116e74986a769f))
+
 # [0.5.0](https://github.com/pmatos/pewpew/compare/v0.4.0...v0.5.0) (2026-07-27)
 
 
