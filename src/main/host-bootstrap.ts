@@ -51,10 +51,23 @@ export const OMP_HOOK_SCRIPT_VERSION = 1
 // with the resolved absolute notifyScriptPath baked in directly instead of
 // recomputed from CONFIG_DIR/XDG_CONFIG_HOME (which only makes sense for a
 // local install where "this machine's home dir" is unambiguous).
+//
+// The generated script's `import` line is built via string concatenation
+// (not a literal `import ... from ...` substring in this file) so it can't
+// be statically pattern-matched as a real import by electron-vite's ESM
+// __dirname/__filename/require shim injector — that injector scans the
+// bundled *output* text for import-looking lines and once mistook this
+// template literal's embedded import statement for a real one, inserting
+// its CommonJS-shim boilerplate here instead of at this file's actual top,
+// leaving every real `__dirname` use elsewhere in the bundle undefined.
+const OMP_HOOK_IMPORT_LINE = ['import', '{ execFileSync }', 'from', "'node:child_process'"].join(
+  ' '
+)
+
 function buildOmpHookScript(notifyScriptPath: string): string {
   return `// pewpew omp hook bridge v${OMP_HOOK_SCRIPT_VERSION}
 // PEWPEW_OMP_HOOK_VERSION=${OMP_HOOK_SCRIPT_VERSION}
-import { execFileSync } from 'node:child_process'
+${OMP_HOOK_IMPORT_LINE}
 
 const NOTIFY_SCRIPT = ${JSON.stringify(notifyScriptPath)}
 

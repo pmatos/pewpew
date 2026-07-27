@@ -129,6 +129,17 @@ describe('bootstrapHost', () => {
     // The bridge source has the resolved notify.sh path baked in as a literal.
     expect(ompInstallCall?.[6]).toContain(JSON.stringify(result.notifyScriptPath))
     expect(ompInstallCall?.[7]).toBe(String(OMP_HOOK_SCRIPT_VERSION))
+    // Regression: the import line is built via string concatenation (not a
+    // literal `import ... from ...` substring in host-bootstrap.ts) so
+    // electron-vite's ESM __dirname/__filename/require shim injector can't
+    // mistake it for a real import and inject its CommonJS-shim boilerplate
+    // inside this template literal instead of at the file's actual top —
+    // which previously broke every real __dirname use in the built app
+    // (`ReferenceError: __dirname is not defined`, caught by the CI smoke
+    // test, not by tsc/eslint/vitest). Assert the generated text is still
+    // byte-for-byte correct despite the indirection.
+    expect(ompInstallCall?.[6]).toContain("import { execFileSync } from 'node:child_process'")
+
     // Reinstall guard also keys on the current notifyScriptPath (arg $5), not
     // just the bridge's own version marker — so bumping NOTIFY_SCRIPT_VERSION
     // alone still forces a reinstall of an already-installed bridge that would
