@@ -8,7 +8,7 @@ export const NOTIFY_SCRIPT_VERSION = 1
 // hook to work. Exported so the connection-test flow can surface missing ones
 // up front instead of letting a session/mirror fail deep in bootstrap.
 export const STRICT_DEPS = ['tmux', 'git', 'jq', 'socat'] as const
-export const AGENT_TOOLS: readonly AgentTool[] = ['claude', 'codex'] as const
+export const AGENT_TOOLS: readonly AgentTool[] = ['claude', 'codex', 'omp'] as const
 
 const notifyScript = `#!/usr/bin/env bash
 # pewpew notify script v${NOTIFY_SCRIPT_VERSION}
@@ -40,6 +40,79 @@ PAYLOAD=$(printf '%s' "$INPUT" | jq -c \\
 echo "$PAYLOAD" | socat - UNIX-CONNECT:"$SOCKET" >/dev/null 2>/dev/null || true
 `
 
+export const OMP_HOOK_SCRIPT_VERSION = 1
+
+// Matches hooks/omp-notify.ts's NOTIFY_TIMEOUT_MS — kept in sync by hand
+// alongside the rest of this duplicated bridge logic (see the comment below).
+const OMP_HOOK_NOTIFY_TIMEOUT_MS = 2000
+
+// omp loads its hook bridge via `--hook <path>` (a real file, not a piece of
+// declarative JSON), so unlike notifyScript above this has to be installed as
+// its own file rather than merged into a settings/hooks JSON blob. This is a
+// duplicate of hooks/omp-notify.ts's logic (kept in sync by hand) rather than
+// reading that file at runtime, because the remote install has to inline the
+// script text into a single ssh round trip the same way notifyScript does —
+// with the resolved absolute notifyScriptPath baked in directly instead of
+// recomputed from CONFIG_DIR/XDG_CONFIG_HOME (which only makes sense for a
+// local install where "this machine's home dir" is unambiguous).
+//
+// MANUAL SYNC CHECKLIST — host-bootstrap.test.ts asserts this generated
+// script registers the same pi.on(...) event set and the same
+// NOTIFY_TIMEOUT_MS value as hooks/omp-notify.ts, but NOT full handler-body
+// behavior, so when changing hooks/omp-notify.ts also mirror here:
+//   - add/remove/rename a pi.on(...) event
+//   - change NOTIFY_TIMEOUT_MS (OMP_HOOK_NOTIFY_TIMEOUT_MS below)
+//   - change the willContinue skip (or any other handler conditional)
+//   - change the notify() payload shape
+//
+// The generated script's `import` line is built via string concatenation
+// (not a literal `import ... from ...` substring in this file) so it can't
+// be statically pattern-matched as a real import by electron-vite's ESM
+// __dirname/__filename/require shim injector — that injector scans the
+// bundled *output* text for import-looking lines and once mistook this
+// template literal's embedded import statement for a real one, inserting
+// its CommonJS-shim boilerplate here instead of at this file's actual top,
+// leaving every real `__dirname` use elsewhere in the bundle undefined.
+const OMP_HOOK_IMPORT_LINE = ['import', '{ execFileSync }', 'from', "'node:child_process'"].join(
+  ' '
+)
+
+function buildOmpHookScript(notifyScriptPath: string): string {
+  return `// pewpew omp hook bridge v${OMP_HOOK_SCRIPT_VERSION}
+// PEWPEW_OMP_HOOK_VERSION=${OMP_HOOK_SCRIPT_VERSION}
+${OMP_HOOK_IMPORT_LINE}
+
+const NOTIFY_SCRIPT = ${JSON.stringify(notifyScriptPath)}
+// Bounds notify() so a hung notify.sh/socat can't stall the omp agent loop —
+// this runs on every tool_result, not just at session start/end.
+const NOTIFY_TIMEOUT_MS = ${OMP_HOOK_NOTIFY_TIMEOUT_MS}
+
+function notify(hookEventName, params) {
+  const payload = JSON.stringify({ hook_event_name: hookEventName, ...params })
+  try {
+    execFileSync(NOTIFY_SCRIPT, [], {
+      input: payload,
+      stdio: ['pipe', 'ignore', 'ignore'],
+      timeout: NOTIFY_TIMEOUT_MS,
+    })
+  } catch {
+    // Best effort — pewpew may not be running, the socket may be gone, or
+    // the call timed out.
+  }
+}
+
+export default function (pi) {
+  pi.on('session_start', (_event, ctx) => notify('SessionStart', { cwd: ctx.cwd }))
+  pi.on('agent_end', (event, ctx) => {
+    if (event.willContinue) return
+    notify('Stop', { cwd: ctx.cwd })
+  })
+  pi.on('tool_result', (_event, ctx) => notify('PostToolUse', { cwd: ctx.cwd }))
+  pi.on('session_shutdown', (_event, ctx) => notify('SessionEnd', { cwd: ctx.cwd, reason: 'other' }))
+}
+`
+}
+
 export type HostBootstrapErrorKind = 'missing-deps' | 'stream-local-bind' | 'install-failed'
 
 export class HostBootstrapError extends Error {
@@ -67,11 +140,13 @@ export type AgentResolution = Partial<Record<AgentTool, string>>
 // search.
 interface CachedBootstrap {
   notifyScriptPath: string
+  ompHookScriptPath: string
   remoteSocketPath: string
 }
 
 export interface HostBootstrapResult {
   notifyScriptPath: string
+  ompHookScriptPath: string
   remoteSocketPath: string
   agentPaths: AgentResolution
 }
@@ -86,8 +161,12 @@ const bootstrapped = new Map<string, CachedBootstrap>()
 // users who only export PATH in their interactive rc — sshd's non-interactive
 // command exec doesn't source those.
 //
-// Output is two lines (claude, then codex), each containing the absolute path
-// or empty.
+// Output is one line per AGENT_TOOLS entry (claude, codex, omp — in that
+// order), each containing the absolute path or empty. The order here, the
+// resolve_one calls below, and the positional args passed into the script by
+// resolveRemoteAgents must all stay in lockstep — resolveRemoteAgents maps
+// stdout lines back to tools by array index, so a mismatch silently
+// mis-assigns a resolved path to the wrong tool.
 const RESOLVE_SCRIPT = `set +e
 augment_path() {
   for d in "$HOME/.local/bin" "$HOME/.npm-global/bin" "$HOME/bin" "$HOME/.cargo/bin" "$HOME/.deno/bin" "$HOME/go/bin"; do
@@ -114,6 +193,7 @@ resolve_one() {
 }
 resolve_one claude "$1"
 resolve_one codex "$2"
+resolve_one omp "$3"
 `
 
 export async function resolveRemoteAgents(
@@ -121,7 +201,15 @@ export async function resolveRemoteAgents(
   cachedAgentPaths: AgentResolution = {}
 ): Promise<AgentResolution> {
   const result = await connection.exec(
-    ['sh', '-c', RESOLVE_SCRIPT, '_', cachedAgentPaths.claude ?? '', cachedAgentPaths.codex ?? ''],
+    [
+      'sh',
+      '-c',
+      RESOLVE_SCRIPT,
+      '_',
+      cachedAgentPaths.claude ?? '',
+      cachedAgentPaths.codex ?? '',
+      cachedAgentPaths.omp ?? '',
+    ],
     { timeoutMs: 15000 }
   )
   // Surface probe failures as a typed bootstrap error rather than masquerading
@@ -233,6 +321,7 @@ export async function bootstrapHost(
 
   const hooksDir = posix.join(configRoot, 'pewpew', 'hooks')
   const notifyScriptPath = posix.join(hooksDir, `notify-v${NOTIFY_SCRIPT_VERSION}.sh`)
+  const ompHookScriptPath = posix.join(hooksDir, `omp-notify-v${OMP_HOOK_SCRIPT_VERSION}.ts`)
   const breadcrumbPath = posix.join(hooksDir, 'socket-path')
   const installScript =
     'set -e\n' +
@@ -259,6 +348,37 @@ export async function bootstrapHost(
   )
   await expectOk(install, 'install-failed', 'Unable to install remote notify hook')
 
-  bootstrapped.set(hostId, { notifyScriptPath, remoteSocketPath })
-  return { notifyScriptPath, remoteSocketPath, agentPaths }
+  // Separate install step: the omp hook bridge is a plain file (loaded via
+  // `--hook <path>`, not merged JSON), so it doesn't share installScript's
+  // socket-breadcrumb/notify.sh write above. The reinstall guard checks BOTH
+  // the bridge's own version marker AND that the current notifyScriptPath is
+  // still baked in as a literal — otherwise bumping NOTIFY_SCRIPT_VERSION
+  // alone (without also touching OMP_HOOK_SCRIPT_VERSION) would leave an
+  // already-installed bridge silently pointing at a notify.sh path that no
+  // longer exists, and omp events would go nowhere on already-bootstrapped
+  // hosts.
+  const ompHookInstallScript =
+    'set -e\n' +
+    'mkdir -p "$1"\n' +
+    'if [ ! -f "$2" ] || ! grep -qF "PEWPEW_OMP_HOOK_VERSION=$4" "$2" || ! grep -qF "$5" "$2"; then\n' +
+    '  printf "%s" "$3" > "$2"\n' +
+    'fi\n'
+  const ompHookInstall = await connection.exec(
+    [
+      'sh',
+      '-c',
+      ompHookInstallScript,
+      '_',
+      hooksDir,
+      ompHookScriptPath,
+      buildOmpHookScript(notifyScriptPath),
+      String(OMP_HOOK_SCRIPT_VERSION),
+      notifyScriptPath,
+    ],
+    { timeoutMs: 15000 }
+  )
+  await expectOk(ompHookInstall, 'install-failed', 'Unable to install remote omp hook bridge')
+
+  bootstrapped.set(hostId, { notifyScriptPath, ompHookScriptPath, remoteSocketPath })
+  return { notifyScriptPath, ompHookScriptPath, remoteSocketPath, agentPaths }
 }

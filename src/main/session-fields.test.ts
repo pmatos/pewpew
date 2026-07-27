@@ -118,4 +118,11 @@ describe('deriveSessionFields — tool', () => {
     })
     expect(derived.tool).toBe('codex')
   })
+
+  it('preserves a persisted omp tool', () => {
+    const derived = deriveSessionFields(base({ tool: 'omp' }), {
+      resolvedLocalBranch: undefined,
+    })
+    expect(derived.tool).toBe('omp')
+  })
 })

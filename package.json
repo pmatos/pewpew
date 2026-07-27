@@ -33,7 +33,8 @@
     "files": [
       "dist/**/*",
       "dist-electron/**/*",
-      "hooks/**/*"
+      "hooks/**/*",
+      "!hooks/**/*.test.ts"
     ],
     "linux": {
       "target": [

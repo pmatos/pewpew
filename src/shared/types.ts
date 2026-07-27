@@ -23,7 +23,7 @@ export interface Worktree {
   isMain: boolean
 }
 
-export type AgentTool = 'claude' | 'codex'
+export type AgentTool = 'claude' | 'codex' | 'omp'
 
 export type Theme = 'dark' | 'light'
 
@@ -141,7 +141,7 @@ export interface TestConnectionResult {
   message?: string
   // Populated when the connection succeeds and the host could be probed.
   // requiredDeps are the tools pewpew strictly needs (tmux, git, jq, socat);
-  // agentTools are the optional agent CLIs (claude, codex), shown for info.
+  // agentTools are the optional agent CLIs (claude, codex, omp), shown for info.
   requiredDeps?: DependencyStatus[]
   agentTools?: DependencyStatus[]
 }

@@ -3,6 +3,7 @@ import { readFileSync, existsSync } from 'fs'
 import { join } from 'path'
 import { CONFIG_DIR, getConfig, saveConfig } from './config'
 import { hasRemoteProjectsBoundTo } from './remote-project-registry'
+import { AGENT_TOOLS } from './host-bootstrap'
 import type { AgentTool, Host, HostId } from '../shared/types'
 
 const SESSIONS_PATH = join(CONFIG_DIR, 'sessions.json')
@@ -97,7 +98,7 @@ export function setHostAgentPaths(hostId: HostId, paths: Partial<Record<AgentToo
   const previous = config.hosts[idx]
   const previousPaths = previous.agentPaths ?? {}
   const merged: Partial<Record<AgentTool, string>> = { ...previousPaths }
-  for (const tool of ['claude', 'codex'] as const) {
+  for (const tool of AGENT_TOOLS) {
     if (paths[tool]) {
       merged[tool] = paths[tool]
     } else if (previousPaths[tool]) {
