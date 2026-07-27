@@ -122,9 +122,9 @@ function appendToBuffer(entry: PtyEntry, data: string): void {
   scheduleFlush()
 }
 
-export function isTmuxAvailable(): boolean {
+function commandAvailable(bin: string): boolean {
   try {
-    execFileSync('which', ['tmux'], {
+    execFileSync('which', [bin], {
       stdio: 'pipe',
       env: sanitizeChildEnv() as NodeJS.ProcessEnv,
     })
@@ -134,16 +134,12 @@ export function isTmuxAvailable(): boolean {
   }
 }
 
+export function isTmuxAvailable(): boolean {
+  return commandAvailable('tmux')
+}
+
 export function isSandboxAvailable(): boolean {
-  try {
-    execFileSync('which', ['bwrap'], {
-      stdio: 'pipe',
-      env: sanitizeChildEnv() as NodeJS.ProcessEnv,
-    })
-    return true
-  } catch {
-    return false
-  }
+  return commandAvailable('bwrap')
 }
 
 // Under the hardened bwrap args (--ro-bind / /, see agent-sandbox.ts), $HOME
