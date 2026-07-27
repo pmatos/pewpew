@@ -69,4 +69,34 @@ describe('buildSandboxArgs', () => {
     const withOmitted = buildSandboxArgs(PROJECT, WORKTREE)
     expect(withEmpty).toEqual(withOmitted)
   })
+
+  it('drops extraWritablePaths entries that overlap the project root', () => {
+    const args = buildSandboxArgs(PROJECT, WORKTREE, {
+      extraWritablePaths: [PROJECT, `${PROJECT}/.git/hooks`, `${PROJECT}-other`, '/tmp'],
+    })
+    const occurrences = (value: string) => args.filter((a) => a === value).length
+    // The project root and its .git/hooks carve-out already appear twice
+    // each (as the ro-bind source/target from steps 2 and 4) — a dropped
+    // overlap must not add a third occurrence via an extra --bind pair.
+    expect(occurrences(PROJECT)).toBe(2)
+    expect(occurrences(`${PROJECT}/.git/hooks`)).toBe(2)
+    // A path that merely shares a string prefix (not a path separator) with
+    // the project root, and a genuinely unrelated path, are not overlaps.
+    expect(args).toContain(`${PROJECT}-other`)
+    expect(args).toContain('/tmp')
+  })
+
+  it('drops extraWritablePaths entries that are an ANCESTOR of the project root', () => {
+    // A caller-supplied ancestor (e.g. "/home/dev", or the extreme case "/")
+    // would re-mount projectPath itself read-write via the later --bind,
+    // since bwrap binds are order-dependent — not just a subtree within it.
+    const args = buildSandboxArgs(PROJECT, WORKTREE, {
+      extraWritablePaths: ['/home/dev', '/', '/tmp'],
+    })
+    expect(args).not.toContain('/home/dev')
+    // '/' is also the --dev-bind target from step 1, so assert on the
+    // occurrence count rather than presence.
+    expect(args.filter((a) => a === '/').length).toBe(2)
+    expect(args).toContain('/tmp')
+  })
 })

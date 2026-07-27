@@ -18,7 +18,9 @@
 //      read-only (kills the code-exec-persistence path through .git/hooks).
 //      "-try" degrades gracefully when hooks/ doesn't exist (e.g. a repo with
 //      core.hooksPath pointed elsewhere) instead of hard-failing bwrap's spawn.
-//   5. extra caller-granted writable paths (e.g. /tmp)
+//   5. extra caller-granted writable paths (e.g. /tmp) — any path that
+//      equals, is nested under, or is an ancestor of <project> is dropped,
+//      since it would re-open the read-only guarantees from steps 2 and 4
 //   6. --bind <worktree> <worktree>        the session's own worktree, r/w
 //   7. --chdir <worktree> --               land in the worktree; `--`
 //      separates bwrap's own options from the command to run inside it
@@ -61,7 +63,24 @@ export function buildSandboxArgs(
     `${projectPath}/.git/hooks`,
   ]
 
-  for (const path of extraWritablePaths) {
+  // extraWritablePaths binds run after the project ro-binds above, and bwrap
+  // binds are order-dependent — a caller-supplied path that overlaps
+  // projectPath in EITHER direction would re-mount part or all of the
+  // project read-write, undoing the guarantees this function exists to
+  // enforce: a path nested under projectPath re-opens that subtree, and a
+  // path that is an ANCESTOR of projectPath (e.g. extraWritablePaths
+  // containing "/tmp" when projectPath is "/tmp/proj") re-mounts projectPath
+  // itself along with it. Drop any such overlap rather than trusting the
+  // caller to avoid it.
+  const overlapsProject = (path: string): boolean =>
+    path === projectPath ||
+    path === '/' ||
+    path.startsWith(`${projectPath}/`) ||
+    projectPath.startsWith(`${path}/`)
+
+  const safeExtraWritablePaths = extraWritablePaths.filter((path) => !overlapsProject(path))
+
+  for (const path of safeExtraWritablePaths) {
     args.push('--bind', path, path)
   }
 
