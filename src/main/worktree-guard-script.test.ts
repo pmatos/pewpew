@@ -190,4 +190,15 @@ describe('worktree-guard.sh', () => {
     })
     expect(out.trim()).toBe('')
   })
+
+  it('fails closed (denies) when jq is not installed on PATH', () => {
+    const out = execFileSync('/bin/bash', [SCRIPT, root], {
+      input: JSON.stringify(writePayload(join(root, 'inside.txt'))),
+      encoding: 'utf-8',
+      env: { PATH: '/nonexistent-bin-dir' },
+    })
+    const decision = JSON.parse(out.trim()) as Decision
+    expect(decision.hookSpecificOutput?.permissionDecision).toBe('deny')
+    expect(decision.hookSpecificOutput?.permissionDecisionReason).toContain('jq is not installed')
+  })
 })

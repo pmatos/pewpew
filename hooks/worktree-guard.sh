@@ -19,6 +19,16 @@ root="$1"
 root_real=$(cd "$root" 2>/dev/null && pwd -P) || exit 0
 
 payload=$(cat)
+
+if ! command -v jq >/dev/null 2>&1; then
+  # jq is required for every decision this hook makes, so its absence can't
+  # be treated as "nothing to guard here" — that would silently disable the
+  # guard for the rest of the session. Deny with a hand-built JSON reason
+  # (there's no jq available to build one) instead of failing open.
+  printf '%s' '{"hookSpecificOutput":{"hookEventName":"PreToolUse","permissionDecision":"deny","permissionDecisionReason":"pewpew: worktree guard cannot run because jq is not installed on this host; blocking the write (fail-closed)"}}'
+  exit 0
+fi
+
 target=$(printf '%s' "$payload" | jq -r '.tool_input.file_path // .tool_input.notebook_path // empty' 2>/dev/null)
 [ -z "$target" ] && exit 0
 
