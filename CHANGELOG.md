@@ -1,3 +1,20 @@
+# [0.4.0](https://github.com/pmatos/pewpew/compare/v0.3.1...v0.4.0) (2026-07-27)
+
+
+### Bug Fixes
+
+* **build:** stop embedded import text from corrupting the ESM __dirname shim ([e3abb96](https://github.com/pmatos/pewpew/commit/e3abb96b50bb8fb8e863be457599fad23fe0d847))
+* **hooks:** bound notify() with a timeout, assert local/remote event parity ([870dd83](https://github.com/pmatos/pewpew/commit/870dd832997416aae71ce6a7812b5eed9095ab68))
+* **hooks:** extend parity test to NOTIFY_TIMEOUT_MS, use grep -qF for the version marker ([2567196](https://github.com/pmatos/pewpew/commit/256719646047686feb9d5647f514fa078774a972))
+* **sessions:** release cleanupInProgress when removeSession's teardown fails ([b32e74e](https://github.com/pmatos/pewpew/commit/b32e74e9493959aa2e19ce0d8d40de3a089c0ff9))
+* **sessions:** stop cleanupInProgress leak, fix remote temp-dir fallback ([87ee1f7](https://github.com/pmatos/pewpew/commit/87ee1f7f8cec7469961102de89871462d43d940e))
+* **ui:** fall back to the claude badge for an unrecognized session.tool ([8ca9bdb](https://github.com/pmatos/pewpew/commit/8ca9bdbe17c4037446cfa6a7ccfe9e52c418a932))
+
+
+### Features
+
+* add oh-my-pi (omp) as a third supported agent tool ([6694a63](https://github.com/pmatos/pewpew/commit/6694a63a549f83bfea7069dc4b7c69962a176396))
+
 ## [0.3.1](https://github.com/pmatos/pewpew/compare/v0.3.0...v0.3.1) (2026-07-25)
 
 
