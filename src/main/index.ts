@@ -165,13 +165,15 @@ if (process.platform === 'linux') {
 const uiScale = getConfig().uiScale ?? 1.2
 app.commandLine.appendSwitch('force-device-scale-factor', uiScale.toString())
 
-function installNotifyScript(): void {
+function installBundledHookScripts(): void {
   const hooksDir = join(CONFIG_DIR, 'hooks')
   mkdirSync(hooksDir, { recursive: true })
-  const src = join(__dirname, '../../hooks/notify.sh')
-  const dest = join(hooksDir, 'notify.sh')
-  copyFileSync(src, dest)
-  chmodSync(dest, 0o755)
+  for (const name of ['notify.sh', 'worktree-guard.sh']) {
+    const src = join(__dirname, '../../hooks', name)
+    const dest = join(hooksDir, name)
+    copyFileSync(src, dest)
+    chmodSync(dest, 0o755)
+  }
 }
 
 // Tracks the last auto-reload per window so a renderer that crashes again right
@@ -258,7 +260,7 @@ app.whenReady().then(async () => {
     }
   }
 
-  installNotifyScript()
+  installBundledHookScripts()
 
   ipcMain.handle('projects:scan', async () => {
     const config = getConfig()

@@ -3,6 +3,7 @@ import type { ExecResult } from './host-connection'
 import type { AgentTool } from '../shared/types'
 
 export const NOTIFY_SCRIPT_VERSION = 1
+export const WORKTREE_GUARD_SCRIPT_VERSION = 1
 
 // Tools pewpew strictly requires on a remote host for sessions and the notify
 // hook to work. Exported so the connection-test flow can surface missing ones
@@ -40,6 +41,76 @@ PAYLOAD=$(printf '%s' "$INPUT" | jq -c \\
 echo "$PAYLOAD" | socat - UNIX-CONNECT:"$SOCKET" >/dev/null 2>/dev/null || true
 `
 
+// Logic body must stay byte-identical to hooks/worktree-guard.sh from its
+// root="$1" line onward — enforced by a round-trip test in
+// host-bootstrap.test.ts so the local and remote guards can't silently drift.
+export const worktreeGuardScript = `#!/usr/bin/env bash
+# pewpew worktree guard script v${WORKTREE_GUARD_SCRIPT_VERSION}
+PEWPEW_WORKTREE_GUARD_VERSION=${WORKTREE_GUARD_SCRIPT_VERSION}
+root="$1"
+[ -z "$root" ] && exit 0
+
+# Canonicalize the root itself (resolves any symlinks in the worktree path).
+root_real=$(cd "$root" 2>/dev/null && pwd -P) || exit 0
+
+payload=$(cat)
+target=$(printf '%s' "$payload" | jq -r '.tool_input.file_path // .tool_input.notebook_path // empty' 2>/dev/null)
+[ -z "$target" ] && exit 0
+
+# Resolve an absolute, symlink-free path even when the target doesn't exist
+# yet (a new file's parent directory may not have been created). Walk up from
+# the target until an existing *directory* ancestor is found (an existing
+# regular file can't be cd'd into, so -d rather than -e), canonicalize that,
+# then re-append the unresolved remainder.
+resolve_path() {
+  p="$1"
+  case "$p" in
+    /*) ;;
+    *) p="$root_real/$p" ;;
+  esac
+  suffix=""
+  while [ ! -d "$p" ]; do
+    suffix="/\${p##*/}$suffix"
+    parent="\${p%/*}"
+    if [ "$parent" = "$p" ] || [ -z "$parent" ]; then
+      p="/"
+      break
+    fi
+    p="$parent"
+  done
+  base=$(cd "$p" 2>/dev/null && pwd -P) || { printf ''; return; }
+  printf '%s%s\\n' "$base" "$suffix"
+}
+
+target_real=$(resolve_path "$target")
+[ -z "$target_real" ] && exit 0
+
+# Path-boundary check: target must be the root itself, or start with "root/".
+# A plain string-prefix check would let a sibling like "<root>-evil" through.
+case "$target_real" in
+  "$root_real") allowed=1 ;;
+  "$root_real"/*) allowed=1 ;;
+  *) allowed=0 ;;
+esac
+
+reason=""
+guard_settings="$root_real/.claude/settings.local.json"
+if [ "$target_real" = "$guard_settings" ]; then
+  allowed=0
+  reason="pewpew: this hook's own settings file ($guard_settings) may not be edited"
+fi
+
+[ "\${allowed:-0}" = "1" ] && exit 0
+
+if [ -z "$reason" ]; then
+  reason="pewpew: blocked write outside the session worktree ($root_real) — target resolved to $target_real"
+fi
+
+jq -nc --arg reason "$reason" \\
+  '{hookSpecificOutput:{hookEventName:"PreToolUse",permissionDecision:"deny",permissionDecisionReason:$reason}}'
+exit 0
+`
+
 export type HostBootstrapErrorKind = 'missing-deps' | 'stream-local-bind' | 'install-failed'
 
 export class HostBootstrapError extends Error {
@@ -67,11 +138,13 @@ export type AgentResolution = Partial<Record<AgentTool, string>>
 // search.
 interface CachedBootstrap {
   notifyScriptPath: string
+  guardScriptPath: string
   remoteSocketPath: string
 }
 
 export interface HostBootstrapResult {
   notifyScriptPath: string
+  guardScriptPath: string
   remoteSocketPath: string
   agentPaths: AgentResolution
 }
@@ -234,6 +307,10 @@ export async function bootstrapHost(
   const hooksDir = posix.join(configRoot, 'pewpew', 'hooks')
   const notifyScriptPath = posix.join(hooksDir, `notify-v${NOTIFY_SCRIPT_VERSION}.sh`)
   const breadcrumbPath = posix.join(hooksDir, 'socket-path')
+  const guardScriptPath = posix.join(
+    hooksDir,
+    `worktree-guard-v${WORKTREE_GUARD_SCRIPT_VERSION}.sh`
+  )
   const installScript =
     'set -e\n' +
     'mkdir -p "$1"\n' +
@@ -241,7 +318,11 @@ export async function bootstrapHost(
     '  printf "%s" "$4" > "$2"\n' +
     '  chmod 700 "$2"\n' +
     'fi\n' +
-    'printf "%s\\n" "$3" > "$6"\n'
+    'printf "%s\\n" "$3" > "$6"\n' +
+    'if [ ! -f "$7" ] || ! grep -q "PEWPEW_WORKTREE_GUARD_VERSION=$9" "$7"; then\n' +
+    '  printf "%s" "$8" > "$7"\n' +
+    '  chmod 755 "$7"\n' +
+    'fi\n'
   const install = await connection.exec(
     [
       'sh',
@@ -254,11 +335,18 @@ export async function bootstrapHost(
       notifyScript,
       String(NOTIFY_SCRIPT_VERSION),
       breadcrumbPath,
+      guardScriptPath,
+      worktreeGuardScript,
+      String(WORKTREE_GUARD_SCRIPT_VERSION),
     ],
     { timeoutMs: 15000 }
   )
-  await expectOk(install, 'install-failed', 'Unable to install remote notify hook')
+  await expectOk(
+    install,
+    'install-failed',
+    'Unable to install remote notify hook and worktree guard'
+  )
 
-  bootstrapped.set(hostId, { notifyScriptPath, remoteSocketPath })
-  return { notifyScriptPath, remoteSocketPath, agentPaths }
+  bootstrapped.set(hostId, { notifyScriptPath, guardScriptPath, remoteSocketPath })
+  return { notifyScriptPath, guardScriptPath, remoteSocketPath, agentPaths }
 }

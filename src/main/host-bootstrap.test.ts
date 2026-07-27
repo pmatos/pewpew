@@ -1,4 +1,6 @@
 import { describe, it, expect } from 'vitest'
+import { readFileSync } from 'fs'
+import { join } from 'path'
 import {
   bootstrapHost,
   HostBootstrapError,
@@ -6,6 +8,8 @@ import {
   probeMissingDeps,
   resolveRemoteAgents,
   STRICT_DEPS,
+  worktreeGuardScript,
+  WORKTREE_GUARD_SCRIPT_VERSION,
   type AgentResolution,
   type HostBootstrapConnection,
 } from './host-bootstrap'
@@ -60,6 +64,7 @@ describe('bootstrapHost', () => {
 
     expect(result).toEqual({
       notifyScriptPath: '/home/dev/.config/pewpew/hooks/notify-v1.sh',
+      guardScriptPath: '/home/dev/.config/pewpew/hooks/worktree-guard-v1.sh',
       remoteSocketPath: '/tmp/ipc',
       agentPaths: { claude: '/usr/bin/claude', codex: '/usr/bin/codex' },
     })
@@ -118,6 +123,19 @@ describe('bootstrapHost', () => {
     expect(installCall).toBeDefined()
     expect(installCall?.[2]).toContain('grep -q "PEWPEW_NOTIFY_VERSION=$5"')
     expect(installCall).toContain(String(NOTIFY_SCRIPT_VERSION))
+  })
+
+  it('installs through a version guard so already-installed worktree guard scripts are kept', async () => {
+    const calls: string[][] = []
+    await bootstrapHost('host-bootstrap-guard-version-guard', fakeConnection(calls), '/tmp/ipc')
+
+    const installCall = calls.find((argv) =>
+      argv.some((part) => part.includes(`worktree-guard-v${WORKTREE_GUARD_SCRIPT_VERSION}.sh`))
+    )
+    expect(installCall).toBeDefined()
+    expect(installCall?.[2]).toContain('grep -q "PEWPEW_WORKTREE_GUARD_VERSION=$9"')
+    expect(installCall).toContain(String(WORKTREE_GUARD_SCRIPT_VERSION))
+    expect(installCall).toContain(worktreeGuardScript)
   })
 
   it('passes cached agent paths into the resolve script on subsequent bootstraps', async () => {
@@ -211,6 +229,16 @@ describe('bootstrapHost', () => {
     await expect(
       bootstrapHost('host-probe-nonzero', failingConn, '/tmp/ipc')
     ).rejects.toMatchObject({ kind: 'install-failed' })
+  })
+})
+
+describe('worktreeGuardScript', () => {
+  it('stays byte-identical to hooks/worktree-guard.sh from its root="$1" line onward', () => {
+    const localScript = readFileSync(join(__dirname, '../../hooks/worktree-guard.sh'), 'utf-8')
+    const marker = 'root="$1"'
+    const localBody = localScript.slice(localScript.indexOf(marker))
+    const remoteBody = worktreeGuardScript.slice(worktreeGuardScript.indexOf(marker))
+    expect(remoteBody).toBe(localBody)
   })
 })
 
