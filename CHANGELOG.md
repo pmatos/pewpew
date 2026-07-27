@@ -1,3 +1,10 @@
+# [0.5.0](https://github.com/pmatos/pewpew/compare/v0.4.0...v0.5.0) (2026-07-27)
+
+
+### Features
+
+* **sessions:** block file-tool writes outside the session worktree ([#236](https://github.com/pmatos/pewpew/issues/236)) ([f62baa5](https://github.com/pmatos/pewpew/commit/f62baa5a334709ac5df6b9f340f9320fc3617f1c))
+
 # [0.4.0](https://github.com/pmatos/pewpew/compare/v0.3.1...v0.4.0) (2026-07-27)
 
 
