@@ -1671,14 +1671,15 @@ export async function removeSession(id: string): Promise<void> {
   // subprocess is still running — before this session is even out of the
   // `sessions` map. Without this guard that races the explicit, dialog-free
   // delete here against a "clean up worktree?" prompt for a worktree that's
-  // already being (or already was) force-removed. Released in the catch below
+  // already being (or already was) force-removed. Released below on both paths:
   // on failure: getRequiredHost throws synchronously for a removed host
   // config, and destroyRemotePty throws on SSH failures — both reachable
   // since this is called directly from the sessions:remove(-batch) IPC
-  // handlers, not just via promptCleanup. On success the session is deleted
-  // from `sessions` below and can never be revived, so nothing needs to
-  // release the guard; on failure the session survives and must not stay
-  // permanently wedged out of future cleanup-dialog prompts.
+  // handlers, not just via promptCleanup, so the failure path must not leave
+  // the surviving session permanently wedged out of future cleanup-dialog
+  // prompts. The success path also releases it (rather than leaving it "safe
+  // to leak forever since the id can't be revived") so this process-lifetime
+  // Set doesn't grow by one entry for every session ever removed.
   cleanupInProgress.add(id)
   try {
     if (entry?.session.hostId) {
@@ -1689,6 +1690,7 @@ export async function removeSession(id: string): Promise<void> {
     }
     await removeWorktree(id)
     sessions.delete(id)
+    cleanupInProgress.delete(id)
     onSessionsChanged()
   } catch (err) {
     cleanupInProgress.delete(id)
@@ -2376,7 +2378,10 @@ async function hasRemoteClaudeConversationHistory(
 // home falls back to a tmp-root-relative or legacy `--<path>--` encoding;
 // pewpew worktrees can in principle live outside $HOME, so both are ported
 // too rather than assumed away.
-function encodeOmpSessionDirName(cwd: string): string {
+// Exported so session-manager.test.ts can assert parity against the POSIX
+// shell port below (OMP_ENCODE_SHELL_SCRIPT) by running both against the
+// same table of paths.
+export function encodeOmpSessionDirName(cwd: string): string {
   const resolvedCwd = canonicalPath(cwd)
   const home = canonicalPath(homedir())
   const tempRoot = canonicalPath(tmpdir())
@@ -2406,25 +2411,35 @@ function hasOmpConversationHistory(worktreePath: string): boolean {
 // home-relative / tmp-relative / legacy-absolute encoding in POSIX shell.
 // Canonicalizes cwd, $HOME, and the temp root with `cd -P`/`pwd -P` (portable,
 // unlike GNU-only `readlink -f`), then pattern-matches which root the cwd
-// falls under via `case`. Any SSH/probe failure returns false, so revival
-// falls back to a fresh spawn rather than risk `omp --continue` exiting
+// falls under via `case`. The temp root resolves TMPDIR, then TMP, then TEMP,
+// then /tmp — matching Node's own os.tmpdir() fallback order (which the local
+// encodeOmpSessionDirName delegates to via tmpdir()), so a remote host that
+// sets only TMP or TEMP still encodes a temp-rooted worktree the same way
+// omp itself would. Any SSH/probe failure returns false, so revival falls
+// back to a fresh spawn rather than risk `omp --continue` exiting
 // immediately on a directory that doesn't exist yet.
+// The encoding half of hasRemoteOmpConversationHistory's script, split out so
+// session-manager.test.ts can run it through a real shell (echoing $enc
+// instead of testing a directory) and assert parity with
+// encodeOmpSessionDirName across a table of representative paths — the
+// production function below just appends its own `[ -d ... ]` check.
+export const OMP_ENCODE_SHELL_SCRIPT =
+  'canon() { CDPATH= cd -P -- "$1" 2>/dev/null && pwd -P; }; ' +
+  'p=$(canon "$1"); [ -n "$p" ] || p="$1"; ' +
+  'h=$(canon "$HOME"); [ -n "$h" ] || h="$HOME"; ' +
+  'case "$p" in ' +
+  '"$h") enc="-" ;; ' +
+  '"$h"/*) rel=${p#"$h"/}; enc="-$(printf \'%s\' "$rel" | sed \'s/[\\/\\\\:]/-/g\')" ;; ' +
+  '*) t=$(canon "${TMPDIR:-${TMP:-${TEMP:-/tmp}}}"); [ -n "$t" ] || t="${TMPDIR:-${TMP:-${TEMP:-/tmp}}}"; ' +
+  'case "$p" in ' +
+  '"$t") enc="-tmp" ;; ' +
+  '"$t"/*) rel=${p#"$t"/}; enc="-tmp-$(printf \'%s\' "$rel" | sed \'s/[\\/\\\\:]/-/g\')" ;; ' +
+  '*) enc="--$(printf \'%s\' "$p" | sed \'s/^[\\/\\\\]//; s/[\\/\\\\:]/-/g\')--" ;; ' +
+  'esac ;; ' +
+  'esac'
+
 async function hasRemoteOmpConversationHistory(host: Host, worktreePath: string): Promise<boolean> {
-  const script =
-    'canon() { CDPATH= cd -P -- "$1" 2>/dev/null && pwd -P; }; ' +
-    'p=$(canon "$1"); [ -n "$p" ] || p="$1"; ' +
-    'h=$(canon "$HOME"); [ -n "$h" ] || h="$HOME"; ' +
-    'case "$p" in ' +
-    '"$h") enc="-" ;; ' +
-    '"$h"/*) rel=${p#"$h"/}; enc="-$(printf \'%s\' "$rel" | sed \'s/[\\/\\\\:]/-/g\')" ;; ' +
-    '*) t=$(canon "${TMPDIR:-/tmp}"); [ -n "$t" ] || t="${TMPDIR:-/tmp}"; ' +
-    'case "$p" in ' +
-    '"$t") enc="-tmp" ;; ' +
-    '"$t"/*) rel=${p#"$t"/}; enc="-tmp-$(printf \'%s\' "$rel" | sed \'s/[\\/\\\\:]/-/g\')" ;; ' +
-    '*) enc="--$(printf \'%s\' "$p" | sed \'s/^[\\/\\\\]//; s/[\\/\\\\:]/-/g\')--" ;; ' +
-    'esac ;; ' +
-    'esac; ' +
-    '[ -d "$h/.omp/agent/sessions/$enc" ]'
+  const script = `${OMP_ENCODE_SHELL_SCRIPT}; [ -d "$h/.omp/agent/sessions/$enc" ]`
   try {
     const result = await execRemote(host, ['sh', '-c', script, '_', worktreePath], {
       timeoutMs: 10000,
