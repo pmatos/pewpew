@@ -1,11 +1,17 @@
 import { execFile, execFileSync } from 'child_process'
 import { promisify } from 'util'
-import { readFileSync, writeFileSync, existsSync, realpathSync } from 'fs'
-import { join, basename, sep, relative, isAbsolute } from 'path'
+import { readFileSync, writeFileSync, existsSync } from 'fs'
+import { join, basename, sep } from 'path'
 import { posix } from 'path'
-import { homedir, tmpdir } from 'os'
+import { homedir } from 'os'
 import { randomUUID } from 'crypto'
 import { dialog, shell } from 'electron'
+import {
+  canonicalPath,
+  encodeOmpSessionDirName,
+  OMP_ENCODE_SHELL_SCRIPT,
+} from './agent-state-paths'
+export { encodeOmpSessionDirName, OMP_ENCODE_SHELL_SCRIPT } from './agent-state-paths'
 import { broadcastToAll, getMainWindow } from './window-registry'
 import { CONFIG_DIR, getConfig, getReconnectConfig, saveConfig } from './config'
 import { updateTray } from './tray'
@@ -357,14 +363,6 @@ async function deriveLabel(worktreePath: string): Promise<string> {
     // fall through to basename
   }
   return basename(worktreePath)
-}
-
-function canonicalPath(p: string): string {
-  try {
-    return realpathSync(p)
-  } catch {
-    return p
-  }
 }
 
 async function isGitWorktree(worktreePath: string): Promise<boolean> {
@@ -2405,41 +2403,6 @@ async function hasRemoteClaudeConversationHistory(
   }
 }
 
-// omp (oh-my-pi) stores per-cwd session history under
-// `~/.omp/agent/sessions/<encoded>/`, where <encoded> is NOT a simple
-// full-path substitution like Claude's. Ported from omp's own encoder
-// (packages/coding-agent/src/session/session-paths.ts,
-// getDefaultSessionDirName/encodeRelativeSessionDirName): canonicalize both
-// cwd and $HOME, take cwd relative to home, and if that relative path doesn't
-// escape upward (i.e. cwd is under home), prefix it with '-' and replace path
-// separators with '-' (cwd === home itself encodes to just '-'). A cwd outside
-// home falls back to a tmp-root-relative or legacy `--<path>--` encoding;
-// pewpew worktrees can in principle live outside $HOME, so both are ported
-// too rather than assumed away.
-// Exported so session-manager.test.ts can assert parity against the POSIX
-// shell port below (OMP_ENCODE_SHELL_SCRIPT) by running both against the
-// same table of paths.
-export function encodeOmpSessionDirName(cwd: string): string {
-  const resolvedCwd = canonicalPath(cwd)
-  const home = canonicalPath(homedir())
-  const tempRoot = canonicalPath(tmpdir())
-  const homeRelative = relative(home, resolvedCwd)
-  if (homeRelative === '' || (!homeRelative.startsWith('..') && !isAbsolute(homeRelative))) {
-    return encodeOmpRelativeSessionDirName('-', homeRelative)
-  }
-  const tempRelative = relative(tempRoot, resolvedCwd)
-  if (tempRelative === '' || (!tempRelative.startsWith('..') && !isAbsolute(tempRelative))) {
-    return encodeOmpRelativeSessionDirName('-tmp', tempRelative)
-  }
-  return `--${resolvedCwd.replace(/^[/\\]/, '').replace(/[/\\:]/g, '-')}--`
-}
-
-function encodeOmpRelativeSessionDirName(prefix: string, relativePath: string): string {
-  const encoded = relativePath.replace(/[/\\:]/g, '-')
-  if (!encoded) return prefix
-  return prefix.endsWith('-') ? `${prefix}${encoded}` : `${prefix}-${encoded}`
-}
-
 function hasOmpConversationHistory(worktreePath: string): boolean {
   const encoded = encodeOmpSessionDirName(worktreePath)
   return existsSync(join(homedir(), '.omp', 'agent', 'sessions', encoded))
@@ -2456,26 +2419,6 @@ function hasOmpConversationHistory(worktreePath: string): boolean {
 // omp itself would. Any SSH/probe failure returns false, so revival falls
 // back to a fresh spawn rather than risk `omp --continue` exiting
 // immediately on a directory that doesn't exist yet.
-// The encoding half of hasRemoteOmpConversationHistory's script, split out so
-// session-manager.test.ts can run it through a real shell (echoing $enc
-// instead of testing a directory) and assert parity with
-// encodeOmpSessionDirName across a table of representative paths — the
-// production function below just appends its own `[ -d ... ]` check.
-export const OMP_ENCODE_SHELL_SCRIPT =
-  'canon() { CDPATH= cd -P -- "$1" 2>/dev/null && pwd -P; }; ' +
-  'p=$(canon "$1"); [ -n "$p" ] || p="$1"; ' +
-  'h=$(canon "$HOME"); [ -n "$h" ] || h="$HOME"; ' +
-  'case "$p" in ' +
-  '"$h") enc="-" ;; ' +
-  '"$h"/*) rel=${p#"$h"/}; enc="-$(printf \'%s\' "$rel" | sed \'s/[\\/\\\\:]/-/g\')" ;; ' +
-  '*) t=$(canon "${TMPDIR:-${TMP:-${TEMP:-/tmp}}}"); [ -n "$t" ] || t="${TMPDIR:-${TMP:-${TEMP:-/tmp}}}"; ' +
-  'case "$p" in ' +
-  '"$t") enc="-tmp" ;; ' +
-  '"$t"/*) rel=${p#"$t"/}; enc="-tmp-$(printf \'%s\' "$rel" | sed \'s/[\\/\\\\:]/-/g\')" ;; ' +
-  '*) enc="--$(printf \'%s\' "$p" | sed \'s/^[\\/\\\\]//; s/[\\/\\\\:]/-/g\')--" ;; ' +
-  'esac ;; ' +
-  'esac'
-
 async function hasRemoteOmpConversationHistory(host: Host, worktreePath: string): Promise<boolean> {
   const script = `${OMP_ENCODE_SHELL_SCRIPT}; [ -d "$h/.omp/agent/sessions/$enc" ]`
   try {

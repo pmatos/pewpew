@@ -49,6 +49,7 @@ vi.mock('fs', () => ({
   mkdirSync: (path: string) => {
     state.mkdirCalls.push(path)
   },
+  realpathSync: (path: string) => path,
 }))
 
 vi.mock('node-pty', () => ({
@@ -66,9 +67,11 @@ vi.mock('./host-connection', () => ({
 }))
 
 import { homedir } from 'os'
+import { join } from 'path'
 import { buildAgentArgs, createPty, createRemotePty } from './pty-manager'
 import { buildSandboxArgs } from './agent-sandbox'
 import { OMP_HOOK_SCRIPT } from './hook-installer'
+import { canonicalPath, encodeOmpSessionDirName } from './agent-state-paths'
 import type { Host } from '../shared/types'
 
 const PROJECT = '/home/dev/project'
@@ -190,26 +193,37 @@ describe('createPty', () => {
   it('prepends the bwrap sandbox prefix to the composed tmux argv when available', () => {
     createPty('s1', WORKTREE, { tool: 'claude', projectPath: PROJECT })
     const argv = agentArgsFromCall(state.tmuxArgvCalls[0])
+    const claudeStateDir = join(
+      homedir(),
+      '.claude',
+      'projects',
+      canonicalPath(WORKTREE).replace(/[^a-zA-Z0-9-]/g, '-')
+    )
     const expectedPrefix = buildSandboxArgs(PROJECT, WORKTREE, {
       enabled: true,
-      extraWritablePaths: [`${homedir()}/.claude`],
+      extraWritablePaths: [claudeStateDir],
     })
     expect(argv).toEqual([...expectedPrefix, ...buildAgentArgs({ tool: 'claude' })])
     expect(warnSpy).not.toHaveBeenCalled()
   })
 
-  it('creates the tool-specific state dir and opens it as an extra writable path', () => {
+  it('creates the tool-specific per-worktree state dir and opens only that as an extra writable path', () => {
     createPty('s1', WORKTREE, { tool: 'omp', projectPath: PROJECT })
-    expect(state.mkdirCalls).toContain(`${homedir()}/.omp`)
+    const ompStateDir = join(
+      homedir(),
+      '.omp',
+      'agent',
+      'sessions',
+      encodeOmpSessionDirName(WORKTREE)
+    )
+    expect(state.mkdirCalls).toContain(ompStateDir)
+    // Not the whole ~/.omp dir — only this worktree's own session subdirectory.
+    expect(state.mkdirCalls).not.toContain(join(homedir(), '.omp'))
     const argv = agentArgsFromCall(state.tmuxArgvCalls[0])
     // The extra writable path is bound after the project's own `.git`/`.git/hooks`
     // binds, so search for '--bind' starting past the last fixed occurrence.
     const bindIdx = argv.indexOf('--bind', argv.indexOf(`${PROJECT}/.git/hooks`))
-    expect(argv.slice(bindIdx, bindIdx + 3)).toEqual([
-      '--bind',
-      `${homedir()}/.omp`,
-      `${homedir()}/.omp`,
-    ])
+    expect(argv.slice(bindIdx, bindIdx + 3)).toEqual(['--bind', ompStateDir, ompStateDir])
   })
 
   it('omits the sandbox prefix and warns when bwrap is unavailable', () => {

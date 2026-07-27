@@ -17,6 +17,7 @@ import { captureRemotePaneTexts, type RemoteSessionEntry } from './remote-thumbn
 import { sanitizeChildEnv } from './appimage-env'
 import { buildSandboxArgs } from './agent-sandbox'
 import { OMP_HOOK_SCRIPT } from './hook-installer'
+import { canonicalPath, encodeOmpSessionDirName } from './agent-state-paths'
 import type { AgentTool, Host } from '../shared/types'
 
 interface SpawnOptions {
@@ -144,14 +145,34 @@ export function isSandboxAvailable(): boolean {
 
 // Under the hardened bwrap args (--ro-bind / /, see agent-sandbox.ts), $HOME
 // is read-only by default. Every supported tool persists conversation/session
-// state under its own dir there — claude at ~/.claude/projects/<encoded>
-// (see hasClaudeConversationHistory), omp at ~/.omp/agent/sessions/<encoded>
-// (see hasOmpConversationHistory), codex at ~/.codex — so without an explicit
-// writable exception every sandboxed session would fail on its very first
-// state write. Only the active session's own tool dir is opened, not the rest
-// of $HOME.
-function agentStateDir(tool?: AgentTool): string {
-  return join(homedir(), tool === 'omp' ? '.omp' : tool === 'codex' ? '.codex' : '.claude')
+// state under its own dir there, so without an explicit writable exception
+// every sandboxed session would fail on its very first state write.
+//
+// Narrowed to each tool's own per-worktree subdirectory, not the rest of
+// $HOME — opening the whole tool dir would also expose global config like
+// ~/.claude/CLAUDE.md and ~/.claude/settings.json, which every future
+// session across every project loads, turning one sandboxed write into a
+// persistence vector for every session afterward.
+//
+// claude and omp key their per-worktree directory off an encoded path
+// (hasClaudeConversationHistory / hasOmpConversationHistory in
+// session-manager.ts); the encoders are imported from agent-state-paths.ts
+// rather than reimplemented so a mismatch can't leave the sandbox binding a
+// different directory than the one resume-probing checks.
+//
+// codex has no per-worktree directory convention in this codebase — its
+// resume is keyed on `agentSessionId` from the hook payload, not a
+// filesystem path — so its writable exception stays the whole ~/.codex dir
+// for now; narrowing it would mean guessing at codex's own on-disk layout.
+function agentStateDir(tool: AgentTool | undefined, worktreePath: string): string {
+  if (tool === 'omp') {
+    return join(homedir(), '.omp', 'agent', 'sessions', encodeOmpSessionDirName(worktreePath))
+  }
+  if (tool === 'codex') {
+    return join(homedir(), '.codex')
+  }
+  const encoded = canonicalPath(worktreePath).replace(/[^a-zA-Z0-9-]/g, '-')
+  return join(homedir(), '.claude', 'projects', encoded)
 }
 
 export function initPtyManager(): void {
@@ -185,7 +206,7 @@ export function createPty(sessionId: string, cwd: string, options?: SpawnOptions
     if (!sandboxAvailable) {
       console.warn(`Session ${sessionId}: bwrap not found, spawning without sandbox containment`)
     }
-    const stateDir = agentStateDir(options.tool)
+    const stateDir = agentStateDir(options.tool, cwd)
     mkdirSync(stateDir, { recursive: true })
     sandboxPrefix = buildSandboxArgs(options.projectPath, cwd, {
       enabled: sandboxAvailable,
