@@ -246,7 +246,9 @@ describe('createPty', () => {
     const argv = agentArgsFromCall(state.tmuxArgvCalls[0])
     expect(argv).toEqual(buildAgentArgs({ tool: 'claude' }))
     expect(argv).not.toContain('bwrap')
-    expect(warnSpy).toHaveBeenCalledWith(expect.stringContaining('bwrap not found'))
+    expect(warnSpy).toHaveBeenCalledWith(
+      expect.stringContaining('bwrap missing or unable to sandbox')
+    )
   })
 
   it('skips sandboxing entirely (and never creates a state dir) when no projectPath is given', () => {

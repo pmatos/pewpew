@@ -260,8 +260,15 @@ export function createPty(sessionId: string, cwd: string, options?: SpawnOptions
   if (options?.projectPath) {
     const sandboxAvailable = isSandboxAvailable()
     if (!sandboxAvailable) {
-      console.warn(`Session ${sessionId}: bwrap not found, spawning without sandbox containment`)
+      console.warn(
+        `Session ${sessionId}: bwrap missing or unable to sandbox (not on PATH, or present but ` +
+          'unable to create the required namespaces/mounts), spawning without sandbox containment'
+      )
     }
+    // This directory doubles as session-manager.ts's resume-history marker
+    // (hasClaudeConversationHistory/hasOmpConversationHistory check it via
+    // existsSync) — creating it here, before the agent has ever run, is why
+    // those checks test directory *contents* rather than mere existence.
     const stateDir = agentStateDir(options.tool, cwd)
     mkdirSync(stateDir, { recursive: true })
     sandboxPrefix = buildSandboxArgs(options.projectPath, cwd, {

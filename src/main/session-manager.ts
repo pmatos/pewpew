@@ -1,6 +1,6 @@
 import { execFile, execFileSync } from 'child_process'
 import { promisify } from 'util'
-import { readFileSync, writeFileSync, existsSync } from 'fs'
+import { readFileSync, writeFileSync, existsSync, readdirSync } from 'fs'
 import { join, basename, sep } from 'path'
 import { posix } from 'path'
 import { homedir } from 'os'
@@ -2370,9 +2370,22 @@ export async function relocateProject(
 // `worktreePath`s only after the auto-recovery branch runs, so without this
 // `realpathSync` a migrated session would probe an encoded symlink path,
 // find nothing, and silently lose its conversation history on reboot.
+//
+// Checks directory *contents*, not mere existence: pty-manager.ts's sandbox
+// wiring pre-creates this exact directory (as a bwrap bind-source, before
+// the agent ever runs) so its first write doesn't resolve EROFS. Plain
+// `existsSync` would treat that pre-creation itself as proof of a real prior
+// conversation — a worktree's very first session, if the app restarts
+// before the agent writes anything, would then wrongly resume into an empty
+// directory and immediately exit instead of spawning fresh.
 function hasClaudeConversationHistory(worktreePath: string): boolean {
   const encoded = canonicalPath(worktreePath).replace(/[^a-zA-Z0-9-]/g, '-')
-  return existsSync(join(homedir(), '.claude', 'projects', encoded))
+  const dir = join(homedir(), '.claude', 'projects', encoded)
+  try {
+    return readdirSync(dir).length > 0
+  } catch {
+    return false
+  }
 }
 
 // Remote analogue of hasClaudeConversationHistory. Claude keys the per-worktree
@@ -2403,9 +2416,18 @@ async function hasRemoteClaudeConversationHistory(
   }
 }
 
+// Checks directory contents, not mere existence — same reasoning as
+// hasClaudeConversationHistory above: pty-manager.ts pre-creates this exact
+// directory before omp ever runs, so existence alone isn't proof of a real
+// prior conversation.
 function hasOmpConversationHistory(worktreePath: string): boolean {
   const encoded = encodeOmpSessionDirName(worktreePath)
-  return existsSync(join(homedir(), '.omp', 'agent', 'sessions', encoded))
+  const dir = join(homedir(), '.omp', 'agent', 'sessions', encoded)
+  try {
+    return readdirSync(dir).length > 0
+  } catch {
+    return false
+  }
 }
 
 // Remote analogue of hasOmpConversationHistory, mirroring the same
