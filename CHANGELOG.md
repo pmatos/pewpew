@@ -1,3 +1,10 @@
+# [0.7.0](https://github.com/pmatos/pewpew/compare/v0.6.0...v0.7.0) (2026-07-28)
+
+
+### Features
+
+* **sessions:** wire bwrap sandbox prefix into local and remote pty spawn ([#238](https://github.com/pmatos/pewpew/issues/238)) ([189e581](https://github.com/pmatos/pewpew/commit/189e581734c8d3a5e6123154a59ed61d22c840e7))
+
 # [0.6.0](https://github.com/pmatos/pewpew/compare/v0.5.0...v0.6.0) (2026-07-27)
 
 
