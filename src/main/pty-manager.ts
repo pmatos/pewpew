@@ -23,6 +23,7 @@ import {
   encodeOmpSessionDirName,
   OMP_ENCODE_SHELL_SCRIPT,
 } from './agent-state-paths'
+import { getSandboxConfig, resolvePath } from './config'
 import type { AgentTool, Host } from '../shared/types'
 
 interface SpawnOptions {
@@ -332,7 +333,46 @@ export function stopPtyManager(): void {
   }
 }
 
-export function createPty(sessionId: string, cwd: string, options?: SpawnOptions): void {
+// Resolves sandbox config once and composes the bwrap prefix for a local
+// spawn, including the caller-configured extraWritablePaths from config.json
+// — extraWritablePaths is local-only (a remote host's ~ can't be resolved
+// here), so this helper is not shared with the remote spawn path.
+function buildLocalSandboxPrefix(
+  sessionId: string,
+  projectPath: string | undefined,
+  cwd: string,
+  tool: AgentTool | undefined
+): string[] {
+  if (!projectPath) return []
+  const sandboxConfig = getSandboxConfig()
+  const sandboxAvailable = isSandboxAvailable()
+  if (sandboxConfig.enabled && !sandboxAvailable) {
+    console.warn(
+      `Session ${sessionId}: bwrap missing or unable to sandbox (not on PATH, or present but ` +
+        'unable to create the required namespaces/mounts), spawning without sandbox containment'
+    )
+  }
+  // This directory doubles as session-manager.ts's resume-history marker
+  // (hasClaudeConversationHistory/hasOmpConversationHistory check it via
+  // existsSync) — creating it here, before the agent has ever run, is why
+  // those checks test directory *contents* rather than mere existence.
+  const stateDir = agentStateDir(tool, cwd)
+  mkdirSync(stateDir, { recursive: true })
+  const gitDir = resolveGitDir(projectPath)
+  return buildSandboxArgs(projectPath, cwd, {
+    enabled: sandboxConfig.enabled && sandboxAvailable,
+    extraWritablePaths: [stateDir, ...sandboxConfig.extraWritablePaths.map(resolvePath)],
+    gitDir,
+  })
+}
+
+// Returns whether this session's agent process is running inside the bwrap
+// sandbox — false when projectPath was omitted, sandboxing is disabled in
+// config, or bwrap isn't available. Callers persist this on the Session so
+// the UI can show an accurate per-session indicator; it reflects reality at
+// spawn time only (reattachPty reuses the existing process and doesn't call
+// this again, which is correct — reattach doesn't re-wrap anything).
+export function createPty(sessionId: string, cwd: string, options?: SpawnOptions): boolean {
   if (!existsSync(cwd)) {
     throw new Error(`Working directory does not exist: ${cwd}`)
   }
@@ -346,28 +386,7 @@ export function createPty(sessionId: string, cwd: string, options?: SpawnOptions
   }
 
   const tmuxSession = `pewpew-${sessionId}`
-  let sandboxPrefix: string[] = []
-  if (options?.projectPath) {
-    const sandboxAvailable = isSandboxAvailable()
-    if (!sandboxAvailable) {
-      console.warn(
-        `Session ${sessionId}: bwrap missing or unable to sandbox (not on PATH, or present but ` +
-          'unable to create the required namespaces/mounts), spawning without sandbox containment'
-      )
-    }
-    // This directory doubles as session-manager.ts's resume-history marker
-    // (hasClaudeConversationHistory/hasOmpConversationHistory check it via
-    // existsSync) — creating it here, before the agent has ever run, is why
-    // those checks test directory *contents* rather than mere existence.
-    const stateDir = agentStateDir(options.tool, cwd)
-    mkdirSync(stateDir, { recursive: true })
-    const gitDir = resolveGitDir(options.projectPath)
-    sandboxPrefix = buildSandboxArgs(options.projectPath, cwd, {
-      enabled: sandboxAvailable,
-      extraWritablePaths: [stateDir],
-      gitDir,
-    })
-  }
+  const sandboxPrefix = buildLocalSandboxPrefix(sessionId, options?.projectPath, cwd, options?.tool)
   const agentArgs = [...sandboxPrefix, ...buildAgentArgs(options)]
 
   // Create a detached tmux session that directly runs the agent CLI.
@@ -402,6 +421,7 @@ export function createPty(sessionId: string, cwd: string, options?: SpawnOptions
   })
 
   ptys.set(sessionId, entry)
+  return sandboxPrefix.length > 0
 }
 
 function releaseRemoteEntry(entry: PtyEntry): void {
@@ -410,12 +430,15 @@ function releaseRemoteEntry(entry: PtyEntry): void {
   void releaseHostConnection(entry.host.hostId)
 }
 
+// See createPty's doc comment for what the returned boolean means. Remote
+// sessions never get extraWritablePaths — a remote host's home directory
+// (needed to resolve a `~/` entry) can't be resolved from this process.
 export async function createRemotePty(
   sessionId: string,
   cwd: string,
   host: Host,
   options?: SpawnOptions
-): Promise<void> {
+): Promise<boolean> {
   const tmuxSession = `pewpew-${sessionId}`
   let sandboxPrefix: string[] = []
   if (options?.projectPath) {
@@ -434,13 +457,14 @@ export async function createRemotePty(
       resolveRemoteGitDir(host, options.projectPath),
       resolveRemoteAgentStateDir(host, options.tool, cwd),
     ])
-    const canSandbox = options?.sandboxAvailable === true && !!stateDir
+    const sandboxEnabled = getSandboxConfig().enabled
+    const canSandbox = sandboxEnabled && options?.sandboxAvailable === true && !!stateDir
     sandboxPrefix = buildSandboxArgs(options.projectPath, cwd, {
       enabled: canSandbox,
       extraWritablePaths: stateDir ? [stateDir] : [],
       gitDir,
     })
-    if (options?.sandboxAvailable === true && !canSandbox) {
+    if (sandboxEnabled && options?.sandboxAvailable === true && !stateDir) {
       console.warn(
         `Session ${sessionId}: bwrap is available on host ${host.alias} but the remote ` +
           'agent state directory could not be resolved, spawning without sandbox containment'
@@ -494,6 +518,7 @@ export async function createRemotePty(
   })
 
   ptys.set(sessionId, entry)
+  return sandboxPrefix.length > 0
 }
 
 export function writePty(sessionId: string, data: string): void {

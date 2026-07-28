@@ -58,9 +58,16 @@
 //      core.hooksPath pointed elsewhere) instead of hard-failing bwrap's spawn.
 //   9. extra caller-granted writable paths — any path that equals, is
 //      nested under, or is an ancestor of <project> is dropped, since it
-//      would re-open the read-only guarantees from steps 1 and 6-8
+//      would re-open the read-only guarantees from steps 1 and 6-8. Uses
+//      --bind-try: a --bind of a source that doesn't exist makes bwrap exit
+//      before the agent ever runs, which is worse than not granting the path.
 //   10. --bind <worktree> <worktree>       the session's own worktree, r/w
-//   11. --chdir <worktree> --              land in the worktree; `--`
+//   11. --ro-bind-try <worktree>/.claude/settings.local.json  close the one
+//      file back up: without this, Bash inside the sandbox (which the worktree
+//      bind at step 10 left read-write) could overwrite its own guard-hook
+//      settings and disarm the PreToolUse guard for the next session. -try
+//      because the file may not exist yet on a session's first ever spawn.
+//   12. --chdir <worktree> --              land in the worktree; `--`
 //      separates bwrap's own options from the command to run inside it
 //
 // Deliberately NOT ro-binding <project>/.git/config: that breaks `git config
@@ -80,6 +87,9 @@ const normalizePath = (path: string): string => {
 
 export interface SandboxOptions {
   enabled?: boolean
+  // Must already be fully resolved (no `~`, which bwrap does not expand) and
+  // absolute. Sources that don't exist are silently skipped via --bind-try
+  // rather than crashing the sandbox.
   extraWritablePaths?: string[]
   // Real .git directory for the project root. Defaults to `<projectPath>/.git`
   // which is correct for a standard worktree. A gitfile root (a submodule or
@@ -165,9 +175,19 @@ export function buildSandboxArgs(
   const safeExtraWritablePaths = extraWritablePaths.filter((path) => !overlapsProject(path))
 
   for (const path of safeExtraWritablePaths) {
-    args.push('--bind', path, path)
+    args.push('--bind-try', path, path)
   }
 
-  args.push('--bind', worktreePath, worktreePath, '--chdir', worktreePath, '--')
+  args.push(
+    '--bind',
+    worktreePath,
+    worktreePath,
+    '--ro-bind-try',
+    `${worktreePath}/.claude/settings.local.json`,
+    `${worktreePath}/.claude/settings.local.json`,
+    '--chdir',
+    worktreePath,
+    '--'
+  )
   return args
 }

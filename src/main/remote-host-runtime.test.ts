@@ -34,6 +34,7 @@ function deps(): RemoteHostRuntimeDeps {
     execRemote: vi.fn(async () => ({ stdout: '', stderr: '', code: 0, timedOut: false })),
     setHostAgentPaths: vi.fn(),
     emitToast: vi.fn(),
+    sandboxEnabled: vi.fn(() => true),
   }
 }
 
@@ -102,5 +103,26 @@ describe('sandbox availability', () => {
         detail: expect.stringContaining('Claude sessions still block'),
       })
     )
+  })
+
+  it('suppresses the unavailable toast when sandboxing is disabled in config', async () => {
+    const fakes = deps()
+    fakes.bootstrapHost = vi.fn(async () => ({
+      notifyScriptPath: '/tmp/notify.sh',
+      guardScriptPath: '/tmp/worktree-guard.sh',
+      ompHookScriptPath: '/tmp/omp-notify.ts',
+      remoteSocketPath: '/tmp/remote.sock',
+      sandboxAvailable: false,
+      agentPaths: { claude: '/bin/claude' },
+    }))
+    fakes.sandboxEnabled = vi.fn(() => false)
+    const runtime = createRemoteHostRuntime(fakes)
+
+    // Distinct hostId: sandboxWarned is module-global and already holds
+    // no-bwrap-host from the test above, which would suppress the toast
+    // regardless of the config gate.
+    await runtime.withPreparedHost(host({ hostId: 'sandbox-disabled-host' }), async () => null)
+
+    expect(fakes.emitToast).not.toHaveBeenCalled()
   })
 })

@@ -97,6 +97,7 @@ vi.mock('./config', () => ({
     worktreeBase: state.worktreeBase,
   }),
   getReconnectConfig: () => state.reconnectConfig,
+  getSandboxConfig: () => ({ enabled: true, extraWritablePaths: [] }),
   saveConfig: vi.fn(),
 }))
 

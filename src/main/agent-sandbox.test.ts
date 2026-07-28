@@ -3,6 +3,7 @@ import { buildSandboxArgs } from './agent-sandbox'
 
 const PROJECT = '/home/dev/project'
 const WORKTREE = '/home/dev/project/.claude/worktrees/wt1'
+const SETTINGS = `${WORKTREE}/.claude/settings.local.json`
 
 describe('buildSandboxArgs', () => {
   it('produces the exact bind order, including the trailing -- separator', () => {
@@ -33,6 +34,9 @@ describe('buildSandboxArgs', () => {
       '--bind',
       WORKTREE,
       WORKTREE,
+      '--ro-bind-try',
+      SETTINGS,
+      SETTINGS,
       '--chdir',
       WORKTREE,
       '--',
@@ -65,6 +69,16 @@ describe('buildSandboxArgs', () => {
     expect(args).toContain(`${PROJECT}/.git/hooks`)
   })
 
+  it('closes write access to its own settings.local.json inside the worktree bind, using -try since the file may not exist yet', () => {
+    const args = buildSandboxArgs(PROJECT, WORKTREE)
+    // The hooks ro-bind-try precedes this one in the argv — search past it
+    // so the assertion targets the settings bind, not the hooks bind.
+    const settingsIdx = args.indexOf('--ro-bind-try', args.indexOf(`${PROJECT}/.git/hooks`))
+    const worktreeIdx = args.indexOf('--bind', args.indexOf(`${PROJECT}/.git/hooks`))
+    expect(settingsIdx).toBeGreaterThan(worktreeIdx)
+    expect(args.slice(settingsIdx, settingsIdx + 3)).toEqual(['--ro-bind-try', SETTINGS, SETTINGS])
+  })
+
   it('defaults to enabled when opts is omitted', () => {
     expect(buildSandboxArgs(PROJECT, WORKTREE).length).toBeGreaterThan(0)
   })
@@ -93,19 +107,19 @@ describe('buildSandboxArgs', () => {
     expect(buildSandboxArgs(PROJECT, `${PROJECT}/./`)).toEqual([])
   })
 
-  it('appends extra writable paths as --bind pairs before the final --chdir/--', () => {
+  it('appends extra writable paths as --bind-try pairs, tolerating a missing source', () => {
     const args = buildSandboxArgs(PROJECT, WORKTREE, {
       extraWritablePaths: ['/opt/data', '/var/tmp'],
     })
     const chdirIdx = args.indexOf('--chdir')
-    const extraIdx = args.indexOf('--bind', args.indexOf(`${PROJECT}/.git/hooks`))
-    expect(args.slice(extraIdx, extraIdx + 3)).toEqual(['--bind', '/opt/data', '/opt/data'])
-    expect(args.slice(extraIdx + 3, extraIdx + 6)).toEqual(['--bind', '/var/tmp', '/var/tmp'])
+    const extraIdx = args.indexOf('--bind-try', args.indexOf(`${PROJECT}/.git/hooks`))
+    expect(args.slice(extraIdx, extraIdx + 3)).toEqual(['--bind-try', '/opt/data', '/opt/data'])
+    expect(args.slice(extraIdx + 3, extraIdx + 6)).toEqual(['--bind-try', '/var/tmp', '/var/tmp'])
     expect(extraIdx).toBeLessThan(chdirIdx)
     expect(args.slice(chdirIdx)).toEqual(['--chdir', WORKTREE, '--'])
   })
 
-  it('appends no extra --bind pairs when extraWritablePaths is empty', () => {
+  it('appends no extra binds when extraWritablePaths is empty', () => {
     const withEmpty = buildSandboxArgs(PROJECT, WORKTREE, { extraWritablePaths: [] })
     const withOmitted = buildSandboxArgs(PROJECT, WORKTREE)
     expect(withEmpty).toEqual(withOmitted)

@@ -242,6 +242,18 @@ export default function SessionCard({ session, thumbnail, style, onOpenSession, 
           >
             {(TOOL_BADGE[session.tool] ?? TOOL_BADGE.claude).letter}
           </span>
+          {session.sandboxed !== undefined && (
+            <span
+              className={`sandbox-badge ${session.sandboxed ? 'sandbox-on' : 'sandbox-off'}`}
+              title={
+                session.sandboxed
+                  ? 'Sandboxed — Bash commands are confined to this worktree'
+                  : 'Not sandboxed — bwrap is unavailable, but file-tool writes are still blocked by the guard hook'
+              }
+            >
+              sandbox
+            </span>
+          )}
           {host && connectionState && <span className="connection-label">{connectionState}</span>}
         </div>
         <div className="session-card-time">{timeAgo(session.lastActivity)}</div>

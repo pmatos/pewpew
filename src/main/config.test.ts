@@ -8,7 +8,7 @@ vi.mock('fs', () => ({
 }))
 
 import { readFileSync } from 'fs'
-import { getReconnectConfig } from './config'
+import { getReconnectConfig, getSandboxConfig } from './config'
 
 describe('getReconnectConfig', () => {
   beforeEach(() => vi.clearAllMocks())
@@ -28,6 +28,30 @@ describe('getReconnectConfig', () => {
       enabled: true,
       initialDelayMs: 1000,
       maxDelayMs: 30000,
+    })
+  })
+})
+
+describe('getSandboxConfig', () => {
+  beforeEach(() => vi.clearAllMocks())
+
+  it('fills default extraWritablePaths when the persisted sandbox object is partial', () => {
+    vi.mocked(readFileSync).mockReturnValue(JSON.stringify({ sandbox: { enabled: false } }))
+    expect(getSandboxConfig()).toEqual({ enabled: false, extraWritablePaths: [] })
+  })
+
+  it('returns the full default when no sandbox key is persisted', () => {
+    vi.mocked(readFileSync).mockReturnValue(JSON.stringify({ scanDirs: ['~/x'] }))
+    expect(getSandboxConfig()).toEqual({ enabled: true, extraWritablePaths: [] })
+  })
+
+  it('preserves a persisted extraWritablePaths list', () => {
+    vi.mocked(readFileSync).mockReturnValue(
+      JSON.stringify({ sandbox: { extraWritablePaths: ['~/scratch', '/tmp/build'] } })
+    )
+    expect(getSandboxConfig()).toEqual({
+      enabled: true,
+      extraWritablePaths: ['~/scratch', '/tmp/build'],
     })
   })
 })
