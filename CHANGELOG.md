@@ -1,3 +1,10 @@
+# [0.10.0](https://github.com/pmatos/pewpew/compare/v0.9.0...v0.10.0) (2026-07-28)
+
+
+### Features
+
+* select agent for bulk PR sessions ([#257](https://github.com/pmatos/pewpew/issues/257)) ([1f66792](https://github.com/pmatos/pewpew/commit/1f66792dc4ba3e0b7008f44f8aeffeb325c5741c))
+
 # [0.9.0](https://github.com/pmatos/pewpew/compare/v0.8.0...v0.9.0) (2026-07-28)
 
 
