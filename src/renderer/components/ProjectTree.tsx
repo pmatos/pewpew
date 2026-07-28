@@ -23,6 +23,23 @@ interface TreeProps {
   onOpenSession?: (id: string, name: string) => void
 }
 
+export async function resolveBulkPrDialogDefaults(
+  api: {
+    getRepoChoices: () => Promise<RepoChoices | string>
+    getDefaultTool: () => Promise<AgentTool>
+  },
+  fallbackTool: AgentTool
+): Promise<{ repoChoices: RepoChoices | null; tool: AgentTool }> {
+  const [choices, tool] = await Promise.all([
+    api.getRepoChoices().catch(() => null),
+    api.getDefaultTool().catch(() => fallbackTool),
+  ])
+  return {
+    repoChoices: choices && typeof choices !== 'string' ? choices : null,
+    tool,
+  }
+}
+
 interface ProjectTreeUiState {
   expanded: Set<string>
   menu: MenuState | null
@@ -378,18 +395,18 @@ function useProjectTreeElement({ onOpenSession }: TreeProps) {
   const openAllPrs = async (projectPath: string, hostId: string | null) => {
     if (creating) return
     const token = (repoRequestRef.current += 1)
-    let choices: RepoChoices | string | null
-    try {
-      choices = await window.api.getRepoChoices(projectPath, hostId)
-    } catch {
-      choices = null
-    }
+    const { repoChoices: resolvedChoices, tool } = await resolveBulkPrDialogDefaults(
+      {
+        getRepoChoices: () => window.api.getRepoChoices(projectPath, hostId),
+        getDefaultTool: () => window.api.getDefaultTool(),
+      },
+      defaultTool
+    )
     if (repoRequestRef.current !== token) return
-    const resolvedChoices = choices && typeof choices !== 'string' ? choices : null
     setUi({
       pendingOpenAllPrsPath: projectPath,
       pendingOpenAllPrsHostId: hostId,
-      pendingOpenAllPrsTool: defaultTool,
+      pendingOpenAllPrsTool: tool,
       repoChoices: resolvedChoices,
       selectedRepo: resolvedChoices?.current ?? '',
     })
