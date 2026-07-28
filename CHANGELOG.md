@@ -1,3 +1,10 @@
+# [0.8.0](https://github.com/pmatos/pewpew/compare/v0.7.0...v0.8.0) (2026-07-28)
+
+
+### Features
+
+* **sessions:** probe remote bwrap availability and surface it per host ([#239](https://github.com/pmatos/pewpew/issues/239)) ([39048fa](https://github.com/pmatos/pewpew/commit/39048fa0702a7aaeb490fffa04ae78c7bd5754d6))
+
 # [0.7.0](https://github.com/pmatos/pewpew/compare/v0.6.0...v0.7.0) (2026-07-28)
 
 
