@@ -49,7 +49,7 @@ declare global {
       openSessionsForOpenPrs: (
         projectPath: string,
         hostId?: string | null,
-        repo?: string | null
+        options?: CreateSessionOptions
       ) => Promise<OpenSessionsSummary | string>
       openSessionsForOpenIssues: (
         projectPath: string,

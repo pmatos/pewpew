@@ -1932,11 +1932,11 @@ async function openSessionsForNumberedItems(
   field: 'prNumber' | 'issueNumber',
   listItems: ListNumberedItems,
   createSession: CreateNumberedSession,
-  repo: string | null = null
+  options: CreateSessionOptions = {}
 ): Promise<OpenSessionsSummary | string> {
   let items: NumberedGhItem[] | string
   try {
-    items = await listItems(projectPath, hostId, repo)
+    items = await listItems(projectPath, hostId, options.repo ?? null)
   } catch (err) {
     return describeGhError(err)
   }
@@ -1948,7 +1948,7 @@ async function openSessionsForNumberedItems(
     field,
     items.map((i) => i.number),
     createSession,
-    repo ? { repo } : {}
+    options
   )
 }
 
@@ -2281,7 +2281,7 @@ async function createRemoteIssueSession(
 export async function openSessionsForOpenPrs(
   projectPath: string,
   hostId: string | null = null,
-  repo: string | null = null,
+  options: CreateSessionOptions = {},
   deps: OpenSessionsDeps = {}
 ): Promise<OpenSessionsSummary | string> {
   return openSessionsForNumberedItems(
@@ -2290,7 +2290,7 @@ export async function openSessionsForOpenPrs(
     'prNumber',
     deps.listPrs ?? listOpenPrs,
     deps.createPrSession ?? createPrSession,
-    repo
+    options
   )
 }
 
@@ -2307,7 +2307,7 @@ export async function openSessionsForOpenIssues(
     'issueNumber',
     deps.listIssues ?? ((p, h, r) => listOpenIssues(p, h, label, r)),
     deps.createIssueSession ?? createIssueSession,
-    repo
+    repo ? { repo } : {}
   )
 }
 
