@@ -19,6 +19,7 @@ export interface PreparedRemoteHost {
   notifyScriptPath: string
   guardScriptPath: string
   ompHookScriptPath: string
+  sandboxAvailable: boolean
   agentPaths: AgentResolution
 }
 
@@ -52,6 +53,10 @@ export interface RemoteHostRuntime {
   acquirePreparedHost(host: Host): Promise<PreparedRemoteHostLease>
   withPreparedHost<T>(host: Host, fn: (prepared: PreparedRemoteHost) => Promise<T>): Promise<T>
 }
+
+// Hosts we've already surfaced the "sandbox unavailable" toast for, so it
+// fires once per host per app run rather than on every session created there.
+const sandboxWarned = new Set<string>()
 
 function toastBootstrapError(
   host: Host,
@@ -120,10 +125,25 @@ export function createRemoteHostRuntime(deps: RemoteHostRuntimeDeps): RemoteHost
         host.agentPaths ?? {}
       )
       deps.setHostAgentPaths(host.hostId, bootstrap.agentPaths)
+      if (!bootstrap.sandboxAvailable && !sandboxWarned.has(host.hostId)) {
+        sandboxWarned.add(host.hostId)
+        const label = host.label || host.alias
+        deps.emitToast({
+          severity: 'info',
+          title: `${label}: sandbox unavailable`,
+          detail:
+            'bwrap is unavailable or unable to create the required sandbox on this ' +
+            'host, so sessions run without worktree containment for Bash commands. ' +
+            'Claude sessions still block file-tool writes outside the worktree via ' +
+            'the guard hook; Codex and omp sessions run without that guard.',
+          hostLabel: label,
+        })
+      }
       return {
         notifyScriptPath: bootstrap.notifyScriptPath,
         guardScriptPath: bootstrap.guardScriptPath,
         ompHookScriptPath: bootstrap.ompHookScriptPath,
+        sandboxAvailable: bootstrap.sandboxAvailable,
         agentPaths: bootstrap.agentPaths,
       }
     } catch (err) {

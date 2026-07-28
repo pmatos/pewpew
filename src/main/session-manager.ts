@@ -663,7 +663,13 @@ async function adoptRemoteWorktree(
 
   const branch = await remoteHostRuntime.withPreparedHost(
     host,
-    async ({ notifyScriptPath, guardScriptPath, ompHookScriptPath, agentPaths }) => {
+    async ({
+      notifyScriptPath,
+      guardScriptPath,
+      ompHookScriptPath,
+      sandboxAvailable,
+      agentPaths,
+    }) => {
       const agentPath = agentPaths[tool]
       if (!agentPath) {
         throw new Error(`${tool} is not installed on host ${host.label || host.alias}`)
@@ -695,6 +701,7 @@ async function adoptRemoteWorktree(
         agentPath,
         projectPath,
         notifyHookPath: ompHookScriptPath,
+        sandboxAvailable,
       })
       return resolvedBranch
     }
@@ -749,7 +756,13 @@ async function createRemoteSession(
 
   const branch = await remoteHostRuntime.withPreparedHost(
     host,
-    async ({ notifyScriptPath, guardScriptPath, ompHookScriptPath, agentPaths }) => {
+    async ({
+      notifyScriptPath,
+      guardScriptPath,
+      ompHookScriptPath,
+      sandboxAvailable,
+      agentPaths,
+    }) => {
       const agentPath = agentPaths[effectiveTool]
       if (!agentPath) {
         throw new Error(`${effectiveTool} is not installed on host ${host.label || host.alias}`)
@@ -829,6 +842,7 @@ async function createRemoteSession(
         agentPath,
         projectPath,
         notifyHookPath: ompHookScriptPath,
+        sandboxAvailable,
       })
       return resolvedBranch
     }
@@ -882,7 +896,13 @@ async function createRemotePrSession(
 
   return remoteHostRuntime.withPreparedHost(
     host,
-    async ({ notifyScriptPath, guardScriptPath, ompHookScriptPath, agentPaths }) => {
+    async ({
+      notifyScriptPath,
+      guardScriptPath,
+      ompHookScriptPath,
+      sandboxAvailable,
+      agentPaths,
+    }) => {
       const ghProbe = await probeRemoteGh(host)
       if (!ghProbe.ok) {
         return ghProbe.error
@@ -1000,6 +1020,7 @@ async function createRemotePrSession(
         agentPath,
         projectPath,
         notifyHookPath: ompHookScriptPath,
+        sandboxAvailable,
       })
 
       const session: Session = {
@@ -1508,30 +1529,36 @@ export async function reviveSession(id: string): Promise<void> {
     session.connectionState = 'connecting'
     onSessionsChanged()
     try {
-      await remoteHostRuntime.withPreparedHost(host, async ({ agentPaths, ompHookScriptPath }) => {
-        if (await hasRemoteTmuxSession(id, host)) {
-          await reattachRemotePty(id, host)
-        } else {
-          const agentPath = agentPaths[session.tool]
-          if (!agentPath) {
-            throw new Error(`${session.tool} is not installed on host ${host.label || host.alias}`)
+      await remoteHostRuntime.withPreparedHost(
+        host,
+        async ({ agentPaths, ompHookScriptPath, sandboxAvailable }) => {
+          if (await hasRemoteTmuxSession(id, host)) {
+            await reattachRemotePty(id, host)
+          } else {
+            const agentPath = agentPaths[session.tool]
+            if (!agentPath) {
+              throw new Error(
+                `${session.tool} is not installed on host ${host.label || host.alias}`
+              )
+            }
+            const canResume = await canResumeRemoteAgent(session, host)
+            if (!canResume) {
+              console.warn(
+                `Session ${id} (${session.tool}) has no prior conversation on host ${host.alias}; spawning fresh instead of resuming`
+              )
+            }
+            await createRemotePty(id, session.worktreePath, host, {
+              continueSession: canResume,
+              tool: session.tool,
+              agentSessionId: session.agentSessionId,
+              agentPath,
+              projectPath: session.projectPath,
+              notifyHookPath: ompHookScriptPath,
+              sandboxAvailable,
+            })
           }
-          const canResume = await canResumeRemoteAgent(session, host)
-          if (!canResume) {
-            console.warn(
-              `Session ${id} (${session.tool}) has no prior conversation on host ${host.alias}; spawning fresh instead of resuming`
-            )
-          }
-          await createRemotePty(id, session.worktreePath, host, {
-            continueSession: canResume,
-            tool: session.tool,
-            agentSessionId: session.agentSessionId,
-            agentPath,
-            projectPath: session.projectPath,
-            notifyHookPath: ompHookScriptPath,
-          })
         }
-      })
+      )
     } catch (err) {
       session.connectionState = 'offline'
       onSessionsChanged()
@@ -2130,7 +2157,13 @@ async function createRemoteIssueSession(
 
   return remoteHostRuntime.withPreparedHost(
     host,
-    async ({ notifyScriptPath, guardScriptPath, ompHookScriptPath, agentPaths }) => {
+    async ({
+      notifyScriptPath,
+      guardScriptPath,
+      ompHookScriptPath,
+      sandboxAvailable,
+      agentPaths,
+    }) => {
       const effectiveTool: AgentTool = options.tool ?? getConfig().defaultTool
       const agentPath = agentPaths[effectiveTool]
       if (!agentPath) {
@@ -2209,6 +2242,7 @@ async function createRemoteIssueSession(
         agentPath,
         projectPath,
         notifyHookPath: ompHookScriptPath,
+        sandboxAvailable,
       })
 
       const session: Session = {
@@ -2405,7 +2439,12 @@ async function hasRemoteClaudeConversationHistory(
   const script =
     'p=$(CDPATH= cd -P -- "$1" 2>/dev/null && pwd -P); [ -n "$p" ] || p="$1"; ' +
     "enc=$(printf '%s' \"$p\" | sed 's/[^a-zA-Z0-9-]/-/g'); " +
-    '[ -d "$HOME/.claude/projects/$enc" ]'
+    // Check directory *contents*, not mere existence: createRemotePty's
+    // resolveRemoteAgentStateDir pre-creates this exact directory (as a bwrap
+    // bind-source, before the agent ever runs) so existence alone isn't proof
+    // of a real prior conversation — a worktree's very first session, if the
+    // app restarts before the agent writes anything, would wrongly resume.
+    '[ -n "$(ls -A "$HOME/.claude/projects/$enc" 2>/dev/null)" ]'
   try {
     const result = await execRemote(host, ['sh', '-c', script, '_', worktreePath], {
       timeoutMs: 10000,
@@ -2441,8 +2480,13 @@ function hasOmpConversationHistory(worktreePath: string): boolean {
 // omp itself would. Any SSH/probe failure returns false, so revival falls
 // back to a fresh spawn rather than risk `omp --continue` exiting
 // immediately on a directory that doesn't exist yet.
+//
+// Checks directory *contents*, not mere existence — same reasoning as
+// hasOmpConversationHistory above: createRemotePty's resolveRemoteAgentStateDir
+// pre-creates this exact directory before omp ever runs, so existence alone
+// isn't proof of a real prior conversation.
 async function hasRemoteOmpConversationHistory(host: Host, worktreePath: string): Promise<boolean> {
-  const script = `${OMP_ENCODE_SHELL_SCRIPT}; [ -d "$h/.omp/agent/sessions/$enc" ]`
+  const script = `${OMP_ENCODE_SHELL_SCRIPT}; [ -n "$(ls -A "$h/.omp/agent/sessions/$enc" 2>/dev/null)" ]`
   try {
     const result = await execRemote(host, ['sh', '-c', script, '_', worktreePath], {
       timeoutMs: 10000,

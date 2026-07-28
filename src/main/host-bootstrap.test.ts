@@ -75,6 +75,7 @@ describe('bootstrapHost', () => {
       guardScriptPath: '/home/dev/.config/pewpew/hooks/worktree-guard-v5.sh',
       ompHookScriptPath: '/home/dev/.config/pewpew/hooks/omp-notify-v1.ts',
       remoteSocketPath: '/tmp/ipc',
+      sandboxAvailable: true,
       agentPaths: { claude: '/usr/bin/claude', codex: '/usr/bin/codex' },
     })
     expect(calls.some((argv) => argv.some((a) => a.includes('resolve_one claude')))).toBe(true)
@@ -334,6 +335,90 @@ describe('bootstrapHost', () => {
     await expect(
       bootstrapHost('host-probe-nonzero', failingConn, '/tmp/ipc')
     ).rejects.toMatchObject({ kind: 'install-failed' })
+  })
+
+  // The real bwrap invocation probe (probeRemoteSandboxUsable) runs
+  // `bwrap --ro-bind / / ...` — distinguish it from the strict-deps
+  // `command -v` probe by the bwrap argv in the script text.
+  function isBwrapProbeCall(argv: string[]): boolean {
+    const script = argv[2]
+    return typeof script === 'string' && script.includes('bwrap --ro-bind')
+  }
+
+  it('reports sandboxAvailable=false without failing the bootstrap when bwrap is missing', async () => {
+    const conn: HostBootstrapConnection = {
+      exec: async (argv) => {
+        const script = argv[2]
+        if (isBwrapProbeCall(argv)) {
+          return { stdout: '', stderr: 'bwrap: command not found', code: 127, timedOut: false }
+        }
+        if (script.includes('command -v') && script.includes('missing="$missing $dep"')) {
+          return ok('\n')
+        }
+        if (script.includes('resolve_one claude')) return ok('/usr/bin/claude\n/usr/bin/codex\n')
+        if (script === 'test -S "$1"') return ok()
+        if (script.includes('XDG_CONFIG_HOME')) return ok('/home/dev/.config')
+        return ok()
+      },
+    }
+    const result = await bootstrapHost('host-no-bwrap', conn, '/tmp/ipc')
+    expect(result.sandboxAvailable).toBe(false)
+  })
+
+  it('treats a failed bwrap probe (nonzero exit) the same as bwrap missing', async () => {
+    const conn: HostBootstrapConnection = {
+      exec: async (argv) => {
+        const script = argv[2]
+        if (isBwrapProbeCall(argv)) {
+          // bwrap is on PATH but can't create namespaces (unprivileged userns
+          // disabled, LSM policy, etc.) — the real-invocation probe catches
+          // what a `command -v` presence check would miss.
+          return {
+            stdout: '',
+            stderr: 'bwrap: failed to create namespace',
+            code: 1,
+            timedOut: false,
+          }
+        }
+        if (script.includes('command -v') && script.includes('missing="$missing $dep"')) {
+          return ok('\n')
+        }
+        if (script.includes('resolve_one claude')) return ok('/usr/bin/claude\n/usr/bin/codex\n')
+        if (script === 'test -S "$1"') return ok()
+        if (script.includes('XDG_CONFIG_HOME')) return ok('/home/dev/.config')
+        return ok()
+      },
+    }
+    const result = await bootstrapHost('host-sandbox-probe-fails', conn, '/tmp/ipc')
+    expect(result.sandboxAvailable).toBe(false)
+  })
+
+  it('reports sandboxAvailable=true when the bwrap probe succeeds', async () => {
+    const calls: string[][] = []
+    const result = await bootstrapHost('host-bwrap-present', fakeConnection(calls), '/tmp/ipc')
+    expect(result.sandboxAvailable).toBe(true)
+    expect(calls.some((argv) => isBwrapProbeCall(argv))).toBe(true)
+  })
+
+  it('re-probes sandbox availability on a cache hit (does not cache sandboxAvailable)', async () => {
+    const calls: string[][] = []
+    const conn = fakeConnection(calls)
+    // First bootstrap: bwrap probe succeeds (fakeConnection returns ok()).
+    const first = await bootstrapHost('host-cache-reprobe', conn, '/tmp/ipc')
+    expect(first.sandboxAvailable).toBe(true)
+
+    // Second call hits the cache but re-probes bwrap. Make the probe fail this
+    // time to prove sandboxAvailable isn't pinned to the cached true.
+    const conn2: HostBootstrapConnection = {
+      exec: async (argv) => {
+        if (isBwrapProbeCall(argv)) {
+          return { stdout: '', stderr: 'namespace error', code: 1, timedOut: false }
+        }
+        return conn.exec(argv)
+      },
+    }
+    const second = await bootstrapHost('host-cache-reprobe', conn2, '/tmp/ipc')
+    expect(second.sandboxAvailable).toBe(false)
   })
 })
 

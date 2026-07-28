@@ -81,6 +81,14 @@ const normalizePath = (path: string): string => {
 export interface SandboxOptions {
   enabled?: boolean
   extraWritablePaths?: string[]
+  // Real .git directory for the project root. Defaults to `<projectPath>/.git`
+  // which is correct for a standard worktree. A gitfile root (a submodule or
+  // linked worktree whose `.git` is a *file* like `gitdir: /path/to/real/.git`,
+  // not a directory) must pass the resolved real git dir here instead — bwrap
+  // can't bind a file as a directory mount, and `git commit/checkout` need the
+  // real dir writable. Callers resolve this via `git rev-parse --git-common-dir`
+  // (local) or the remote equivalent before calling buildSandboxArgs.
+  gitDir?: string
 }
 
 export function buildSandboxArgs(
@@ -88,7 +96,7 @@ export function buildSandboxArgs(
   worktreePath: string,
   opts: SandboxOptions = {}
 ): string[] {
-  const { enabled = true, extraWritablePaths = [] } = opts
+  const { enabled = true, extraWritablePaths = [], gitDir } = opts
   if (!enabled) return []
 
   // Nothing to confine to when the "worktree" IS the project root (e.g. a
@@ -99,6 +107,11 @@ export function buildSandboxArgs(
   // and a read-write bind for the same directory, with the read-write one
   // winning — silently making the entire project writable.
   if (normalizePath(worktreePath) === normalizePath(projectPath)) return []
+
+  // Resolve the real .git directory. A gitfile root (submodule or linked
+  // worktree whose `.git` is a file, not a directory) must pass gitDir
+  // explicitly — bwrap can't bind a file as a directory mount.
+  const realGitDir = gitDir ?? `${projectPath}/.git`
 
   const args = [
     'bwrap',
@@ -116,11 +129,11 @@ export function buildSandboxArgs(
     projectPath,
     projectPath,
     '--bind',
-    `${projectPath}/.git`,
-    `${projectPath}/.git`,
+    realGitDir,
+    realGitDir,
     '--ro-bind-try',
-    `${projectPath}/.git/hooks`,
-    `${projectPath}/.git/hooks`,
+    `${realGitDir}/hooks`,
+    `${realGitDir}/hooks`,
   ]
 
   // extraWritablePaths binds run after the project ro-binds above, and bwrap

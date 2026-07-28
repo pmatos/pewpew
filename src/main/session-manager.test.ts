@@ -174,6 +174,8 @@ vi.mock('./host-bootstrap', () => ({
   bootstrapHost: vi.fn(async () => ({
     notifyScriptPath: '/tmp/notify-v1.sh',
     ompHookScriptPath: '/tmp/omp-notify-v1.ts',
+    guardScriptPath: '/tmp/worktree-guard-v1.sh',
+    sandboxAvailable: true,
     agentPaths: { claude: '/r/bin/claude', codex: '/r/bin/codex', omp: '/r/bin/omp' },
   })),
 }))
