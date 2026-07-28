@@ -229,10 +229,11 @@ describe('worktree-guard.sh', () => {
   })
 
   it('fails open when no root argument is given', () => {
-    const out = execFileSync('bash', [SCRIPT], {
-      input: JSON.stringify(writePayload('/etc/passwd')),
-      encoding: 'utf-8',
-    })
+    // No `input` here: the script's `[ -z "$root" ] && exit 0` guard exits
+    // before it ever reads stdin, so writing a payload races the pipe close
+    // and intermittently throws EPIPE from execFileSync instead of
+    // exercising the behavior this test actually checks.
+    const out = execFileSync('bash', [SCRIPT], { encoding: 'utf-8' })
     expect(out.trim()).toBe('')
   })
 

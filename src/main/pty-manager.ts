@@ -1,7 +1,9 @@
 import * as pty from 'node-pty'
 import type { IPty } from 'node-pty'
 import { execFileSync } from 'child_process'
-import { existsSync } from 'fs'
+import { existsSync, mkdirSync } from 'fs'
+import { homedir } from 'os'
+import { join } from 'path'
 import { dialog } from 'electron'
 import { broadcastToAll } from './window-registry'
 import {
@@ -13,7 +15,9 @@ import {
 import { classifySshExit } from './ssh-exit-parser'
 import { captureRemotePaneTexts, type RemoteSessionEntry } from './remote-thumbnail'
 import { sanitizeChildEnv } from './appimage-env'
+import { buildSandboxArgs } from './agent-sandbox'
 import { OMP_HOOK_SCRIPT } from './hook-installer'
+import { canonicalPath, encodeOmpSessionDirName } from './agent-state-paths'
 import type { AgentTool, Host } from '../shared/types'
 
 interface SpawnOptions {
@@ -26,6 +30,14 @@ interface SpawnOptions {
   // pass it through here so tmux can exec it directly. Omitted for local
   // sessions where the GUI process inherits a usable PATH.
   agentPath?: string
+  // Project root — the read-only boundary the bwrap sandbox draws around the
+  // worktree (see agent-sandbox.ts). Omitted skips sandboxing entirely.
+  projectPath?: string
+  // Remote-only: whether bwrap was confirmed present on the target host by
+  // the remote bootstrap probe. Local sessions self-check via
+  // isSandboxAvailable() instead, since there's no equivalent signal for a
+  // remote host to check here.
+  sandboxAvailable?: boolean
   // Absolute path (on the target host) to the omp hook bridge script passed
   // via `--hook`. Defaults to OMP_HOOK_SCRIPT for local sessions; remote
   // sessions must pass the path returned by bootstrapHost/withPreparedHost
@@ -111,9 +123,9 @@ function appendToBuffer(entry: PtyEntry, data: string): void {
   scheduleFlush()
 }
 
-export function isTmuxAvailable(): boolean {
+function commandAvailable(bin: string): boolean {
   try {
-    execFileSync('which', ['tmux'], {
+    execFileSync('which', [bin], {
       stdio: 'pipe',
       env: sanitizeChildEnv() as NodeJS.ProcessEnv,
     })
@@ -121,6 +133,102 @@ export function isTmuxAvailable(): boolean {
   } catch {
     return false
   }
+}
+
+export function isTmuxAvailable(): boolean {
+  return commandAvailable('tmux')
+}
+
+// `which bwrap` only proves the binary is on PATH — it doesn't prove bwrap
+// can actually create the namespaces/mounts it needs. Unprivileged user
+// namespaces can be disabled host-wide (sysctl
+// kernel.unprivileged_userns_clone=0) or blocked by an LSM/container policy,
+// in which case bwrap fails at exec time and a session spawned with the
+// sandbox prefix dies immediately instead of falling back to the unsandboxed
+// path the missing-binary case already gets. Probe with a real (minimal)
+// invocation exercising the same namespace/mount setup as the production
+// prefix in agent-sandbox.ts (--ro-bind / /, --dev /dev, --unshare-pid,
+// --proc /proc, --tmpfs /tmp) — a strict subset of that argv, so a pass here
+// isn't a false positive on a host that can list bwrap on PATH but can't run
+// it. `timeout` is load-bearing: this runs synchronously on the Electron main
+// process, so a hang (not just a nonzero exit) must not block the UI.
+//
+// Only the positive result is memoized: caching a negative would wrongly pin
+// every future session to unsandboxed if the host's namespace policy changes
+// (or bubblewrap gets installed) mid-run — same reasoning as the caching
+// discussion tracked in #251 for the simpler presence check this replaces.
+let sandboxUsable: boolean | null = null
+
+function probeSandboxUsable(): boolean {
+  if (sandboxUsable) return true
+  try {
+    execFileSync(
+      'bwrap',
+      [
+        '--ro-bind',
+        '/',
+        '/',
+        '--dev',
+        '/dev',
+        '--unshare-pid',
+        '--proc',
+        '/proc',
+        '--tmpfs',
+        '/tmp',
+        '--',
+        '/bin/true',
+      ],
+      { stdio: 'pipe', timeout: 3000, env: sanitizeChildEnv() as NodeJS.ProcessEnv }
+    )
+    sandboxUsable = true
+    return true
+  } catch {
+    return false
+  }
+}
+
+// Test-only escape hatch: pty-manager.test.ts exercises both the usable and
+// unusable case within one process, and the positive-only memoization above
+// would otherwise make the first successful probe permanently mask a later
+// test simulating an unusable bwrap. Not called from any production path.
+export function __resetSandboxProbeCacheForTesting(): void {
+  sandboxUsable = null
+}
+
+export function isSandboxAvailable(): boolean {
+  return probeSandboxUsable()
+}
+
+// Under the hardened bwrap args (--ro-bind / /, see agent-sandbox.ts), $HOME
+// is read-only by default. Every supported tool persists conversation/session
+// state under its own dir there, so without an explicit writable exception
+// every sandboxed session would fail on its very first state write.
+//
+// Narrowed to each tool's own per-worktree subdirectory, not the rest of
+// $HOME — opening the whole tool dir would also expose global config like
+// ~/.claude/CLAUDE.md and ~/.claude/settings.json, which every future
+// session across every project loads, turning one sandboxed write into a
+// persistence vector for every session afterward.
+//
+// claude and omp key their per-worktree directory off an encoded path
+// (hasClaudeConversationHistory / hasOmpConversationHistory in
+// session-manager.ts); the encoders are imported from agent-state-paths.ts
+// rather than reimplemented so a mismatch can't leave the sandbox binding a
+// different directory than the one resume-probing checks.
+//
+// codex has no per-worktree directory convention in this codebase — its
+// resume is keyed on `agentSessionId` from the hook payload, not a
+// filesystem path — so its writable exception stays the whole ~/.codex dir
+// for now; narrowing it would mean guessing at codex's own on-disk layout.
+function agentStateDir(tool: AgentTool | undefined, worktreePath: string): string {
+  if (tool === 'omp') {
+    return join(homedir(), '.omp', 'agent', 'sessions', encodeOmpSessionDirName(worktreePath))
+  }
+  if (tool === 'codex') {
+    return join(homedir(), '.codex')
+  }
+  const encoded = canonicalPath(worktreePath).replace(/[^a-zA-Z0-9-]/g, '-')
+  return join(homedir(), '.claude', 'projects', encoded)
 }
 
 export function initPtyManager(): void {
@@ -148,7 +256,27 @@ export function createPty(sessionId: string, cwd: string, options?: SpawnOptions
   }
 
   const tmuxSession = `pewpew-${sessionId}`
-  const agentArgs = buildAgentArgs(options)
+  let sandboxPrefix: string[] = []
+  if (options?.projectPath) {
+    const sandboxAvailable = isSandboxAvailable()
+    if (!sandboxAvailable) {
+      console.warn(
+        `Session ${sessionId}: bwrap missing or unable to sandbox (not on PATH, or present but ` +
+          'unable to create the required namespaces/mounts), spawning without sandbox containment'
+      )
+    }
+    // This directory doubles as session-manager.ts's resume-history marker
+    // (hasClaudeConversationHistory/hasOmpConversationHistory check it via
+    // existsSync) — creating it here, before the agent has ever run, is why
+    // those checks test directory *contents* rather than mere existence.
+    const stateDir = agentStateDir(options.tool, cwd)
+    mkdirSync(stateDir, { recursive: true })
+    sandboxPrefix = buildSandboxArgs(options.projectPath, cwd, {
+      enabled: sandboxAvailable,
+      extraWritablePaths: [stateDir],
+    })
+  }
+  const agentArgs = [...sandboxPrefix, ...buildAgentArgs(options)]
 
   // Create a detached tmux session that directly runs the agent CLI.
   // Using tmux's shell command avoids issues with interactive shell init (omz, etc.)
@@ -197,7 +325,10 @@ export async function createRemotePty(
   options?: SpawnOptions
 ): Promise<void> {
   const tmuxSession = `pewpew-${sessionId}`
-  const agentArgs = buildAgentArgs(options)
+  const sandboxPrefix = options?.projectPath
+    ? buildSandboxArgs(options.projectPath, cwd, { enabled: options?.sandboxAvailable === true })
+    : []
+  const agentArgs = [...sandboxPrefix, ...buildAgentArgs(options)]
 
   const create = await execRemote(host, [
     'tmux',

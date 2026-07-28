@@ -1,11 +1,17 @@
 import { execFile, execFileSync } from 'child_process'
 import { promisify } from 'util'
-import { readFileSync, writeFileSync, existsSync, realpathSync } from 'fs'
-import { join, basename, sep, relative, isAbsolute } from 'path'
+import { readFileSync, writeFileSync, existsSync, readdirSync } from 'fs'
+import { join, basename, sep } from 'path'
 import { posix } from 'path'
-import { homedir, tmpdir } from 'os'
+import { homedir } from 'os'
 import { randomUUID } from 'crypto'
 import { dialog, shell } from 'electron'
+import {
+  canonicalPath,
+  encodeOmpSessionDirName,
+  OMP_ENCODE_SHELL_SCRIPT,
+} from './agent-state-paths'
+export { encodeOmpSessionDirName, OMP_ENCODE_SHELL_SCRIPT } from './agent-state-paths'
 import { broadcastToAll, getMainWindow } from './window-registry'
 import { CONFIG_DIR, getConfig, getReconnectConfig, saveConfig } from './config'
 import { updateTray } from './tray'
@@ -359,14 +365,6 @@ async function deriveLabel(worktreePath: string): Promise<string> {
   return basename(worktreePath)
 }
 
-function canonicalPath(p: string): string {
-  try {
-    return realpathSync(p)
-  } catch {
-    return p
-  }
-}
-
 async function isGitWorktree(worktreePath: string): Promise<boolean> {
   if (!existsSync(worktreePath)) return false
   try {
@@ -465,7 +463,7 @@ async function adoptWorktree(
   const branch = resolveBranchFromWorktree(worktreePath, worktreeName, projectName)
 
   await installAgentHooks(tool, worktreePath)
-  createPty(id, worktreePath, { tool })
+  createPty(id, worktreePath, { tool, projectPath })
 
   const session: Session = {
     id,
@@ -695,6 +693,7 @@ async function adoptRemoteWorktree(
       await createRemotePty(id, worktreePath, host, {
         tool,
         agentPath,
+        projectPath,
         notifyHookPath: ompHookScriptPath,
       })
       return resolvedBranch
@@ -828,6 +827,7 @@ async function createRemoteSession(
       await createRemotePty(id, worktreePath, host, {
         tool: effectiveTool,
         agentPath,
+        projectPath,
         notifyHookPath: ompHookScriptPath,
       })
       return resolvedBranch
@@ -998,6 +998,7 @@ async function createRemotePrSession(
       await createRemotePty(id, worktreePath, host, {
         tool: effectiveTool,
         agentPath,
+        projectPath,
         notifyHookPath: ompHookScriptPath,
       })
 
@@ -1526,6 +1527,7 @@ export async function reviveSession(id: string): Promise<void> {
             tool: session.tool,
             agentSessionId: session.agentSessionId,
             agentPath,
+            projectPath: session.projectPath,
             notifyHookPath: ompHookScriptPath,
           })
         }
@@ -1558,6 +1560,7 @@ export async function reviveSession(id: string): Promise<void> {
       continueSession: canResume,
       tool: session.tool,
       agentSessionId: session.agentSessionId,
+      projectPath: session.projectPath,
     })
   }
   updateSession(id, 'idle')
@@ -1618,6 +1621,7 @@ export async function attachLocalSession(id: string): Promise<void> {
         continueSession: canResume,
         tool: session.tool,
         agentSessionId: session.agentSessionId,
+        projectPath: session.projectPath,
       })
     }
     session.connectionState = undefined
@@ -2203,6 +2207,7 @@ async function createRemoteIssueSession(
       await createRemotePty(id, worktreePath, host, {
         tool: effectiveTool,
         agentPath,
+        projectPath,
         notifyHookPath: ompHookScriptPath,
       })
 
@@ -2320,7 +2325,7 @@ export async function relocateProject(
     if (hasPty(s.id)) {
       destroyPty(s.id)
       if (existsSync(s.worktreePath)) {
-        createPty(s.id, s.worktreePath, { tool: s.tool })
+        createPty(s.id, s.worktreePath, { tool: s.tool, projectPath: s.projectPath })
         s.status = 'idle'
       } else {
         s.status = 'dead'
@@ -2365,9 +2370,22 @@ export async function relocateProject(
 // `worktreePath`s only after the auto-recovery branch runs, so without this
 // `realpathSync` a migrated session would probe an encoded symlink path,
 // find nothing, and silently lose its conversation history on reboot.
+//
+// Checks directory *contents*, not mere existence: pty-manager.ts's sandbox
+// wiring pre-creates this exact directory (as a bwrap bind-source, before
+// the agent ever runs) so its first write doesn't resolve EROFS. Plain
+// `existsSync` would treat that pre-creation itself as proof of a real prior
+// conversation — a worktree's very first session, if the app restarts
+// before the agent writes anything, would then wrongly resume into an empty
+// directory and immediately exit instead of spawning fresh.
 function hasClaudeConversationHistory(worktreePath: string): boolean {
   const encoded = canonicalPath(worktreePath).replace(/[^a-zA-Z0-9-]/g, '-')
-  return existsSync(join(homedir(), '.claude', 'projects', encoded))
+  const dir = join(homedir(), '.claude', 'projects', encoded)
+  try {
+    return readdirSync(dir).length > 0
+  } catch {
+    return false
+  }
 }
 
 // Remote analogue of hasClaudeConversationHistory. Claude keys the per-worktree
@@ -2398,44 +2416,18 @@ async function hasRemoteClaudeConversationHistory(
   }
 }
 
-// omp (oh-my-pi) stores per-cwd session history under
-// `~/.omp/agent/sessions/<encoded>/`, where <encoded> is NOT a simple
-// full-path substitution like Claude's. Ported from omp's own encoder
-// (packages/coding-agent/src/session/session-paths.ts,
-// getDefaultSessionDirName/encodeRelativeSessionDirName): canonicalize both
-// cwd and $HOME, take cwd relative to home, and if that relative path doesn't
-// escape upward (i.e. cwd is under home), prefix it with '-' and replace path
-// separators with '-' (cwd === home itself encodes to just '-'). A cwd outside
-// home falls back to a tmp-root-relative or legacy `--<path>--` encoding;
-// pewpew worktrees can in principle live outside $HOME, so both are ported
-// too rather than assumed away.
-// Exported so session-manager.test.ts can assert parity against the POSIX
-// shell port below (OMP_ENCODE_SHELL_SCRIPT) by running both against the
-// same table of paths.
-export function encodeOmpSessionDirName(cwd: string): string {
-  const resolvedCwd = canonicalPath(cwd)
-  const home = canonicalPath(homedir())
-  const tempRoot = canonicalPath(tmpdir())
-  const homeRelative = relative(home, resolvedCwd)
-  if (homeRelative === '' || (!homeRelative.startsWith('..') && !isAbsolute(homeRelative))) {
-    return encodeOmpRelativeSessionDirName('-', homeRelative)
-  }
-  const tempRelative = relative(tempRoot, resolvedCwd)
-  if (tempRelative === '' || (!tempRelative.startsWith('..') && !isAbsolute(tempRelative))) {
-    return encodeOmpRelativeSessionDirName('-tmp', tempRelative)
-  }
-  return `--${resolvedCwd.replace(/^[/\\]/, '').replace(/[/\\:]/g, '-')}--`
-}
-
-function encodeOmpRelativeSessionDirName(prefix: string, relativePath: string): string {
-  const encoded = relativePath.replace(/[/\\:]/g, '-')
-  if (!encoded) return prefix
-  return prefix.endsWith('-') ? `${prefix}${encoded}` : `${prefix}-${encoded}`
-}
-
+// Checks directory contents, not mere existence — same reasoning as
+// hasClaudeConversationHistory above: pty-manager.ts pre-creates this exact
+// directory before omp ever runs, so existence alone isn't proof of a real
+// prior conversation.
 function hasOmpConversationHistory(worktreePath: string): boolean {
   const encoded = encodeOmpSessionDirName(worktreePath)
-  return existsSync(join(homedir(), '.omp', 'agent', 'sessions', encoded))
+  const dir = join(homedir(), '.omp', 'agent', 'sessions', encoded)
+  try {
+    return readdirSync(dir).length > 0
+  } catch {
+    return false
+  }
 }
 
 // Remote analogue of hasOmpConversationHistory, mirroring the same
@@ -2449,26 +2441,6 @@ function hasOmpConversationHistory(worktreePath: string): boolean {
 // omp itself would. Any SSH/probe failure returns false, so revival falls
 // back to a fresh spawn rather than risk `omp --continue` exiting
 // immediately on a directory that doesn't exist yet.
-// The encoding half of hasRemoteOmpConversationHistory's script, split out so
-// session-manager.test.ts can run it through a real shell (echoing $enc
-// instead of testing a directory) and assert parity with
-// encodeOmpSessionDirName across a table of representative paths — the
-// production function below just appends its own `[ -d ... ]` check.
-export const OMP_ENCODE_SHELL_SCRIPT =
-  'canon() { CDPATH= cd -P -- "$1" 2>/dev/null && pwd -P; }; ' +
-  'p=$(canon "$1"); [ -n "$p" ] || p="$1"; ' +
-  'h=$(canon "$HOME"); [ -n "$h" ] || h="$HOME"; ' +
-  'case "$p" in ' +
-  '"$h") enc="-" ;; ' +
-  '"$h"/*) rel=${p#"$h"/}; enc="-$(printf \'%s\' "$rel" | sed \'s/[\\/\\\\:]/-/g\')" ;; ' +
-  '*) t=$(canon "${TMPDIR:-${TMP:-${TEMP:-/tmp}}}"); [ -n "$t" ] || t="${TMPDIR:-${TMP:-${TEMP:-/tmp}}}"; ' +
-  'case "$p" in ' +
-  '"$t") enc="-tmp" ;; ' +
-  '"$t"/*) rel=${p#"$t"/}; enc="-tmp-$(printf \'%s\' "$rel" | sed \'s/[\\/\\\\:]/-/g\')" ;; ' +
-  '*) enc="--$(printf \'%s\' "$p" | sed \'s/^[\\/\\\\]//; s/[\\/\\\\:]/-/g\')--" ;; ' +
-  'esac ;; ' +
-  'esac'
-
 async function hasRemoteOmpConversationHistory(host: Host, worktreePath: string): Promise<boolean> {
   const script = `${OMP_ENCODE_SHELL_SCRIPT}; [ -d "$h/.omp/agent/sessions/$enc" ]`
   try {
