@@ -2348,10 +2348,15 @@ describe('openSessionsForOpenPrs', () => {
         baseLocalSession({ id: `s-${prNumber}`, prNumber }) as Session | string
     )
 
-    const result = await sm.openSessionsForOpenPrs('/proj', null, null, {
-      listPrs,
-      createPrSession,
-    })
+    const result = await sm.openSessionsForOpenPrs(
+      '/proj',
+      null,
+      {},
+      {
+        listPrs,
+        createPrSession,
+      }
+    )
     expect(typeof result).not.toBe('string')
     if (typeof result === 'string') throw new Error(result)
 
@@ -2366,10 +2371,15 @@ describe('openSessionsForOpenPrs', () => {
 
   it('surfaces gh list errors as a string', async () => {
     const sm = await loadSessionManager()
-    const result = await sm.openSessionsForOpenPrs('/proj', null, null, {
-      listPrs: async () => 'Failed to list open PRs: gh auth failed',
-      createPrSession: vi.fn(),
-    })
+    const result = await sm.openSessionsForOpenPrs(
+      '/proj',
+      null,
+      {},
+      {
+        listPrs: async () => 'Failed to list open PRs: gh auth failed',
+        createPrSession: vi.fn(),
+      }
+    )
 
     expect(result).toBe('Failed to list open PRs: gh auth failed')
   })
@@ -2381,13 +2391,44 @@ describe('openSessionsForOpenPrs', () => {
       async (_projectPath: string, prNumber: number) =>
         baseLocalSession({ id: `s-${prNumber}`, prNumber }) as Session | string
     )
-    const result = await sm.openSessionsForOpenPrs('/proj', null, 'up/stream', {
-      listPrs,
-      createPrSession,
-    })
+    const result = await sm.openSessionsForOpenPrs(
+      '/proj',
+      null,
+      { repo: 'up/stream' },
+      {
+        listPrs,
+        createPrSession,
+      }
+    )
     expect(typeof result).not.toBe('string')
     expect(listPrs).toHaveBeenCalledWith('/proj', null, 'up/stream')
     expect(createPrSession).toHaveBeenCalledWith('/proj', 8, null, { repo: 'up/stream' })
+  })
+
+  it('uses the selected tool for every newly created PR session', async () => {
+    const sm = await loadSessionManager()
+    const createPrSession = vi.fn(
+      async (_projectPath: string, prNumber: number) =>
+        baseLocalSession({ id: `s-${prNumber}`, prNumber }) as Session | string
+    )
+
+    await sm.openSessionsForOpenPrs(
+      '/proj',
+      null,
+      { tool: 'codex' },
+      {
+        listPrs: async () => [
+          { number: 8, title: 'x', headRefName: 'b' },
+          { number: 9, title: 'y', headRefName: 'c' },
+        ],
+        createPrSession,
+      }
+    )
+
+    expect(createPrSession.mock.calls).toEqual([
+      ['/proj', 8, null, { tool: 'codex' }],
+      ['/proj', 9, null, { tool: 'codex' }],
+    ])
   })
 
   it('surfaces remote SSH auth failures separately from missing gh', async () => {

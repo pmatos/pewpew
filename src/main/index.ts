@@ -382,8 +382,8 @@ app.whenReady().then(async () => {
 
   ipcMain.handle(
     'sessions:open-all-prs',
-    async (_event, projectPath: string, hostId?: string | null, repo?: string | null) => {
-      return openSessionsForOpenPrs(projectPath, hostId ?? null, repo ?? null)
+    async (_event, projectPath: string, hostId?: string | null, options?: CreateSessionOptions) => {
+      return openSessionsForOpenPrs(projectPath, hostId ?? null, options ?? {})
     }
   )
 

@@ -41,6 +41,7 @@ interface ProjectTreeUiState {
   prError: string | null
   pendingOpenAllPrsPath: string | null
   pendingOpenAllPrsHostId: string | null
+  pendingOpenAllPrsTool: AgentTool
   // The repos a PR/issue can be drawn from (origin + detected upstream parent),
   // and the currently-selected one. Shared across the PR, issue, and open-all
   // dialogs since only one is open at a time. null until resolved / when the
@@ -127,6 +128,7 @@ function useProjectTreeElement({ onOpenSession }: TreeProps) {
     prError: null,
     pendingOpenAllPrsPath: null,
     pendingOpenAllPrsHostId: null,
+    pendingOpenAllPrsTool: 'claude',
     repoChoices: null,
     selectedRepo: '',
     pendingIssuePath: null,
@@ -157,6 +159,7 @@ function useProjectTreeElement({ onOpenSession }: TreeProps) {
     prError,
     pendingOpenAllPrsPath,
     pendingOpenAllPrsHostId,
+    pendingOpenAllPrsTool,
     repoChoices,
     selectedRepo,
     pendingIssuePath,
@@ -171,6 +174,7 @@ function useProjectTreeElement({ onOpenSession }: TreeProps) {
   } = ui
   const sessionNameInputRef = useRef<HTMLInputElement>(null)
   const prNumberInputRef = useRef<HTMLInputElement>(null)
+  const bulkOpenPrsDialogRef = useRef<HTMLDivElement>(null)
   // Monotonic token: bumped whenever the issue dialog opens or closes so an
   // in-flight countOpenIssues can detect it was canceled/reopened mid-await.
   const issueRequestRef = useRef(0)
@@ -212,6 +216,12 @@ function useProjectTreeElement({ onOpenSession }: TreeProps) {
   useEffect(() => {
     scanProjects()
   }, [scanProjects])
+
+  useEffect(() => {
+    if (pendingOpenAllPrsPath) {
+      bulkOpenPrsDialogRef.current?.scrollIntoView({ block: 'nearest' })
+    }
+  }, [pendingOpenAllPrsPath])
 
   useEffect(() => {
     let cancelled = false
@@ -345,12 +355,16 @@ function useProjectTreeElement({ onOpenSession }: TreeProps) {
   const handleOpenAllPrs = async (
     projectPath: string,
     hostId: string | null,
-    repo: string | null
+    repo: string | undefined,
+    tool: AgentTool
   ) => {
     if (creating) return
     setUi({ creating: true })
     try {
-      const result = await window.api.openSessionsForOpenPrs(projectPath, hostId, repo)
+      const result = await window.api.openSessionsForOpenPrs(projectPath, hostId, {
+        tool,
+        ...(repo ? { repo } : {}),
+      })
       showToast(typeof result === 'string' ? result : formatOpenAllSummary(result, 'PR'))
     } catch (err) {
       showToast(`Failed to open PR sessions: ${String(err)}`)
@@ -359,8 +373,8 @@ function useProjectTreeElement({ onOpenSession }: TreeProps) {
     }
   }
 
-  // Entry point for "Open sessions for all open PRs". For a fork we pop a small
-  // repo picker first; otherwise we keep the historical instant behavior.
+  // Resolve the optional upstream repo before showing the bulk-open dialog so a
+  // fast confirmation can never bypass the repository choice for a fork.
   const openAllPrs = async (projectPath: string, hostId: string | null) => {
     if (creating) return
     const token = (repoRequestRef.current += 1)
@@ -371,25 +385,23 @@ function useProjectTreeElement({ onOpenSession }: TreeProps) {
       choices = null
     }
     if (repoRequestRef.current !== token) return
-    if (choices && typeof choices !== 'string' && choices.parent) {
-      setUi({
-        pendingOpenAllPrsPath: projectPath,
-        pendingOpenAllPrsHostId: hostId,
-        repoChoices: choices,
-        selectedRepo: choices.current,
-      })
-    } else {
-      await handleOpenAllPrs(projectPath, hostId, null)
-    }
+    const resolvedChoices = choices && typeof choices !== 'string' ? choices : null
+    setUi({
+      pendingOpenAllPrsPath: projectPath,
+      pendingOpenAllPrsHostId: hostId,
+      pendingOpenAllPrsTool: defaultTool,
+      repoChoices: resolvedChoices,
+      selectedRepo: resolvedChoices?.current ?? '',
+    })
   }
 
   const confirmOpenAllPrs = async () => {
     if (!pendingOpenAllPrsPath) return
     const projectPath = pendingOpenAllPrsPath
     const hostId = pendingOpenAllPrsHostId
-    const repo = repoOverride() ?? null
+    const repo = repoOverride()
     setUi({ pendingOpenAllPrsPath: null, pendingOpenAllPrsHostId: null })
-    await handleOpenAllPrs(projectPath, hostId, repo)
+    await handleOpenAllPrs(projectPath, hostId, repo, pendingOpenAllPrsTool)
   }
 
   // Load the label filter list for a repo (origin, or a fork's upstream). Bumps
@@ -897,13 +909,46 @@ function useProjectTreeElement({ onOpenSession }: TreeProps) {
         </div>
       )}
       {pendingOpenAllPrsPath && (
-        <div className="session-name-dialog">
+        <div ref={bulkOpenPrsDialogRef} className="session-name-dialog">
           <RepoPicker
             choices={repoChoices}
             value={selectedRepo}
             disabled={creating}
             onChange={(repo) => setUi({ selectedRepo: repo })}
           />
+          <div className="session-name-label">Tool:</div>
+          <div className="tool-picker">
+            <label>
+              <input
+                type="radio"
+                name="bulk-pr-tool"
+                value="claude"
+                checked={pendingOpenAllPrsTool === 'claude'}
+                onChange={() => setUi({ pendingOpenAllPrsTool: 'claude' })}
+              />
+              Claude
+            </label>
+            <label>
+              <input
+                type="radio"
+                name="bulk-pr-tool"
+                value="codex"
+                checked={pendingOpenAllPrsTool === 'codex'}
+                onChange={() => setUi({ pendingOpenAllPrsTool: 'codex' })}
+              />
+              Codex
+            </label>
+            <label>
+              <input
+                type="radio"
+                name="bulk-pr-tool"
+                value="omp"
+                checked={pendingOpenAllPrsTool === 'omp'}
+                onChange={() => setUi({ pendingOpenAllPrsTool: 'omp' })}
+              />
+              oh-my-pi
+            </label>
+          </div>
           <div className="create-actions">
             <button
               type="button"
