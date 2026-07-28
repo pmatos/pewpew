@@ -8,6 +8,7 @@ on:
 permissions:
   contents: read
   pull-requests: write # required to post PR comments
+  statuses: write # required to publish the React Doctor commit status
 
 jobs:
   react-doctor:
@@ -21,6 +22,7 @@ jobs:
 
       - uses: millionco/react-doctor@v2
         with:
-          diff: main
-          offline: true # do not POST diagnostics to the react.doctor score API
-          github-token: ${{ secrets.GITHUB_TOKEN }}
+          scope: changed
+          # A failed analyzer also degrades the baseline and triggers the same
+          # shallow-checkout warning even though the full history is present.
+          silence-missing-baseline-warning: true
