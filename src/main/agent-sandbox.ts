@@ -61,13 +61,15 @@
 //      would re-open the read-only guarantees from steps 1 and 6-8. Uses
 //      --bind-try: a --bind of a source that doesn't exist makes bwrap exit
 //      before the agent ever runs, which is worse than not granting the path.
-//   10. --bind <worktree> <worktree>       the session's own worktree, r/w
-//   11. --ro-bind-try <worktree>/.claude/settings.local.json  close the one
+//   10. extra caller-granted read-only paths — emitted after writable
+//      exceptions so a path granted in both lists remains read-only.
+//   11. --bind <worktree> <worktree>       the session's own worktree, r/w
+//   12. --ro-bind-try <worktree>/.claude/settings.local.json  close the one
 //      file back up: without this, Bash inside the sandbox (which the worktree
-//      bind at step 10 left read-write) could overwrite its own guard-hook
+//      bind at step 11 left read-write) could overwrite its own guard-hook
 //      settings and disarm the PreToolUse guard for the next session. -try
 //      because the file may not exist yet on a session's first ever spawn.
-//   12. --chdir <worktree> --              land in the worktree; `--`
+//   13. --chdir <worktree> --              land in the worktree; `--`
 //      separates bwrap's own options from the command to run inside it
 //
 // Deliberately NOT ro-binding <project>/.git/config: that breaks `git config
@@ -91,6 +93,10 @@ export interface SandboxOptions {
   // absolute. Sources that don't exist are silently skipped via --bind-try
   // rather than crashing the sandbox.
   extraWritablePaths?: string[]
+  // Read-only host paths that must remain visible after mounts such as the
+  // private /tmp tmpfs. Emitted after writable exceptions so a duplicated
+  // path cannot accidentally become writable.
+  extraReadOnlyPaths?: string[]
   // Real .git directory for the project root. Defaults to `<projectPath>/.git`
   // which is correct for a standard worktree. A gitfile root (a submodule or
   // linked worktree whose `.git` is a *file* like `gitdir: /path/to/real/.git`,
@@ -106,7 +112,7 @@ export function buildSandboxArgs(
   worktreePath: string,
   opts: SandboxOptions = {}
 ): string[] {
-  const { enabled = true, extraWritablePaths = [], gitDir } = opts
+  const { enabled = true, extraWritablePaths = [], extraReadOnlyPaths = [], gitDir } = opts
   if (!enabled) return []
 
   // Nothing to confine to when the "worktree" IS the project root (e.g. a
@@ -173,9 +179,13 @@ export function buildSandboxArgs(
   }
 
   const safeExtraWritablePaths = extraWritablePaths.filter((path) => !overlapsProject(path))
+  const safeExtraReadOnlyPaths = extraReadOnlyPaths.filter((path) => !overlapsProject(path))
 
   for (const path of safeExtraWritablePaths) {
     args.push('--bind-try', path, path)
+  }
+  for (const path of safeExtraReadOnlyPaths) {
+    args.push('--ro-bind-try', path, path)
   }
 
   args.push(

@@ -320,7 +320,8 @@ describe('createRemotePty', () => {
     const argv = remoteAgentArgsFromCall(tmuxCall())
     const expectedPrefix = buildSandboxArgs(PROJECT, WORKTREE, {
       enabled: true,
-      extraWritablePaths: [STATE_DIR, REMOTE_SOCKET_DIR],
+      extraWritablePaths: [STATE_DIR],
+      extraReadOnlyPaths: [REMOTE_SOCKET_DIR],
       gitDir: `${PROJECT}/.git`,
     })
     expect(argv).toEqual([...expectedPrefix, ...buildAgentArgs({ tool: 'claude' })])

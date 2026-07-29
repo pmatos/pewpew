@@ -260,8 +260,8 @@ export async function installCodexHooks(
   projectPath: string,
   { skipGitignore = false }: { skipGitignore?: boolean } = {}
 ): Promise<CodexHooksInstallSnapshot> {
+  ensureCodexProjectConfigDir(projectPath)
   const codexDir = join(projectPath, '.codex')
-  mkdirSync(codexDir, { recursive: true })
 
   const hooksPath = join(codexDir, 'hooks.json')
 
@@ -304,6 +304,7 @@ export async function installRemoteCodexHooks(
   worktreePath: string,
   notifyScriptPath: string
 ): Promise<RemoteCodexHooksSnapshot> {
+  await ensureRemoteCodexProjectConfigDir(execRemote, worktreePath)
   const hooksJson = ccPewpewCodexHookJson(notifyScriptPath)
   // Snapshot-and-merge in a single SSH round trip: `cp` the prior file to
   // a known backup path (so rollback can restore unrelated user-authored

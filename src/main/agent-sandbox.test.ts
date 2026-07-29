@@ -119,6 +119,28 @@ describe('buildSandboxArgs', () => {
     expect(args.slice(chdirIdx)).toEqual(['--chdir', WORKTREE, '--'])
   })
 
+  it('appends extra read-only paths as --ro-bind-try pairs after writable exceptions', () => {
+    const args = buildSandboxArgs(PROJECT, WORKTREE, {
+      extraWritablePaths: ['/opt/data'],
+      extraReadOnlyPaths: ['/tmp/pewpew-remote'],
+    })
+    const writableIdx = args.indexOf('--bind-try', args.indexOf(`${PROJECT}/.git/hooks`))
+    const readOnlyIdx = args.indexOf('--ro-bind-try', writableIdx)
+    const worktreeIdx = args.indexOf('--bind', readOnlyIdx)
+
+    expect(args.slice(writableIdx, writableIdx + 3)).toEqual([
+      '--bind-try',
+      '/opt/data',
+      '/opt/data',
+    ])
+    expect(args.slice(readOnlyIdx, readOnlyIdx + 3)).toEqual([
+      '--ro-bind-try',
+      '/tmp/pewpew-remote',
+      '/tmp/pewpew-remote',
+    ])
+    expect(readOnlyIdx).toBeLessThan(worktreeIdx)
+  })
+
   it('appends no extra binds when extraWritablePaths is empty', () => {
     const withEmpty = buildSandboxArgs(PROJECT, WORKTREE, { extraWritablePaths: [] })
     const withOmitted = buildSandboxArgs(PROJECT, WORKTREE)

@@ -477,10 +477,8 @@ export async function createRemotePty(
     const canSandbox = sandboxEnabled && options?.sandboxAvailable === true && !!stateDir
     sandboxPrefix = buildSandboxArgs(options.projectPath, cwd, {
       enabled: canSandbox,
-      extraWritablePaths: [
-        ...(stateDir ? [stateDir] : []),
-        ...(options.remoteSocketPath ? [posix.dirname(options.remoteSocketPath)] : []),
-      ],
+      extraWritablePaths: stateDir ? [stateDir] : [],
+      extraReadOnlyPaths: options.remoteSocketPath ? [posix.dirname(options.remoteSocketPath)] : [],
       gitDir,
     })
     if (sandboxEnabled && options?.sandboxAvailable === true && !stateDir) {

@@ -167,6 +167,17 @@ describe('installRemoteHooks', () => {
 })
 
 describe('installCodexHooks', () => {
+  it('migrates an empty worktree .codex marker before installing hooks', async () => {
+    const codexPath = join(state.tmpProject, '.codex')
+    writeFileSync(codexPath, '')
+
+    const { installCodexHooks } = await loadInstaller()
+    await installCodexHooks(state.tmpProject, { skipGitignore: true })
+
+    expect(statSync(codexPath).isDirectory()).toBe(true)
+    expect(existsSync(join(codexPath, 'hooks.json'))).toBe(true)
+  })
+
   it('writes .codex/hooks.json with codex event shape', async () => {
     const { installCodexHooks } = await loadInstaller()
     await installCodexHooks(state.tmpProject, { skipGitignore: true })
@@ -241,6 +252,23 @@ describe('installCodexHooks', () => {
       readFileSync(join(state.tmpProject, '.codex', 'hooks.json'), 'utf-8')
     ) as { hooks: Record<string, unknown[]> }
     expect(json.hooks.SessionStart).toHaveLength(1)
+  })
+})
+
+describe('installRemoteCodexHooks', () => {
+  it('migrates an empty remote worktree .codex marker before installing hooks', async () => {
+    const codexPath = join(state.tmpProject, '.codex')
+    writeFileSync(codexPath, '')
+
+    const { installRemoteCodexHooks } = await loadInstaller()
+    await installRemoteCodexHooks(
+      vi.fn(execLocally),
+      state.tmpProject,
+      '/home/dev/.config/pewpew/hooks/notify-v1.sh'
+    )
+
+    expect(statSync(codexPath).isDirectory()).toBe(true)
+    expect(existsSync(join(codexPath, 'hooks.json'))).toBe(true)
   })
 })
 
