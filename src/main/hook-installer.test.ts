@@ -1,5 +1,16 @@
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest'
-import { mkdtempSync, readFileSync, writeFileSync, mkdirSync, existsSync, rmSync } from 'fs'
+import {
+  mkdtempSync,
+  readFileSync,
+  writeFileSync,
+  mkdirSync,
+  existsSync,
+  rmSync,
+  statSync,
+  symlinkSync,
+  lstatSync,
+} from 'fs'
+import { execFileSync } from 'child_process'
 import { tmpdir } from 'os'
 import { join } from 'path'
 
@@ -30,6 +41,25 @@ afterEach(() => {
 async function loadInstaller(): Promise<typeof import('./hook-installer')> {
   vi.resetModules()
   return import('./hook-installer')
+}
+
+async function execLocally(argv: string[]) {
+  try {
+    const stdout = execFileSync(argv[0], argv.slice(1), { encoding: 'utf-8' })
+    return { stdout, stderr: '', code: 0, timedOut: false }
+  } catch (err) {
+    const failure = err as {
+      stdout?: Buffer | string
+      stderr?: Buffer | string
+      status?: number
+    }
+    return {
+      stdout: failure.stdout?.toString() ?? '',
+      stderr: failure.stderr?.toString() ?? '',
+      code: failure.status ?? 1,
+      timedOut: false,
+    }
+  }
 }
 
 describe('installHooks (Claude)', () => {
@@ -211,6 +241,59 @@ describe('installCodexHooks', () => {
       readFileSync(join(state.tmpProject, '.codex', 'hooks.json'), 'utf-8')
     ) as { hooks: Record<string, unknown[]> }
     expect(json.hooks.SessionStart).toHaveLength(1)
+  })
+})
+
+describe('ensureCodexProjectConfigDir', () => {
+  it('migrates an empty legacy .codex file to the directory Codex config discovery requires', async () => {
+    const codexPath = join(state.tmpProject, '.codex')
+    writeFileSync(codexPath, '')
+
+    const { ensureCodexProjectConfigDir } = await loadInstaller()
+    ensureCodexProjectConfigDir(state.tmpProject)
+
+    expect(statSync(codexPath).isDirectory()).toBe(true)
+  })
+
+  it('refuses to replace a non-empty .codex file', async () => {
+    const codexPath = join(state.tmpProject, '.codex')
+    writeFileSync(codexPath, 'keep me')
+
+    const { ensureCodexProjectConfigDir } = await loadInstaller()
+    expect(() => ensureCodexProjectConfigDir(state.tmpProject)).toThrow(/must be a directory/)
+    expect(readFileSync(codexPath, 'utf-8')).toBe('keep me')
+  })
+})
+
+describe('ensureRemoteCodexProjectConfigDir', () => {
+  it('migrates an empty legacy .codex file on the remote project root', async () => {
+    const codexPath = join(state.tmpProject, '.codex')
+    writeFileSync(codexPath, '')
+    const execRemote = vi.fn(execLocally)
+
+    const { ensureRemoteCodexProjectConfigDir } = await loadInstaller()
+    await ensureRemoteCodexProjectConfigDir(execRemote, state.tmpProject)
+
+    expect(statSync(codexPath).isDirectory()).toBe(true)
+    expect(execRemote).toHaveBeenCalledWith(
+      expect.arrayContaining(['_', state.tmpProject]),
+      expect.anything()
+    )
+  })
+
+  it('refuses to replace a remote .codex symlink', async () => {
+    const codexPath = join(state.tmpProject, '.codex')
+    const targetPath = join(state.tmpProject, 'legacy-codex-marker')
+    writeFileSync(targetPath, '')
+    symlinkSync(targetPath, codexPath)
+
+    const { ensureRemoteCodexProjectConfigDir } = await loadInstaller()
+    await expect(
+      ensureRemoteCodexProjectConfigDir(vi.fn(execLocally), state.tmpProject)
+    ).rejects.toThrow(/must be a directory/)
+
+    expect(statSync(targetPath).isFile()).toBe(true)
+    expect(lstatSync(codexPath).isSymbolicLink()).toBe(true)
   })
 })
 

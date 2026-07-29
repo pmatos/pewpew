@@ -20,6 +20,7 @@ export interface PreparedRemoteHost {
   notifyScriptPath: string
   guardScriptPath: string
   ompHookScriptPath: string
+  remoteSocketPath: string
   sandboxAvailable: boolean
   agentPaths: AgentResolution
 }
@@ -149,6 +150,7 @@ export function createRemoteHostRuntime(deps: RemoteHostRuntimeDeps): RemoteHost
         notifyScriptPath: bootstrap.notifyScriptPath,
         guardScriptPath: bootstrap.guardScriptPath,
         ompHookScriptPath: bootstrap.ompHookScriptPath,
+        remoteSocketPath,
         sandboxAvailable: bootstrap.sandboxAvailable,
         agentPaths: bootstrap.agentPaths,
       }

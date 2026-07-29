@@ -47,6 +47,7 @@ describe('remote host runtime ownership', () => {
       expect(prepared.notifyScriptPath).toBe('/tmp/notify.sh')
       expect(prepared.guardScriptPath).toBe('/tmp/worktree-guard.sh')
       expect(prepared.ompHookScriptPath).toBe('/tmp/omp-notify.ts')
+      expect(prepared.remoteSocketPath).toBe('/tmp/remote.sock')
       expect(prepared.sandboxAvailable).toBe(true)
       expect(prepared.agentPaths.claude).toBe('/bin/claude')
       return 'created'
