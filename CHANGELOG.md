@@ -1,3 +1,10 @@
+## [0.10.1](https://github.com/pmatos/pewpew/compare/v0.10.0...v0.10.1) (2026-07-29)
+
+
+### Bug Fixes
+
+* **sessions:** repair sandboxed Codex launches ([#258](https://github.com/pmatos/pewpew/issues/258)) ([b17a934](https://github.com/pmatos/pewpew/commit/b17a934c1062b79bb8e1886da718a0256d4c4987))
+
 # [0.10.0](https://github.com/pmatos/pewpew/compare/v0.9.0...v0.10.0) (2026-07-28)
 
 
