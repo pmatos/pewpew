@@ -7,7 +7,7 @@
 
 import { execFile, spawn } from 'child_process'
 import { mkdirSync, unlinkSync } from 'fs'
-import { join } from 'path'
+import { join, posix } from 'path'
 import { homedir, userInfo } from 'os'
 import * as pty from 'node-pty'
 import type { IPty, IPtyForkOptions } from 'node-pty'
@@ -177,7 +177,7 @@ export function remoteSocketPathForHost(hostId: HostId): string {
   // Include hostId so two configured hosts that resolve to the same remote
   // account don't collide on the reverse-forwarded socket (StreamLocalBindUnlink
   // would otherwise let the later connection steal the earlier one's socket).
-  return `/tmp/pewpew-${uidSegment()}-${sanitizeHostIdForPath(hostId)}.sock`
+  return `/tmp/pewpew-${uidSegment()}-${sanitizeHostIdForPath(hostId)}/hook.sock`
 }
 
 function controlPathForHost(hostId: HostId): string {
@@ -340,6 +340,39 @@ export function runtimeStateFor(hostId: HostId): HostConnectionState | undefined
 
 async function startRuntime(runtime: HostRuntime): Promise<void> {
   runtime.state = 'connecting'
+  const remoteSocketDir = posix.dirname(runtime.remoteSocketPath)
+  const prepareScript =
+    'set -e\n' +
+    'socket_dir="$1"\n' +
+    'if [ -L "$socket_dir" ]; then\n' +
+    '  printf "Remote hook socket directory %s must not be a symlink\\n" "$socket_dir" >&2\n' +
+    '  exit 1\n' +
+    'fi\n' +
+    'mkdir -p -- "$socket_dir"\n' +
+    'chmod 700 -- "$socket_dir"\n'
+  const prepareArgv = [
+    '-o',
+    'BatchMode=yes',
+    '-o',
+    'ConnectTimeout=5',
+    '--',
+    runtime.host.alias,
+    ...['sh', '-c', prepareScript, '_', remoteSocketDir].map(shellQuote),
+  ]
+  const prepared = await runSsh(prepareArgv, 10000, {
+    hostId: runtime.host.hostId,
+    kind: 'control',
+  })
+  if (prepared.timedOut || prepared.code !== 0) {
+    maybeEmitFailureToast(runtime.host, 'control', prepared.code, prepared.stderr)
+    runtime.state = classifyConnectionFailure(prepared.code, prepared.stderr)
+    const detail =
+      prepared.stderr.trim() ||
+      prepared.stdout.trim() ||
+      (prepared.timedOut ? 'timed out' : `exit ${prepared.code}`)
+    throw new Error(`Failed to prepare remote hook socket directory: ${detail}`)
+  }
+
   let stderr = ''
   const argv = controlArgs(runtime)
   const t0 = Date.now()

@@ -479,7 +479,7 @@ export async function createRemotePty(
       enabled: canSandbox,
       extraWritablePaths: [
         ...(stateDir ? [stateDir] : []),
-        ...(options.remoteSocketPath ? [options.remoteSocketPath] : []),
+        ...(options.remoteSocketPath ? [posix.dirname(options.remoteSocketPath)] : []),
       ],
       gitDir,
     })

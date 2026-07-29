@@ -295,7 +295,8 @@ describe('createPty', () => {
 describe('createRemotePty', () => {
   const host = { hostId: 'h1', alias: 'dev', label: 'Dev' } as Host
   const STATE_DIR = '/home/dev/.claude/projects/encoded-wt1'
-  const REMOTE_SOCKET = '/tmp/pewpew-remote.sock'
+  const REMOTE_SOCKET_DIR = '/tmp/pewpew-remote'
+  const REMOTE_SOCKET = `${REMOTE_SOCKET_DIR}/hook.sock`
 
   beforeEach(() => {
     state.remoteArgvCalls = []
@@ -309,7 +310,7 @@ describe('createRemotePty', () => {
     return state.remoteArgvCalls.find((argv) => argv[0] === 'tmux') ?? []
   }
 
-  it('includes the sandbox prefix with state and hook socket paths when sandboxAvailable is true', async () => {
+  it('includes the sandbox prefix with state and stable hook socket directory when sandboxAvailable is true', async () => {
     await createRemotePty('s1', WORKTREE, host, {
       tool: 'claude',
       projectPath: PROJECT,
@@ -319,7 +320,7 @@ describe('createRemotePty', () => {
     const argv = remoteAgentArgsFromCall(tmuxCall())
     const expectedPrefix = buildSandboxArgs(PROJECT, WORKTREE, {
       enabled: true,
-      extraWritablePaths: [STATE_DIR, REMOTE_SOCKET],
+      extraWritablePaths: [STATE_DIR, REMOTE_SOCKET_DIR],
       gitDir: `${PROJECT}/.git`,
     })
     expect(argv).toEqual([...expectedPrefix, ...buildAgentArgs({ tool: 'claude' })])
