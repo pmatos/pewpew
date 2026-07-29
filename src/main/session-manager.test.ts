@@ -26,6 +26,7 @@ const state = vi.hoisted(() => ({
     continueSession?: boolean
     tool?: AgentTool
     notifyHookPath?: string
+    remoteSocketPath?: string
   }[],
   reattachRemotePtyCalls: [] as { sessionId: string; hostId: string }[],
   createPtyCalls: [] as { sessionId: string; cwd: string }[],
@@ -36,6 +37,9 @@ const state = vi.hoisted(() => ({
   // Captures the listener registered via setUnexpectedExitListener so tests
   // can invoke it synchronously without spinning up a real node-pty.
   unexpectedExitListener: null as null | ((sessionId: string) => void),
+  // Fired inside createRemotePty before it resolves. Reproduces an agent/tmux
+  // that exits quickly enough to beat session registration.
+  createRemotePtySideEffect: null as null | ((sessionId: string) => void),
   // Per-session side effect fired before the probe resolves. Lets tests
   // simulate a concurrent reconnect advancing another session's state while
   // the batch is in flight.
@@ -226,17 +230,26 @@ vi.mock('./pty-manager', () => ({
     sessionId: string,
     cwd: string,
     host: Host,
-    options?: { continueSession?: boolean; tool?: AgentTool; notifyHookPath?: string }
+    options?: {
+      continueSession?: boolean
+      tool?: AgentTool
+      notifyHookPath?: string
+      remoteSocketPath?: string
+    }
   ) => {
     state.createRemotePtyCalls.push({
       sessionId,
       cwd,
       hostId: host.hostId,
-      continueSession: options?.continueSession,
+      ...(options?.continueSession === undefined
+        ? {}
+        : { continueSession: options.continueSession }),
       tool: options?.tool,
       notifyHookPath: options?.notifyHookPath,
+      remoteSocketPath: options?.remoteSocketPath,
     })
     state.runtimeRefs.set(host.hostId, (state.runtimeRefs.get(host.hostId) ?? 0) + 1)
+    state.createRemotePtySideEffect?.(sessionId)
   },
   setUnexpectedExitListener: (fn: null | ((sessionId: string) => void)) => {
     state.unexpectedExitListener = fn
@@ -393,6 +406,7 @@ beforeEach(() => {
   state.ensureHostConnectionThrows = null
   state.ensureHostConnectionGate = null
   state.unexpectedExitListener = null
+  state.createRemotePtySideEffect = null
   state.reconnectConfig = { enabled: true, initialDelayMs: 1000, maxDelayMs: 30000 }
   state.toasts = []
   state.hasPtyResult = new Set()
@@ -499,6 +513,7 @@ describe('createRemoteSessionForWorktree (adopt remote worktree)', () => {
         hostId: 'h1',
         tool: 'claude',
         notifyHookPath: '/tmp/omp-notify-v1.ts',
+        remoteSocketPath: '/tmp/remote.sock',
       },
     ])
     const ranWorktreeAdd = state.execRemoteCalls.some(
@@ -529,6 +544,24 @@ describe('createRemoteSessionForWorktree (adopt remote worktree)', () => {
     expect(second.id).toBe(first.id)
     expect(sm.getSessions()).toHaveLength(1)
     expect(state.createRemotePtyCalls).toHaveLength(1)
+  })
+
+  it('replays a remote pty exit that lands before the session is registered', async () => {
+    primeWorktree()
+    state.reconnectConfig = { enabled: false, initialDelayMs: 1000, maxDelayMs: 30000 }
+    const sm = await loadSessionManager()
+    sm.initSessionManager()
+    state.createRemotePtySideEffect = (sessionId) => state.unexpectedExitListener?.(sessionId)
+
+    const session = await sm.createRemoteSessionForWorktree(
+      'h1',
+      projectPath,
+      worktreePath,
+      undefined,
+      'claude'
+    )
+
+    expect(session.connectionState).toBe('offline')
   })
 
   it('rejects a mixed-tool adoption of the same worktree', async () => {
@@ -1840,6 +1873,7 @@ describe('reviveSession — remote resume fallback', () => {
         continueSession: false,
         tool: 'claude',
         notifyHookPath: '/tmp/omp-notify-v1.ts',
+        remoteSocketPath: '/tmp/remote.sock',
       },
     ])
     expect(sm.getSessions()[0].status).toBe('idle')
@@ -1862,6 +1896,7 @@ describe('reviveSession — remote resume fallback', () => {
         continueSession: true,
         tool: 'claude',
         notifyHookPath: '/tmp/omp-notify-v1.ts',
+        remoteSocketPath: '/tmp/remote.sock',
       },
     ])
   })
@@ -1883,6 +1918,7 @@ describe('reviveSession — remote resume fallback', () => {
         continueSession: false,
         tool: 'omp',
         notifyHookPath: '/tmp/omp-notify-v1.ts',
+        remoteSocketPath: '/tmp/remote.sock',
       },
     ])
     expect(sm.getSessions()[0].status).toBe('idle')
@@ -1905,6 +1941,7 @@ describe('reviveSession — remote resume fallback', () => {
         continueSession: true,
         tool: 'omp',
         notifyHookPath: '/tmp/omp-notify-v1.ts',
+        remoteSocketPath: '/tmp/remote.sock',
       },
     ])
   })
@@ -1925,6 +1962,7 @@ describe('reviveSession — remote resume fallback', () => {
         continueSession: false,
         tool: 'codex',
         notifyHookPath: '/tmp/omp-notify-v1.ts',
+        remoteSocketPath: '/tmp/remote.sock',
       },
     ])
   })

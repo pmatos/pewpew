@@ -303,6 +303,52 @@ export function updateLastKnownStatesBatch(
 // after session creation shows up without an app restart.
 const PR_REFRESH_INTERVAL_MS = 5 * 60 * 1000
 
+// A newly spawned process can exit before its Session record is inserted
+// (remote tmux failures make this window especially easy to hit). Keep that
+// signal and replay it as soon as registration completes; dropping it leaves a
+// dead PTY recorded as connectionState='live', which renders a black terminal.
+const pendingUnexpectedExits = new Set<string>()
+
+function handleUnexpectedPtyExit(sessionId: string): boolean {
+  const entry = sessions.get(sessionId)
+  if (!entry) return false
+  if (entry.session.status === 'dead') return true
+
+  if (!entry.session.hostId) {
+    updateSession(sessionId, 'dead')
+    return true
+  }
+
+  // A normally-ended remote session (agent exited → session.end hook →
+  // promptCleanup) must not be auto-reconnected: its remote tmux is gone, so a
+  // probe would flip it to 'dead' with a misleading "remote session ended"
+  // toast and could clobber a user-chosen 'completed'. Terminal statuses and
+  // an in-flight cleanup both mark a genuine end — a network drop delivers no
+  // session.end hook, so it never trips these.
+  if (entry.session.status === 'completed' || entry.session.status === 'error') return true
+  if (cleanupInProgress.has(sessionId)) return true
+
+  const host = getHost(entry.session.hostId)
+  const label = host?.label || host?.alias || entry.session.hostId
+  if (getReconnectConfig().enabled) {
+    emitToast({ severity: 'warning', title: `Connection to ${label} lost — reconnecting…` })
+    entry.session.connectionState = 'connecting'
+    onSessionsChanged()
+    reconnectScheduler.schedule(sessionId)
+  } else {
+    entry.session.connectionState = 'offline'
+    onSessionsChanged()
+  }
+  return true
+}
+
+function registerSpawnedSession(session: Session): void {
+  sessions.set(session.id, { session })
+  if (pendingUnexpectedExits.delete(session.id)) {
+    handleUnexpectedPtyExit(session.id)
+  }
+}
+
 export function initSessionManager(): void {
   setInterval(() => {
     for (const entry of sessions.values()) {
@@ -318,34 +364,8 @@ export function initSessionManager(): void {
   //    backoff-driven reattach. If disabled, mark 'offline' so the manual
   //    "Reconnect" overlay surfaces rather than a frozen terminal.
   setUnexpectedExitListener((sessionId) => {
-    const entry = sessions.get(sessionId)
-    if (!entry) return
-    if (entry.session.status === 'dead') return
-
-    if (!entry.session.hostId) {
-      updateSession(sessionId, 'dead')
-      return
-    }
-
-    // A normally-ended remote session (agent exited → session.end hook →
-    // promptCleanup) must not be auto-reconnected: its remote tmux is gone, so a
-    // probe would flip it to 'dead' with a misleading "remote session ended"
-    // toast and could clobber a user-chosen 'completed'. Terminal statuses and
-    // an in-flight cleanup both mark a genuine end — a network drop delivers no
-    // session.end hook, so it never trips these.
-    if (entry.session.status === 'completed' || entry.session.status === 'error') return
-    if (cleanupInProgress.has(sessionId)) return
-
-    const host = getHost(entry.session.hostId)
-    const label = host?.label || host?.alias || entry.session.hostId
-    if (getReconnectConfig().enabled) {
-      emitToast({ severity: 'warning', title: `Connection to ${label} lost — reconnecting…` })
-      entry.session.connectionState = 'connecting'
-      onSessionsChanged()
-      reconnectScheduler.schedule(sessionId)
-    } else {
-      entry.session.connectionState = 'offline'
-      onSessionsChanged()
+    if (!handleUnexpectedPtyExit(sessionId)) {
+      pendingUnexpectedExits.add(sessionId)
     }
   })
 }
@@ -483,7 +503,7 @@ async function adoptWorktree(
     sandboxed,
   }
 
-  sessions.set(id, { session })
+  registerSpawnedSession(session)
 
   getRepoFingerprint(projectPath).then((fp) => {
     if (fp) {
@@ -668,6 +688,7 @@ async function adoptRemoteWorktree(
       notifyScriptPath,
       guardScriptPath,
       ompHookScriptPath,
+      remoteSocketPath,
       sandboxAvailable,
       agentPaths,
     }) => {
@@ -702,6 +723,7 @@ async function adoptRemoteWorktree(
         agentPath,
         projectPath,
         notifyHookPath: ompHookScriptPath,
+        remoteSocketPath,
         sandboxAvailable,
       })
       return { branch: resolvedBranch, sandboxed: wasSandboxed }
@@ -728,7 +750,7 @@ async function adoptRemoteWorktree(
     ...(remoteProject.repoFingerprint ? { repoFingerprint: remoteProject.repoFingerprint } : {}),
   }
 
-  sessions.set(id, { session })
+  registerSpawnedSession(session)
   onSessionsChanged()
   return session
 }
@@ -762,6 +784,7 @@ async function createRemoteSession(
       notifyScriptPath,
       guardScriptPath,
       ompHookScriptPath,
+      remoteSocketPath,
       sandboxAvailable,
       agentPaths,
     }) => {
@@ -844,6 +867,7 @@ async function createRemoteSession(
         agentPath,
         projectPath,
         notifyHookPath: ompHookScriptPath,
+        remoteSocketPath,
         sandboxAvailable,
       })
       return { branch: resolvedBranch, sandboxed: wasSandboxed }
@@ -870,7 +894,7 @@ async function createRemoteSession(
     ...(remoteProject.repoFingerprint ? { repoFingerprint: remoteProject.repoFingerprint } : {}),
   }
 
-  sessions.set(id, { session })
+  registerSpawnedSession(session)
   onSessionsChanged()
   return session
 }
@@ -903,6 +927,7 @@ async function createRemotePrSession(
       notifyScriptPath,
       guardScriptPath,
       ompHookScriptPath,
+      remoteSocketPath,
       sandboxAvailable,
       agentPaths,
     }) => {
@@ -1023,6 +1048,7 @@ async function createRemotePrSession(
         agentPath,
         projectPath,
         notifyHookPath: ompHookScriptPath,
+        remoteSocketPath,
         sandboxAvailable,
       })
 
@@ -1050,7 +1076,7 @@ async function createRemotePrSession(
           : {}),
       }
 
-      sessions.set(id, { session })
+      registerSpawnedSession(session)
       onSessionsChanged()
       return session
     }
@@ -1401,6 +1427,8 @@ const reconnectScheduler = createReconnectScheduler({
 
 export function stopSessionManager(): void {
   reconnectScheduler.shutdown()
+  pendingUnexpectedExits.clear()
+  setUnexpectedExitListener(null)
 }
 
 // Eager batch probe for remaining `pending` sessions on a host that just
@@ -1535,7 +1563,7 @@ export async function reviveSession(id: string): Promise<void> {
     try {
       await remoteHostRuntime.withPreparedHost(
         host,
-        async ({ agentPaths, ompHookScriptPath, sandboxAvailable }) => {
+        async ({ agentPaths, ompHookScriptPath, remoteSocketPath, sandboxAvailable }) => {
           if (await hasRemoteTmuxSession(id, host)) {
             await reattachRemotePty(id, host)
           } else {
@@ -1558,6 +1586,7 @@ export async function reviveSession(id: string): Promise<void> {
               agentPath,
               projectPath: session.projectPath,
               notifyHookPath: ompHookScriptPath,
+              remoteSocketPath,
               sandboxAvailable,
             })
           }
@@ -2165,6 +2194,7 @@ async function createRemoteIssueSession(
       notifyScriptPath,
       guardScriptPath,
       ompHookScriptPath,
+      remoteSocketPath,
       sandboxAvailable,
       agentPaths,
     }) => {
@@ -2246,6 +2276,7 @@ async function createRemoteIssueSession(
         agentPath,
         projectPath,
         notifyHookPath: ompHookScriptPath,
+        remoteSocketPath,
         sandboxAvailable,
       })
 
@@ -2271,7 +2302,7 @@ async function createRemoteIssueSession(
           : {}),
       }
 
-      sessions.set(id, { session })
+      registerSpawnedSession(session)
       onSessionsChanged()
       return session
     }

@@ -83,6 +83,7 @@ import {
   exec,
   validateRemoteRepo,
   ensureHostConnection,
+  remoteSocketPathForHost,
   stopHostConnection,
   runtimeStateFor,
   testConnection,
@@ -98,6 +99,14 @@ beforeEach(() => {
   emittedToasts.length = 0
   pendingSpawn = null
 })
+
+async function waitForControlSpawn(): Promise<FakeChild> {
+  for (let attempt = 0; attempt < 10; attempt++) {
+    if (pendingSpawn) return pendingSpawn.child
+    await new Promise((resolve) => setImmediate(resolve))
+  }
+  throw new Error('ssh control process was not spawned')
+}
 
 describe('validateRemoteRepo', () => {
   it('returns ok with fingerprint on code=0 stdout', async () => {
@@ -291,15 +300,23 @@ describe('ensureHostConnection / startRuntime', () => {
     await stopHostConnection(HOST.hostId).catch(() => undefined)
   })
 
+  it('places the reverse-forwarded socket in a stable per-host directory', () => {
+    const socketPath = remoteSocketPathForHost(HOST.hostId)
+    expect(socketPath).toMatch(/^\/tmp\/pewpew-[^/]+\/hook\.sock$/)
+  })
+
   it('reaches live state when the parent ssh exits 0 after daemonization', async () => {
     // controlCheck always succeeds — the daemon is serving the socket.
     nextResult = { stdout: '', stderr: '', error: null, exitCode: 0 }
     const promise = ensureHostConnection(HOST, '/tmp/pewpew-test-local.sock')
-    expect(pendingSpawn).not.toBeNull()
+    const child = await waitForControlSpawn()
     // Simulate the foreground parent forking to the background and exiting 0.
-    pendingSpawn!.child.exitCode = 0
-    pendingSpawn!.child.emit('exit', 0)
+    child.exitCode = 0
+    child.emit('exit', 0)
     const result = await promise
+    expect(execFileCalls.some(({ args }) => args.some((arg) => arg.includes('mkdir -p')))).toBe(
+      true
+    )
     expect(result.controlPath).toContain(HOST.hostId)
     expect(runtimeStateFor(HOST.hostId)).toBe('live')
     await stopHostConnection(HOST.hostId)
@@ -329,13 +346,13 @@ describe('ensureHostConnection / startRuntime', () => {
     }
 
     const promise = ensureHostConnection(HOST, '/tmp/pewpew-test-local.sock')
-    expect(pendingSpawn).not.toBeNull()
+    const child = await waitForControlSpawn()
     // Wait for the first failed controlCheck to resolve, then simulate the
     // parent ssh forking to background and exiting cleanly. The next poll
     // attempt must still proceed and succeed.
     await new Promise((r) => setImmediate(r))
-    pendingSpawn!.child.exitCode = 0
-    pendingSpawn!.child.emit('exit', 0)
+    child.exitCode = 0
+    child.emit('exit', 0)
     const result = await promise
     expect(result.controlPath).toContain(HOST.hostId)
     expect(runtimeStateFor(HOST.hostId)).toBe('live')
@@ -346,8 +363,9 @@ describe('ensureHostConnection / startRuntime', () => {
   it('returns immediately on subsequent calls once the runtime is live', async () => {
     nextResult = { stdout: '', stderr: '', error: null, exitCode: 0 }
     const first = ensureHostConnection(HOST, '/tmp/pewpew-test-local.sock')
-    pendingSpawn!.child.exitCode = 0
-    pendingSpawn!.child.emit('exit', 0)
+    const child = await waitForControlSpawn()
+    child.exitCode = 0
+    child.emit('exit', 0)
     await first
     expect(runtimeStateFor(HOST.hostId)).toBe('live')
     // Second call must not spawn another ssh master — it should reuse the
@@ -366,10 +384,10 @@ describe('ensureHostConnection / startRuntime', () => {
     // before the live socket gets used. exitPromise must win the race.
     nextResult = { stdout: '', stderr: '', error: null, exitCode: 0 }
     const promise = ensureHostConnection(HOST, '/tmp/pewpew-test-local.sock')
-    expect(pendingSpawn).not.toBeNull()
-    pendingSpawn!.child.stderr.emit('data', Buffer.from('Permission denied (publickey).\n'))
-    pendingSpawn!.child.exitCode = 255
-    pendingSpawn!.child.emit('exit', 255)
+    const child = await waitForControlSpawn()
+    child.stderr.emit('data', Buffer.from('Permission denied (publickey).\n'))
+    child.exitCode = 255
+    child.emit('exit', 255)
     await expect(promise).rejects.toThrow(/Permission denied/)
     expect(runtimeStateFor(HOST.hostId)).toBe('auth-failed')
     await stopHostConnection(HOST.hostId)

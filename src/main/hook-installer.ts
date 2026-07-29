@@ -6,6 +6,7 @@ import {
   appendFileSync,
   renameSync,
   rmSync,
+  lstatSync,
 } from 'fs'
 import { execFile } from 'child_process'
 import { promisify } from 'util'
@@ -193,6 +194,60 @@ function ensureGitignore(projectPath: string, entry: string): void {
   }
 }
 
+// Codex walks config layers from the outer project root down to a nested
+// worktree and expects every `.codex` marker it encounters to be a directory.
+// Several of the user's older repositories have a zero-byte `.codex` file
+// instead. Once hooks are enabled, Codex treats that legacy marker as a config
+// layer and exits while trying to read `<project>/.codex/config.toml`.
+//
+// An empty regular file carries no content to preserve, so migrate that one
+// legacy shape in place. Anything else may be user data or an intentional
+// symlink and is rejected rather than overwritten.
+export function ensureCodexProjectConfigDir(projectPath: string): void {
+  const codexDir = join(projectPath, '.codex')
+  try {
+    const stat = lstatSync(codexDir)
+    if (stat.isDirectory()) return
+    if (!stat.isFile() || stat.size !== 0) {
+      throw new Error(
+        `Codex cannot start because ${codexDir} must be a directory; move or remove the existing path`
+      )
+    }
+    rmSync(codexDir)
+  } catch (err) {
+    if ((err as NodeJS.ErrnoException).code !== 'ENOENT') throw err
+  }
+  mkdirSync(codexDir, { recursive: true })
+}
+
+export async function ensureRemoteCodexProjectConfigDir(
+  execRemote: (argv: string[], opts?: { timeoutMs?: number }) => Promise<ExecResult>,
+  projectPath: string
+): Promise<void> {
+  const script =
+    'set -e\n' +
+    'codex_dir="$1/.codex"\n' +
+    'if [ -L "$codex_dir" ]; then\n' +
+    '  printf "Codex cannot start because %s must be a directory; move or remove the existing path\\n" "$codex_dir" >&2\n' +
+    '  exit 1\n' +
+    'fi\n' +
+    'if [ -d "$codex_dir" ]; then exit 0; fi\n' +
+    'if [ -f "$codex_dir" ] && [ ! -s "$codex_dir" ]; then\n' +
+    '  rm -f "$codex_dir"\n' +
+    'elif [ -e "$codex_dir" ]; then\n' +
+    '  printf "Codex cannot start because %s must be a directory; move or remove the existing path\\n" "$codex_dir" >&2\n' +
+    '  exit 1\n' +
+    'fi\n' +
+    'mkdir -p "$codex_dir"\n'
+  const result = await execRemote(['sh', '-c', script, '_', projectPath], {
+    timeoutMs: 10000,
+  })
+  if (result.timedOut || result.code !== 0) {
+    const detail = result.stderr.trim() || result.stdout.trim() || `exit ${result.code}`
+    throw new Error(`Failed to prepare remote Codex config directory: ${detail}`)
+  }
+}
+
 // Codex hook config is a JSON file at <project>/.codex/hooks.json. The shape
 // mirrors Claude's `hooks` block (event → matcher groups → handlers) but lives
 // in its own file rather than under a settings key.
@@ -205,8 +260,8 @@ export async function installCodexHooks(
   projectPath: string,
   { skipGitignore = false }: { skipGitignore?: boolean } = {}
 ): Promise<CodexHooksInstallSnapshot> {
+  ensureCodexProjectConfigDir(projectPath)
   const codexDir = join(projectPath, '.codex')
-  mkdirSync(codexDir, { recursive: true })
 
   const hooksPath = join(codexDir, 'hooks.json')
 
@@ -249,6 +304,7 @@ export async function installRemoteCodexHooks(
   worktreePath: string,
   notifyScriptPath: string
 ): Promise<RemoteCodexHooksSnapshot> {
+  await ensureRemoteCodexProjectConfigDir(execRemote, worktreePath)
   const hooksJson = ccPewpewCodexHookJson(notifyScriptPath)
   // Snapshot-and-merge in a single SSH round trip: `cp` the prior file to
   // a known backup path (so rollback can restore unrelated user-authored

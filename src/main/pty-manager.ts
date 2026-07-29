@@ -17,7 +17,11 @@ import { classifySshExit } from './ssh-exit-parser'
 import { captureRemotePaneTexts, type RemoteSessionEntry } from './remote-thumbnail'
 import { sanitizeChildEnv } from './appimage-env'
 import { buildSandboxArgs } from './agent-sandbox'
-import { OMP_HOOK_SCRIPT } from './hook-installer'
+import {
+  OMP_HOOK_SCRIPT,
+  ensureCodexProjectConfigDir,
+  ensureRemoteCodexProjectConfigDir,
+} from './hook-installer'
 import {
   canonicalPath,
   encodeOmpSessionDirName,
@@ -44,6 +48,10 @@ interface SpawnOptions {
   // isSandboxAvailable() instead, since there's no equivalent signal for a
   // remote host to check here.
   sandboxAvailable?: boolean
+  // Remote-only reverse-forwarded hook socket. The sandbox replaces /tmp with
+  // a private tmpfs, so this one path must be bound back in or remote agent
+  // lifecycle hooks cannot reach pewpew.
+  remoteSocketPath?: string
   // Absolute path (on the target host) to the omp hook bridge script passed
   // via `--hook`. Defaults to OMP_HOOK_SCRIPT for local sessions; remote
   // sessions must pass the path returned by bootstrapHost/withPreparedHost
@@ -344,6 +352,7 @@ function buildLocalSandboxPrefix(
   tool: AgentTool | undefined
 ): string[] {
   if (!projectPath) return []
+  if (tool === 'codex') ensureCodexProjectConfigDir(projectPath)
   const sandboxConfig = getSandboxConfig()
   const sandboxAvailable = isSandboxAvailable()
   if (sandboxConfig.enabled && !sandboxAvailable) {
@@ -431,8 +440,9 @@ function releaseRemoteEntry(entry: PtyEntry): void {
 }
 
 // See createPty's doc comment for what the returned boolean means. Remote
-// sessions never get extraWritablePaths — a remote host's home directory
-// (needed to resolve a `~/` entry) can't be resolved from this process.
+// sessions reopen only paths resolved on that host (agent state and the hook
+// socket); user-configured extraWritablePaths remain local-only because a
+// remote host's home directory (needed for `~/`) can't be resolved here.
 export async function createRemotePty(
   sessionId: string,
   cwd: string,
@@ -442,6 +452,12 @@ export async function createRemotePty(
   const tmuxSession = `pewpew-${sessionId}`
   let sandboxPrefix: string[] = []
   if (options?.projectPath) {
+    if (options.tool === 'codex') {
+      await ensureRemoteCodexProjectConfigDir(
+        (argv, opts) => execRemote(host, argv, opts),
+        options.projectPath
+      )
+    }
     // Remote sandbox wiring mirrors createPty's local path: resolve the real
     // .git dir (gitfile roots) and the agent state dir ON the remote host
     // (computing it locally would use the wrong $HOME, symlinks, and omp
@@ -462,6 +478,7 @@ export async function createRemotePty(
     sandboxPrefix = buildSandboxArgs(options.projectPath, cwd, {
       enabled: canSandbox,
       extraWritablePaths: stateDir ? [stateDir] : [],
+      extraReadOnlyPaths: options.remoteSocketPath ? [posix.dirname(options.remoteSocketPath)] : [],
       gitDir,
     })
     if (sandboxEnabled && options?.sandboxAvailable === true && !stateDir) {
