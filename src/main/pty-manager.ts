@@ -505,11 +505,33 @@ function buildLocalSandboxPrefix(
   } else {
     const claudeDirPath = claudeDir()
     extraWritablePaths.push(claudeDirPath, ...userWritablePaths)
-    // mkdir the directory-type denylist entries so --ro-bind-try below can
-    // never silently skip one for being absent (see CLAUDE_DIR_RO_DIRS'
-    // comment) — an empty read-only dir is a harmless outcome either way.
-    for (const name of CLAUDE_DIR_RO_DIRS) {
-      mkdirSync(join(claudeDirPath, name), { recursive: true })
+    if (sandboxConfig.enabled && sandboxAvailable) {
+      // mkdir the directory-type denylist entries so --ro-bind-try below can
+      // never silently skip one for being absent (see CLAUDE_DIR_RO_DIRS'
+      // comment) — an empty read-only dir is a harmless outcome either way.
+      // Gated on the sandbox actually being used: buildSandboxArgs ignores
+      // extraWritablePaths/extraReadOnlyPaths entirely when disabled (it
+      // returns [] up front), so these are real writes against the user's
+      // global ~/.claude with no payoff on a host that isn't sandboxing this
+      // session — and if one of these names is ever occupied by something
+      // other than a directory (a stray file, a dangling symlink from a
+      // dotfiles manager), a pointless one too. Each mkdir is isolated in
+      // its own try/catch so one bad entry can't throw out of createPty and
+      // abort a whole batch (e.g. session-manager.ts's relocateProject loop,
+      // which has no per-iteration try/catch) — that entry just falls back
+      // to the --ro-bind-try fail-open-on-absent gap already documented
+      // above, rather than crashing the spawn.
+      for (const name of CLAUDE_DIR_RO_DIRS) {
+        try {
+          mkdirSync(join(claudeDirPath, name), { recursive: true })
+        } catch (err) {
+          console.warn(
+            `Session ${sessionId}: could not prepare ~/.claude/${name} as a read-only sandbox ` +
+              `entry (${err instanceof Error ? err.message : String(err)}); leaving it to ` +
+              "--ro-bind-try's existing fail-open-on-absent behavior"
+          )
+        }
+      }
     }
     extraReadOnlyPaths.push(...CLAUDE_DIR_WRITE_DENYLIST.map((name) => join(claudeDirPath, name)))
   }

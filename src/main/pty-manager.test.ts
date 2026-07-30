@@ -12,6 +12,11 @@ const state = {
   tmuxArgvCalls: [] as string[][],
   remoteArgvCalls: [] as string[][],
   mkdirCalls: [] as string[],
+  // When set, the mocked mkdirSync throws for this exact path — simulates a
+  // CLAUDE_DIR_RO_DIRS entry occupied by something other than a directory
+  // (stray file, dangling symlink) to test that one bad entry doesn't crash
+  // the whole spawn.
+  mkdirFailFor: null as string | null,
   // Controls what resolveRemoteGitDir returns (empty → fallback to
   // `<project>/.git`).
   remoteGitDir: '' as string,
@@ -83,6 +88,9 @@ vi.mock('fs', () => ({
   existsSync: () => true,
   mkdirSync: (path: string) => {
     state.mkdirCalls.push(path)
+    if (path === state.mkdirFailFor) {
+      throw Object.assign(new Error('EEXIST: file already exists, mkdir'), { code: 'EEXIST' })
+    }
   },
   realpathSync: (path: string) => path,
 }))
@@ -259,6 +267,7 @@ describe('createPty', () => {
     state.bwrapAvailable = true
     state.tmuxArgvCalls = []
     state.mkdirCalls = []
+    state.mkdirFailFor = null
     // isSandboxAvailable() memoizes a successful real-bwrap probe; without
     // resetting it here, the first test to see bwrapAvailable=true would
     // permanently mask every later test simulating bwrap being unusable.
@@ -343,6 +352,30 @@ describe('createPty', () => {
     expect(warnSpy).toHaveBeenCalledWith(
       expect.stringContaining('bwrap missing or unable to sandbox')
     )
+    // The CLAUDE_DIR_RO_DIRS mkdirs are real writes against the user's real
+    // global ~/.claude with no payoff when the sandbox won't be used at all
+    // (buildSandboxArgs ignores extraWritablePaths/extraReadOnlyPaths when
+    // disabled) — must not run on a host that isn't sandboxing this session.
+    const claudeDirPath = join(homedir(), '.claude')
+    for (const name of CLAUDE_DIR_WRITE_DENYLIST) {
+      expect(state.mkdirCalls).not.toContain(join(claudeDirPath, name))
+    }
+  })
+
+  it('does not throw when a CLAUDE_DIR_RO_DIRS entry fails to mkdir, and still mkdirs the rest', () => {
+    const claudeDirPath = join(homedir(), '.claude')
+    state.mkdirFailFor = join(claudeDirPath, 'skills')
+    expect(() => createPty('s1', WORKTREE, { tool: 'claude', projectPath: PROJECT })).not.toThrow()
+    expect(warnSpy).toHaveBeenCalledWith(
+      expect.stringContaining('could not prepare ~/.claude/skills')
+    )
+    // A single bad entry doesn't abort the rest of the loop.
+    expect(state.mkdirCalls).toContain(join(claudeDirPath, 'commands'))
+    expect(state.mkdirCalls).toContain(join(claudeDirPath, 'agents'))
+    // The sandbox still spawns — the failed entry just falls back to
+    // --ro-bind-try's existing fail-open-on-absent behavior for that one name.
+    const argv = agentArgsFromCall(state.tmuxArgvCalls[0])
+    expect(argv).toContain('bwrap')
   })
 
   it('skips sandboxing entirely (and never creates a state dir) when no projectPath is given', () => {
