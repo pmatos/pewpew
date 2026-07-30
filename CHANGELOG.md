@@ -1,3 +1,10 @@
+## [0.10.2](https://github.com/pmatos/pewpew/compare/v0.10.1...v0.10.2) (2026-07-30)
+
+
+### Bug Fixes
+
+* **sandbox:** allow claude to write ~/.claude/session-env ([#259](https://github.com/pmatos/pewpew/issues/259)) ([4698bef](https://github.com/pmatos/pewpew/commit/4698befe35394dd759b02e5ebf411a4f282621cd))
+
 ## [0.10.1](https://github.com/pmatos/pewpew/compare/v0.10.0...v0.10.1) (2026-07-29)
 
 
