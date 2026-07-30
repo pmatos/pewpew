@@ -19,6 +19,10 @@ const state = {
   // disabled, since a missing state bind would make the agent's first write
   // hit EROFS under --ro-bind / /).
   remoteStateDir: '/home/dev/.claude/projects/encoded-wt1' as string | undefined,
+  // Second writable dir the claude-tool branch of resolveRemoteAgentStateDir
+  // reports (Claude's own ~/.claude/session-env, mkdir'd by the same script).
+  // Ignored for the codex/omp branches, which only ever return one dir.
+  remoteSessionEnvDir: '/home/dev/.claude/session-env' as string | undefined,
 }
 
 function fakePty() {
@@ -76,16 +80,26 @@ vi.mock('./host-connection', () => ({
       return { stdout: state.remoteGitDir ?? '', stderr: '', code: 0, timedOut: false }
     }
     // resolveRemoteAgentStateDir: `sh -c <script> _ <worktreePath>` — the
-    // script prints the state dir path after mkdir'ing it. Return a fixed
-    // path so sandboxing can be enabled; tests that need it disabled set
-    // state.remoteStateDir to undefined.
+    // script prints the writable dir path(s), one per line, after mkdir'ing
+    // them. Return a fixed path so sandboxing can be enabled; tests that need
+    // it disabled set state.remoteStateDir to undefined. The claude branch
+    // additionally reports remoteSessionEnvDir (its ~/.claude/session-env
+    // counterpart), matching the real script's two-line stdout.
     if (argv[0] === 'sh' && typeof argv[2] === 'string') {
       const script = argv[2]
-      if (
-        script.includes('.claude/projects') ||
-        script.includes('.codex') ||
-        script.includes('.omp/agent/sessions')
-      ) {
+      if (script.includes('.claude/projects')) {
+        const dir = state.remoteStateDir
+        const dirs = dir
+          ? [dir, ...(state.remoteSessionEnvDir ? [state.remoteSessionEnvDir] : [])]
+          : []
+        return {
+          stdout: dirs.join('\n'),
+          stderr: '',
+          code: dir ? 0 : 1,
+          timedOut: false,
+        }
+      }
+      if (script.includes('.codex') || script.includes('.omp/agent/sessions')) {
         const dir = state.remoteStateDir
         return {
           stdout: dir ?? '',
@@ -244,12 +258,26 @@ describe('createPty', () => {
       'projects',
       canonicalPath(WORKTREE).replace(/[^a-zA-Z0-9-]/g, '-')
     )
+    const claudeSessionEnvDir = join(homedir(), '.claude', 'session-env')
     const expectedPrefix = buildSandboxArgs(PROJECT, WORKTREE, {
       enabled: true,
-      extraWritablePaths: [claudeStateDir],
+      extraWritablePaths: [claudeStateDir, claudeSessionEnvDir],
     })
     expect(argv).toEqual([...expectedPrefix, ...buildAgentArgs({ tool: 'claude' })])
     expect(warnSpy).not.toHaveBeenCalled()
+  })
+
+  it("also creates and binds ~/.claude/session-env writable for claude (Claude Code mkdir's a per-session scratch dir there at SessionStart)", () => {
+    createPty('s1', WORKTREE, { tool: 'claude', projectPath: PROJECT })
+    const claudeSessionEnvDir = join(homedir(), '.claude', 'session-env')
+    expect(state.mkdirCalls).toContain(claudeSessionEnvDir)
+    const argv = agentArgsFromCall(state.tmuxArgvCalls[0])
+    const bindIdx = argv.indexOf('--bind-try', argv.indexOf(`${PROJECT}/.git/hooks`))
+    expect(argv.slice(bindIdx + 3, bindIdx + 6)).toEqual([
+      '--bind-try',
+      claudeSessionEnvDir,
+      claudeSessionEnvDir,
+    ])
   })
 
   it('creates the tool-specific per-worktree state dir and opens only that as an extra writable path', () => {
@@ -264,6 +292,8 @@ describe('createPty', () => {
     expect(state.mkdirCalls).toContain(ompStateDir)
     // Not the whole ~/.omp dir — only this worktree's own session subdirectory.
     expect(state.mkdirCalls).not.toContain(join(homedir(), '.omp'))
+    // omp doesn't touch ~/.claude/session-env — that's claude-specific.
+    expect(state.mkdirCalls).not.toContain(join(homedir(), '.claude', 'session-env'))
     const argv = agentArgsFromCall(state.tmuxArgvCalls[0])
     // The extra writable path is bound after the project's own `.git`/`.git/hooks`
     // binds, so search for '--bind-try' starting past the last fixed occurrence.
@@ -295,6 +325,7 @@ describe('createPty', () => {
 describe('createRemotePty', () => {
   const host = { hostId: 'h1', alias: 'dev', label: 'Dev' } as Host
   const STATE_DIR = '/home/dev/.claude/projects/encoded-wt1'
+  const SESSION_ENV_DIR = '/home/dev/.claude/session-env'
   const REMOTE_SOCKET_DIR = '/tmp/pewpew-remote'
   const REMOTE_SOCKET = `${REMOTE_SOCKET_DIR}/hook.sock`
 
@@ -302,6 +333,7 @@ describe('createRemotePty', () => {
     state.remoteArgvCalls = []
     state.remoteGitDir = ''
     state.remoteStateDir = STATE_DIR
+    state.remoteSessionEnvDir = SESSION_ENV_DIR
   })
 
   // The tmux new-session call is the one whose argv starts with 'tmux' — the
@@ -320,7 +352,7 @@ describe('createRemotePty', () => {
     const argv = remoteAgentArgsFromCall(tmuxCall())
     const expectedPrefix = buildSandboxArgs(PROJECT, WORKTREE, {
       enabled: true,
-      extraWritablePaths: [STATE_DIR],
+      extraWritablePaths: [STATE_DIR, SESSION_ENV_DIR],
       extraReadOnlyPaths: [REMOTE_SOCKET_DIR],
       gitDir: `${PROJECT}/.git`,
     })
