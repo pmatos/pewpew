@@ -57,6 +57,19 @@ if [ -z "$root_real" ]; then
   exit 0
 fi
 
+# /tmp is exempt from the worktree boundary: under the bwrap sandbox it's a
+# private --tmpfs mount unique to this session (see agent-sandbox.ts), not
+# the host's shared /tmp, so a write there can't reach another session or
+# the host filesystem the way a write to an arbitrary host path could. This
+# hook has no visibility into whether bwrap is actually active for *this*
+# session (it's installed with just the worktree root baked in), so on an
+# unsandboxed session /tmp is genuinely the shared host /tmp and this
+# exemption is a real (accepted) gap there — bwrap being unavailable already
+# degrades every other write-containment guarantee this project makes, not
+# just this one. Canonicalized the same way as root_real so a symlinked
+# /tmp (e.g. macOS's /tmp -> /private/tmp) still matches.
+tmp_real=$(cd /tmp 2>/dev/null && pwd -P)
+
 # Check for an embedded/trailing newline in the raw JSON string BEFORE ever
 # assigning it into a shell variable: `target=$(...)` below would silently
 # strip a trailing newline via command substitution, so validating $target
@@ -170,6 +183,17 @@ else
     "$root_real"/*) allowed=1 ;;
     *) allowed=0 ;;
   esac
+
+  # /tmp exemption (see tmp_real above). Guarded on tmp_real being non-empty
+  # and checked outside the case above rather than as extra arms in it: an
+  # empty case pattern (if `cd /tmp` ever failed) would collapse "$tmp_real"/*
+  # into the wildcard /*, matching every absolute path.
+  if [ "$allowed" != "1" ] && [ -n "$tmp_real" ]; then
+    case "$target_real" in
+      "$tmp_real") allowed=1 ;;
+      "$tmp_real"/*) allowed=1 ;;
+    esac
+  fi
 
   guard_settings="$root_real/.claude/settings.local.json"
   # `-ef` (same file, via inode/device) catches what the exact string match
