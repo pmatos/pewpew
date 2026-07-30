@@ -1563,7 +1563,14 @@ export async function reviveSession(id: string): Promise<void> {
     try {
       await remoteHostRuntime.withPreparedHost(
         host,
-        async ({ agentPaths, ompHookScriptPath, remoteSocketPath, sandboxAvailable }) => {
+        async ({
+          agentPaths,
+          notifyScriptPath,
+          guardScriptPath,
+          ompHookScriptPath,
+          remoteSocketPath,
+          sandboxAvailable,
+        }) => {
           if (await hasRemoteTmuxSession(id, host)) {
             await reattachRemotePty(id, host)
           } else {
@@ -1579,6 +1586,17 @@ export async function reviveSession(id: string): Promise<void> {
                 `Session ${id} (${session.tool}) has no prior conversation on host ${host.alias}; spawning fresh instead of resuming`
               )
             }
+            // See the local branch above: reinstall hooks before spawning so
+            // a long-since-created remote worktree picks up hook fixes that
+            // landed after its last install, instead of running forever
+            // against whatever was current at creation time.
+            await installRemoteAgentHooks(
+              session.tool,
+              host,
+              session.worktreePath,
+              notifyScriptPath,
+              guardScriptPath
+            )
             session.sandboxed = await createRemotePty(id, session.worktreePath, host, {
               continueSession: canResume,
               tool: session.tool,
@@ -1615,6 +1633,15 @@ export async function reviveSession(id: string): Promise<void> {
       console.warn(
         `Session ${id} (${session.tool}) has no prior conversation; spawning fresh instead of resuming`
       )
+    }
+    // Reinstall hooks before spawning: the agent process reads its hook
+    // config at process start (see the relocateProject comment above), and a
+    // session revived here may have been created long before its worktree's
+    // settings.local.json last saw an installHooks() call — any hook fix
+    // that landed since (e.g. worktree-guard.sh's /tmp exemption) would
+    // otherwise never reach this worktree until it's relocated or recreated.
+    if (existsSync(session.worktreePath)) {
+      await installAgentHooks(session.tool, session.worktreePath)
     }
     session.sandboxed = createPty(id, session.worktreePath, {
       continueSession: canResume,
@@ -1677,6 +1704,10 @@ export async function attachLocalSession(id: string): Promise<void> {
           `Session ${id} (${session.tool}) has no prior conversation; spawning fresh instead of resuming`
         )
       }
+      // See reviveSession's local branch: reinstall hooks before spawning so
+      // a session that's been pending since long before its worktree's last
+      // installHooks() call picks up hook fixes landed since then.
+      await installAgentHooks(session.tool, session.worktreePath)
       session.sandboxed = createPty(id, session.worktreePath, {
         continueSession: canResume,
         tool: session.tool,
