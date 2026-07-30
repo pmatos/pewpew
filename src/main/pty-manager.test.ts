@@ -480,6 +480,14 @@ describe('createRemotePty', () => {
     expect(argv).not.toContain('bwrap')
   })
 
+  it('skips the remote state-dir SSH round trip entirely when sandboxAvailable is not set', async () => {
+    await createRemotePty('s1', WORKTREE, host, { tool: 'claude', projectPath: PROJECT })
+    // Not just "its result is discarded" — the `sh -c` call that mkdir's
+    // real directories under the remote ~/.claude must never be issued when
+    // the sandbox won't be used on this host at all.
+    expect(state.remoteArgvCalls.some((argv) => argv[0] === 'sh')).toBe(false)
+  })
+
   it('omits the sandbox prefix when no projectPath is given, regardless of sandboxAvailable', async () => {
     await createRemotePty('s1', WORKTREE, host, {
       tool: 'claude',

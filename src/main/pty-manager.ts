@@ -428,7 +428,19 @@ async function resolveRemoteAgentStateDir(
   // as extraReadOnlyPaths, mirroring buildLocalSandboxPrefix — including
   // mkdir'ing the directory-type denylist entries here so their --ro-bind-try
   // can't silently skip an absent one (see CLAUDE_DIR_RO_DIRS' comment).
-  const claudeRoDirsMkdir = CLAUDE_DIR_RO_DIRS.map((name) => `"$c/${name}"`).join(' ')
+  // The essential mkdirs ($d, $c) are `&&`-gated ahead of the denylist
+  // pre-creates deliberately: a failure there means sandboxing genuinely
+  // can't proceed (no writable exception to bind), so falling back to
+  // unsandboxed is correct. The denylist directory names, by contrast, are
+  // each mkdir'd individually inside their own loop with stderr suppressed
+  // and no `&&` between iterations — one name already occupied by a stray
+  // file or dangling symlink must not take the whole remote sandbox down
+  // (as a single `mkdir -p a b c && ...` chain would: GNU mkdir -p keeps
+  // going past a failing operand but still exits non-zero overall, which
+  // used to make the trailing `&& printf` never run, returning undefined
+  // here and disabling bwrap entirely for the session). Mirrors the local
+  // path's per-entry try/catch in buildLocalSandboxPrefix.
+  const claudeRoDirsNames = CLAUDE_DIR_RO_DIRS.join(' ')
   const script =
     tool === 'codex'
       ? 'd="$HOME/.codex"; mkdir -p "$d" && printf "%s" "$d"'
@@ -437,7 +449,9 @@ async function resolveRemoteAgentStateDir(
         : 'p=$(CDPATH= cd -P -- "$1" 2>/dev/null && pwd -P); [ -n "$p" ] || p="$1"; ' +
           "enc=$(printf '%s' \"$p\" | sed 's/[^a-zA-Z0-9-]/-/g'); " +
           'd="$HOME/.claude/projects/$enc"; c="$HOME/.claude"; ' +
-          `mkdir -p "$d" "$c" ${claudeRoDirsMkdir} && printf "%s\\n%s" "$d" "$c"`
+          'mkdir -p "$d" "$c" && { ' +
+          `for x in ${claudeRoDirsNames}; do mkdir -p "$c/$x" 2>/dev/null; done; ` +
+          'printf "%s\\n%s" "$d" "$c"; }'
   try {
     const result = await execRemote(host, ['sh', '-c', script, '_', worktreePath], {
       timeoutMs: 8000,
@@ -639,12 +653,22 @@ export async function createRemotePty(
     // root) or wrong path. A transient SSH failure on either degrades to
     // unsandboxed (safe fallback) rather than launching a known-broken bwrap
     // prefix.
+    //
+    // resolveRemoteAgentStateDir is skipped outright (not just its result
+    // discarded) when the sandbox won't be used on this host: it's an SSH
+    // round trip that mkdir's real directories under the user's remote
+    // ~/.claude, with no payoff — buildSandboxArgs ignores its result
+    // entirely when `enabled` is false below — mirroring the local path's
+    // equivalent gate in buildLocalSandboxPrefix.
+    const sandboxEnabled = getSandboxConfig().enabled
+    const canSandboxHost = sandboxEnabled && options?.sandboxAvailable === true
     const [gitDir, remoteState] = await Promise.all([
       resolveRemoteGitDir(host, options.projectPath),
-      resolveRemoteAgentStateDir(host, options.tool, cwd),
+      canSandboxHost
+        ? resolveRemoteAgentStateDir(host, options.tool, cwd)
+        : Promise.resolve(undefined),
     ])
-    const sandboxEnabled = getSandboxConfig().enabled
-    const canSandbox = sandboxEnabled && options?.sandboxAvailable === true && !!remoteState
+    const canSandbox = canSandboxHost && !!remoteState
     const remoteClaudeDir = remoteState?.claudeDir
     sandboxPrefix = buildSandboxArgs(options.projectPath, cwd, {
       enabled: canSandbox,
