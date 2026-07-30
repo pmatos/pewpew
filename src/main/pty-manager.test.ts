@@ -36,6 +36,7 @@ const CLAUDE_DIR_WRITE_DENYLIST = [
   'plugins',
   'backups',
   'daemon',
+  'shell-snapshots',
   'settings.json',
   'settings.backup.json',
   'CLAUDE.md',

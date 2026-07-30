@@ -303,6 +303,24 @@ function claudeDir(homeDir: string = homedir()): string {
 //                                           backup is ever auto-restored
 //   daemon/                                control.key, the background
 //                                           claude-daemon's auth secret
+//   shell-snapshots/                       Bash tool state snapshots, sourced
+//                                           (not just parsed) by later Bash
+//                                           calls — a stronger persistence
+//                                           vector than most entries above,
+//                                           since it runs as shell code
+//                                           rather than being read as config.
+//                                           Confirmed safe to close: this
+//                                           whole multi-hour session ran with
+//                                           it read-only under the pre-#261
+//                                           narrow allowlist (verified via
+//                                           /proc/self/mountinfo — no bind
+//                                           for shell-snapshots — and by diff
+//                                           against the allowlist this dir
+//                                           was never part of), with heavy
+//                                           Bash tool use throughout and no
+//                                           observed failure — same evidence
+//                                           class already accepted below for
+//                                           ~/.claude.json.
 //
 // buildSandboxArgs emits these as --ro-bind-try, which silently SKIPS a
 // source that doesn't exist — before this file granted the whole ~/.claude
@@ -323,6 +341,7 @@ const CLAUDE_DIR_RO_DIRS = [
   'plugins',
   'backups',
   'daemon',
+  'shell-snapshots',
 ]
 const CLAUDE_DIR_RO_FILES = [
   'settings.json',
