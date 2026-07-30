@@ -6,14 +6,32 @@ import { join } from 'path'
 
 const SCRIPT = join(__dirname, '../../hooks/worktree-guard.sh')
 
+// Every fixture in this file — both `root` and the various "outside"
+// directories — must live somewhere that is NOT under the OS temp dir:
+// worktree-guard.sh now exempts /tmp from the boundary check (see the
+// script's tmp_real comment), and os.tmpdir() is /tmp on Linux. Previously
+// `root` and "outside" fixtures were both created directly under tmpdir(),
+// making `root`'s own parent literally /tmp — the /tmp exemption would then
+// silently pass tests like "denies a write to the parent directory" for the
+// wrong reason (allowed as /tmp, not correctly denied as outside root).
+// FIXTURE_BASE keeps every boundary test exercising the root/worktree logic
+// this file is actually about; the /tmp exemption itself gets its own
+// dedicated tests further down, using tmpdir() directly.
+const FIXTURE_BASE = join(__dirname, '.guard-test-fixtures')
+
+function mkFixtureDir(prefix: string): string {
+  mkdirSync(FIXTURE_BASE, { recursive: true })
+  return mkdtempSync(join(FIXTURE_BASE, prefix))
+}
+
 let root: string
 
 beforeEach(() => {
-  root = mkdtempSync(join(tmpdir(), 'guard-root-'))
+  root = mkFixtureDir('guard-root-')
 })
 
 afterEach(() => {
-  rmSync(root, { recursive: true, force: true })
+  rmSync(FIXTURE_BASE, { recursive: true, force: true })
 })
 
 interface Decision {
@@ -50,7 +68,7 @@ describe('worktree-guard.sh', () => {
   })
 
   it('denies a write outside the worktree', () => {
-    const outside = mkdtempSync(join(tmpdir(), 'guard-outside-'))
+    const outside = mkFixtureDir('guard-outside-')
     try {
       const decision = run(writePayload(join(outside, 'escape.txt')))
       expect(decision?.hookSpecificOutput?.permissionDecision).toBe('deny')
@@ -80,7 +98,7 @@ describe('worktree-guard.sh', () => {
   })
 
   it('denies escaping through a symlink inside the worktree', () => {
-    const outside = mkdtempSync(join(tmpdir(), 'guard-symlink-target-'))
+    const outside = mkFixtureDir('guard-symlink-target-')
     try {
       symlinkSync(outside, join(root, 'link'))
       const decision = run(writePayload(join(root, 'link', 'escape.txt')))
@@ -91,7 +109,7 @@ describe('worktree-guard.sh', () => {
   })
 
   it('denies writes to a new file whose parent is a symlink pointing outside', () => {
-    const outside = mkdtempSync(join(tmpdir(), 'guard-symlink-target2-'))
+    const outside = mkFixtureDir('guard-symlink-target2-')
     try {
       symlinkSync(outside, join(root, 'out-link'))
       const decision = run(writePayload(join(root, 'out-link', 'new', 'deep.txt')))
@@ -102,7 +120,7 @@ describe('worktree-guard.sh', () => {
   })
 
   it('denies a write through a symlink whose target is a file outside the worktree', () => {
-    const outside = mkdtempSync(join(tmpdir(), 'guard-file-target-'))
+    const outside = mkFixtureDir('guard-file-target-')
     try {
       const outsideFile = join(outside, 'secret.txt')
       writeFileSync(outsideFile, 'x')
@@ -148,7 +166,7 @@ describe('worktree-guard.sh', () => {
   })
 
   it('denies a write through a symlink whose target contains a newline', () => {
-    const outside = mkdtempSync(join(tmpdir(), 'guard-symlink-newline-'))
+    const outside = mkFixtureDir('guard-symlink-newline-')
     try {
       symlinkSync(`${outside}/secret\n`, join(root, 'link-newline'))
       const decision = run(writePayload(join(root, 'link-newline')))
@@ -191,7 +209,7 @@ describe('worktree-guard.sh', () => {
   })
 
   it('handles the NotebookEdit notebook_path field', () => {
-    const outside = mkdtempSync(join(tmpdir(), 'guard-nb-'))
+    const outside = mkFixtureDir('guard-nb-')
     try {
       const decision = run({
         tool_name: 'NotebookEdit',
@@ -256,5 +274,29 @@ describe('worktree-guard.sh', () => {
     const decision = JSON.parse(out.trim()) as Decision
     expect(decision.hookSpecificOutput?.permissionDecision).toBe('deny')
     expect(decision.hookSpecificOutput?.permissionDecisionReason).toContain('jq is not installed')
+  })
+
+  // /tmp is exempt from the worktree boundary — see tmp_real's comment in
+  // the script. These use the real OS temp dir directly (unlike every other
+  // fixture above, which was deliberately moved off tmpdir() so this
+  // exemption couldn't quietly make those tests pass for the wrong reason).
+  it('allows a write directly under /tmp, outside the worktree', () => {
+    const outside = mkdtempSync(join(tmpdir(), 'guard-tmp-exempt-'))
+    try {
+      const decision = run(writePayload(join(outside, 'scratch.txt')))
+      expect(decision).toBeNull()
+    } finally {
+      rmSync(outside, { recursive: true, force: true })
+    }
+  })
+
+  it('allows a write to a nested not-yet-existing path under /tmp', () => {
+    const outside = mkdtempSync(join(tmpdir(), 'guard-tmp-exempt-'))
+    try {
+      const decision = run(writePayload(join(outside, 'a', 'b', 'c.txt')))
+      expect(decision).toBeNull()
+    } finally {
+      rmSync(outside, { recursive: true, force: true })
+    }
   })
 })
