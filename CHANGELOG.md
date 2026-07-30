@@ -1,3 +1,10 @@
+## [0.10.3](https://github.com/pmatos/pewpew/compare/v0.10.2...v0.10.3) (2026-07-30)
+
+
+### Bug Fixes
+
+* **sandbox:** stop enumerating ~/.claude writable exceptions one crash at a time ([#261](https://github.com/pmatos/pewpew/issues/261)) ([1248eda](https://github.com/pmatos/pewpew/commit/1248edafc57b24e7566b5abf0afbc07cad1634d4))
+
 ## [0.10.2](https://github.com/pmatos/pewpew/compare/v0.10.1...v0.10.2) (2026-07-30)
 
 
