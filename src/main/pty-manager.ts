@@ -249,6 +249,18 @@ function agentStateDir(
   return join(homeDir, '.claude', 'projects', encoded)
 }
 
+// Claude Code itself (not pewpew) mkdir's a per-invocation scratch directory
+// here at SessionStart — `~/.claude/session-env/<claude-generated-uuid>/` —
+// for state disjoint from the resumable conversation history in
+// agentStateDir's `~/.claude/projects/<encoded>`. That UUID is generated
+// inside the `claude` binary itself, not passed in or predictable ahead of
+// spawn, so unlike agentStateDir there's no per-worktree subdirectory to
+// mkdir and bind narrowly — the whole session-env directory is the writable
+// exception, mirroring why codex's exception above is the whole ~/.codex dir.
+function claudeSessionEnvDir(homeDir: string = homedir()): string {
+  return join(homeDir, '.claude', 'session-env')
+}
+
 // Resolves the real .git directory for a project root. A standard worktree
 // has `<project>/.git` as a directory, but a gitfile root (submodule or
 // linked worktree) has `.git` as a *file* (`gitdir: /path/to/real/.git`) —
@@ -289,25 +301,33 @@ async function resolveRemoteGitDir(host: Host, projectPath: string): Promise<str
   return `${projectPath}/.git`
 }
 
-// Computes the agent's conversation-state directory ON the remote host and
-// mkdir's it in the same SSH round trip. This must run on the remote, not via
-// the local agentStateDir(): the local helper uses local realpathSync/homedir/
-// tmpdir and platform-local path.join, all of which compute the wrong path for
-// a remote session (wrong symlinks, wrong $HOME, wrong tmpdir, wrong omp
-// encoding). The shell canonicalization here mirrors the remote history probes
-// in session-manager.ts exactly so the bind-source and the resume-probe check
-// the same directory.
+// Computes the agent's writable state directories ON the remote host and
+// mkdir's them in the same SSH round trip. This must run on the remote, not via
+// the local agentStateDir()/claudeSessionEnvDir(): the local helpers use local
+// realpathSync/homedir/tmpdir and platform-local path.join, all of which
+// compute the wrong path for a remote session (wrong symlinks, wrong $HOME,
+// wrong tmpdir, wrong omp encoding). The shell canonicalization here mirrors
+// the remote history probes in session-manager.ts exactly so the bind-source
+// and the resume-probe check the same directory.
 //
-// Returns the absolute POSIX path (or undefined on failure — a transient SSH
-// error degrades to unsandboxed rather than blocking session creation).
+// Returns the list of absolute POSIX paths to bind writable (or undefined on
+// failure — a transient SSH error degrades to unsandboxed rather than
+// blocking session creation).
 async function resolveRemoteAgentStateDir(
   host: Host,
   tool: AgentTool | undefined,
   worktreePath: string
-): Promise<string | undefined> {
+): Promise<string[] | undefined> {
   // codex has no per-worktree dir convention — its resume is keyed on
   // agentSessionId, not a filesystem path — so the whole ~/.codex dir is the
   // writable exception (matching the local agentStateDir for codex).
+  //
+  // claude additionally needs ~/.claude/session-env writable: the `claude`
+  // binary itself mkdir's a per-invocation scratch directory there at
+  // SessionStart, keyed by a UUID it generates internally (not predictable
+  // ahead of spawn), so — like ~/.codex above — the whole directory, not a
+  // per-worktree subdirectory, is the writable exception (see
+  // claudeSessionEnvDir's local counterpart for the same reasoning).
   const script =
     tool === 'codex'
       ? 'd="$HOME/.codex"; mkdir -p "$d" && printf "%s" "$d"'
@@ -315,14 +335,18 @@ async function resolveRemoteAgentStateDir(
         ? `${OMP_ENCODE_SHELL_SCRIPT}; d="$HOME/.omp/agent/sessions/$enc"; mkdir -p "$d" && printf "%s" "$d"`
         : 'p=$(CDPATH= cd -P -- "$1" 2>/dev/null && pwd -P); [ -n "$p" ] || p="$1"; ' +
           "enc=$(printf '%s' \"$p\" | sed 's/[^a-zA-Z0-9-]/-/g'); " +
-          'd="$HOME/.claude/projects/$enc"; mkdir -p "$d" && printf "%s" "$d"'
+          'd="$HOME/.claude/projects/$enc"; e="$HOME/.claude/session-env"; ' +
+          'mkdir -p "$d" "$e" && printf "%s\\n%s" "$d" "$e"'
   try {
     const result = await execRemote(host, ['sh', '-c', script, '_', worktreePath], {
       timeoutMs: 8000,
     })
     if (!result.timedOut && result.code === 0) {
-      const dir = result.stdout.trim()
-      if (dir.startsWith('/')) return dir
+      const dirs = result.stdout
+        .trim()
+        .split('\n')
+        .filter((dir) => dir.startsWith('/'))
+      if (dirs.length > 0) return dirs
     }
   } catch {
     // fall through — unsandboxed is the safe fallback
@@ -367,10 +391,17 @@ function buildLocalSandboxPrefix(
   // those checks test directory *contents* rather than mere existence.
   const stateDir = agentStateDir(tool, cwd)
   mkdirSync(stateDir, { recursive: true })
+  const extraWritablePaths = [stateDir, ...sandboxConfig.extraWritablePaths.map(resolvePath)]
+  // codex/omp don't write to ~/.claude/session-env — only claude does.
+  if (tool !== 'codex' && tool !== 'omp') {
+    const sessionEnvDir = claudeSessionEnvDir()
+    mkdirSync(sessionEnvDir, { recursive: true })
+    extraWritablePaths.push(sessionEnvDir)
+  }
   const gitDir = resolveGitDir(projectPath)
   return buildSandboxArgs(projectPath, cwd, {
     enabled: sandboxConfig.enabled && sandboxAvailable,
-    extraWritablePaths: [stateDir, ...sandboxConfig.extraWritablePaths.map(resolvePath)],
+    extraWritablePaths,
     gitDir,
   })
 }
@@ -459,29 +490,29 @@ export async function createRemotePty(
       )
     }
     // Remote sandbox wiring mirrors createPty's local path: resolve the real
-    // .git dir (gitfile roots) and the agent state dir ON the remote host
+    // .git dir (gitfile roots) and the agent state dir(s) ON the remote host
     // (computing it locally would use the wrong $HOME, symlinks, and omp
-    // encoding). resolveRemoteAgentStateDir also mkdir's the dir in the same
+    // encoding). resolveRemoteAgentStateDir also mkdir's the dir(s) in the same
     // SSH round trip so bwrap's bind-source exists before the tmux spawn.
     //
-    // Both resolutions must succeed to enable sandboxing: a missing stateDir
+    // Both resolutions must succeed to enable sandboxing: a missing stateDirs
     // means the agent's first write hits EROFS under --ro-bind / /, and a
     // missing gitDir means the .git bind points at a file (gitfile root) or
     // wrong path. A transient SSH failure on either degrades to unsandboxed
     // (safe fallback) rather than launching a known-broken bwrap prefix.
-    const [gitDir, stateDir] = await Promise.all([
+    const [gitDir, stateDirs] = await Promise.all([
       resolveRemoteGitDir(host, options.projectPath),
       resolveRemoteAgentStateDir(host, options.tool, cwd),
     ])
     const sandboxEnabled = getSandboxConfig().enabled
-    const canSandbox = sandboxEnabled && options?.sandboxAvailable === true && !!stateDir
+    const canSandbox = sandboxEnabled && options?.sandboxAvailable === true && !!stateDirs
     sandboxPrefix = buildSandboxArgs(options.projectPath, cwd, {
       enabled: canSandbox,
-      extraWritablePaths: stateDir ? [stateDir] : [],
+      extraWritablePaths: stateDirs ?? [],
       extraReadOnlyPaths: options.remoteSocketPath ? [posix.dirname(options.remoteSocketPath)] : [],
       gitDir,
     })
-    if (sandboxEnabled && options?.sandboxAvailable === true && !stateDir) {
+    if (sandboxEnabled && options?.sandboxAvailable === true && !stateDirs) {
       console.warn(
         `Session ${sessionId}: bwrap is available on host ${host.alias} but the remote ` +
           'agent state directory could not be resolved, spawning without sandbox containment'
