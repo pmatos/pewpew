@@ -218,17 +218,24 @@ export function isSandboxAvailable(): boolean {
 // state under its own dir there, so without an explicit writable exception
 // every sandboxed session would fail on its very first state write.
 //
-// Narrowed to each tool's own per-worktree subdirectory, not the rest of
-// $HOME — opening the whole tool dir would also expose global config like
-// ~/.claude/CLAUDE.md and ~/.claude/settings.json, which every future
-// session across every project loads, turning one sandboxed write into a
-// persistence vector for every session afterward.
+// For codex and omp, the path returned here IS the sandbox's writable
+// exception — narrowed to each tool's own per-worktree subdirectory, not the
+// rest of $HOME, so a sandboxed write can't reach global config that every
+// future session across every project loads.
 //
-// claude and omp key their per-worktree directory off an encoded path
-// (hasClaudeConversationHistory / hasOmpConversationHistory in
-// session-manager.ts); the encoders are imported from agent-state-paths.ts
-// rather than reimplemented so a mismatch can't leave the sandbox binding a
-// different directory than the one resume-probing checks.
+// For claude, the sandbox's writable exception is the whole ~/.claude dir
+// (see claudeDir() below and CLAUDE_DIR_WRITE_DENYLIST, which re-closes the
+// global-config entries the narrowing above still protects for the other
+// tools). This function is still called for claude, but only to locate —
+// and mkdir ahead of first run — the per-worktree resume-history marker dir
+// that hasClaudeConversationHistory (session-manager.ts) checks; it no
+// longer determines what the sandbox binds writable there.
+//
+// claude and omp key their per-worktree directory off an encoded path; the
+// encoders are imported from agent-state-paths.ts rather than reimplemented
+// so a mismatch can't leave this marker directory (or, for omp, the sandbox
+// binding itself) pointed at a different directory than resume-probing
+// checks.
 //
 // codex has no per-worktree directory convention in this codebase — its
 // resume is keyed on `agentSessionId` from the hook payload, not a
@@ -282,6 +289,13 @@ function claudeDir(homeDir: string = homedir()): string {
 //   CLAUDE.md                              global memory, loaded every session
 //   statusline.sh                          shell script executed every render
 //   commands/, output-styles/, skills/     custom prompt/instruction content
+//   agents/                                user-level custom subagent
+//                                           definitions, loaded the same way
+//                                           as commands/skills/ across every
+//                                           project — including a `hooks`
+//                                           block in their frontmatter, which
+//                                           runs without the workspace-trust
+//                                           dialog a project-level hook gets
 //   plugins/                               third-party hooks/commands/MCP config
 //   .credentials.json                      OAuth token
 //   backups/                               holds .claude.json.backup.* — same
@@ -301,7 +315,15 @@ function claudeDir(homeDir: string = homedir()): string {
 // way without pewpew writing placeholder content into the user's real global
 // config — deliberately not done here; see the callers of this list for the
 // residual gap that leaves on a machine where one of them doesn't exist yet.
-const CLAUDE_DIR_RO_DIRS = ['commands', 'output-styles', 'skills', 'plugins', 'backups', 'daemon']
+const CLAUDE_DIR_RO_DIRS = [
+  'commands',
+  'output-styles',
+  'skills',
+  'agents',
+  'plugins',
+  'backups',
+  'daemon',
+]
 const CLAUDE_DIR_RO_FILES = [
   'settings.json',
   'settings.backup.json',

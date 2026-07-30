@@ -32,6 +32,7 @@ const CLAUDE_DIR_WRITE_DENYLIST = [
   'commands',
   'output-styles',
   'skills',
+  'agents',
   'plugins',
   'backups',
   'daemon',
