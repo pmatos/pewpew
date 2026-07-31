@@ -1929,6 +1929,38 @@ describe('reviveSession — remote resume fallback', () => {
     ])
   })
 
+  // Byte-pin the composed remote history-probe script. The suite mocks
+  // execRemote by argv *substring*, so a dropped `; ` or altered quote in the
+  // shared CLAUDE_ENCODE_SHELL_SCRIPT fragment would otherwise ship green.
+  // Expected value is the exact literal that sat inline before extraction
+  // (independent source of truth), so this guards that the refactor is
+  // byte-for-byte behaviour-preserving at the seam between the fragment and
+  // the `ls -A` tail.
+  it('sends the exact remote claude history-probe script', async () => {
+    const remote = baseRemoteSession({ id: 'r1', status: 'dead' })
+    writeSessionsJson([remote])
+    state.claudeHistoryProbeResult.set(remote.worktreePath, true)
+    const sm = await loadSessionManager()
+    sm.restoreSessions()
+
+    await sm.reviveSession('r1')
+
+    const probe = state.execRemoteCalls.find(
+      (c) =>
+        c.argv[0] === 'sh' &&
+        typeof c.argv[2] === 'string' &&
+        c.argv[2].includes('.claude/projects')
+    )
+    expect(probe).toBeDefined()
+    expect(probe?.argv).toEqual([
+      'sh',
+      '-c',
+      `p=$(CDPATH= cd -P -- "$1" 2>/dev/null && pwd -P); [ -n "$p" ] || p="$1"; enc=$(printf '%s' "$p" | sed 's/[^a-zA-Z0-9-]/-/g'); [ -n "$(ls -A "$HOME/.claude/projects/$enc" 2>/dev/null)" ]`,
+      '_',
+      remote.worktreePath,
+    ])
+  })
+
   it('spawns fresh when the remote has no omp conversation history', async () => {
     const remote = baseRemoteSession({ id: 'r1', status: 'dead', tool: 'omp' })
     writeSessionsJson([remote])

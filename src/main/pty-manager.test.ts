@@ -427,6 +427,33 @@ describe('createRemotePty', () => {
     expect(argv).toEqual([...expectedPrefix, ...buildAgentArgs({ tool: 'claude' })])
   })
 
+  // Byte-pin the composed remote sandbox-prep script. The mock recognizes it by
+  // the `.claude/projects` substring, so a dropped `; ` or altered quoting in
+  // the shared CLAUDE_ENCODE_SHELL_SCRIPT fragment (or the d=/c= seam that
+  // consumes its $enc) would otherwise ship green. Expected bytes are the exact
+  // literal that sat inline before extraction (independent source of truth);
+  // the RO-dirs middle is intentionally covered by endsWith so this stays
+  // robust to that unrelated list changing.
+  it('sends the exact remote claude sandbox-prep script through the shared encoder seam', async () => {
+    await createRemotePty('s1', WORKTREE, host, {
+      tool: 'claude',
+      projectPath: PROJECT,
+      sandboxAvailable: true,
+    })
+    const prep = state.remoteArgvCalls.find(
+      (argv) =>
+        argv[0] === 'sh' && typeof argv[2] === 'string' && argv[2].includes('.claude/projects')
+    )
+    expect(prep).toBeDefined()
+    const script = prep?.[2] ?? ''
+    const expectedPrefix =
+      `p=$(CDPATH= cd -P -- "$1" 2>/dev/null && pwd -P); [ -n "$p" ] || p="$1"; ` +
+      `enc=$(printf '%s' "$p" | sed 's/[^a-zA-Z0-9-]/-/g'); ` +
+      `d="$HOME/.claude/projects/$enc"; c="$HOME/.claude"; mkdir -p "$d" "$c" && { `
+    expect(script.startsWith(expectedPrefix)).toBe(true)
+    expect(script.endsWith(`printf "%s\\n%s" "$d" "$c"; }`)).toBe(true)
+  })
+
   it('re-closes CLAUDE_DIR_WRITE_DENYLIST entries under the remote ~/.claude dir even without a remote socket path', async () => {
     await createRemotePty('s1', WORKTREE, host, {
       tool: 'claude',
