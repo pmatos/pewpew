@@ -1565,7 +1565,14 @@ export async function reviveSession(id: string): Promise<void> {
     try {
       await remoteHostRuntime.withPreparedHost(
         host,
-        async ({ agentPaths, ompHookScriptPath, remoteSocketPath, sandboxAvailable }) => {
+        async ({
+          agentPaths,
+          notifyScriptPath,
+          guardScriptPath,
+          ompHookScriptPath,
+          remoteSocketPath,
+          sandboxAvailable,
+        }) => {
           if (await hasRemoteTmuxSession(id, host)) {
             await reattachRemotePty(id, host)
           } else {
@@ -1579,6 +1586,23 @@ export async function reviveSession(id: string): Promise<void> {
             if (!canResume) {
               console.warn(
                 `Session ${id} (${session.tool}) has no prior conversation on host ${host.alias}; spawning fresh instead of resuming`
+              )
+            }
+            // See the local branch above: reinstall hooks before spawning so
+            // a long-since-created remote worktree picks up hook fixes that
+            // landed after its last install, instead of running forever
+            // against whatever was current at creation time. Mirrors the
+            // local branch's existsSync guard: installRemoteAgentHooks runs
+            // mkdir -p on the worktree path, which would otherwise silently
+            // resurrect a deleted remote worktree as an empty, non-git
+            // directory instead of letting the tmux spawn below fail loudly.
+            if (await hasRemoteWorktree(host, session.worktreePath)) {
+              await installRemoteAgentHooks(
+                session.tool,
+                host,
+                session.worktreePath,
+                notifyScriptPath,
+                guardScriptPath
               )
             }
             session.sandboxed = await createRemotePty(id, session.worktreePath, host, {
@@ -1617,6 +1641,15 @@ export async function reviveSession(id: string): Promise<void> {
       console.warn(
         `Session ${id} (${session.tool}) has no prior conversation; spawning fresh instead of resuming`
       )
+    }
+    // Reinstall hooks before spawning: the agent process reads its hook
+    // config at process start (see the relocateProject comment above), and a
+    // session revived here may have been created long before its worktree's
+    // settings.local.json last saw an installHooks() call — any hook fix
+    // that landed since (e.g. worktree-guard.sh's /tmp exemption) would
+    // otherwise never reach this worktree until it's relocated or recreated.
+    if (existsSync(session.worktreePath)) {
+      await installAgentHooks(session.tool, session.worktreePath)
     }
     session.sandboxed = createPty(id, session.worktreePath, {
       continueSession: canResume,
@@ -1678,6 +1711,19 @@ export async function attachLocalSession(id: string): Promise<void> {
         console.warn(
           `Session ${id} (${session.tool}) has no prior conversation; spawning fresh instead of resuming`
         )
+      }
+      // See reviveSession's local branch: reinstall hooks before spawning so
+      // a session that's been pending since long before its worktree's last
+      // installHooks() call picks up hook fixes landed since then. Best
+      // effort: unlike reviveSession, this path had no hook-install call (and
+      // so no way to fail on one) before this change — a pending session
+      // always spawned successfully regardless of hook file state. Swallow a
+      // failure here rather than let it flip an otherwise-healthy attach to
+      // 'dead', since a stale-hooks spawn is strictly better than no spawn.
+      try {
+        await installAgentHooks(session.tool, session.worktreePath)
+      } catch (err) {
+        console.error(`Session ${id}: failed to reinstall hooks before attach`, err)
       }
       session.sandboxed = createPty(id, session.worktreePath, {
         continueSession: canResume,
@@ -2458,6 +2504,33 @@ function hasClaudeConversationHistory(worktreePath: string): boolean {
   } catch {
     return false
   }
+}
+
+// Guards reviveSession's remote fresh-spawn branch against a deleted remote
+// worktree, mirroring the local branch's plain existsSync check — deliberately
+// a bare directory-existence test rather than the stricter `git rev-parse
+// --is-inside-work-tree` used by createRemoteSessionForWorktree, so a worktree
+// with a valid directory but transiently broken git metadata still spawns
+// exactly as it did before this reinstall-hooks change.
+//
+// `execRemote` never rejects — SSH-level failures resolve as a nonzero `code`
+// (255 for a connection failure, 127 if the local `ssh` binary is missing),
+// same as a genuinely failed `test -d`. Only a clean `code === 1` means the
+// worktree doesn't exist; a timeout or any other code is a transport/exec
+// failure, not proof of absence, and must throw so it reaches reviveSession's
+// outer try/catch (which marks the session offline) instead of being treated
+// the same as a missing worktree — which would silently skip the hook
+// reinstall while still letting the spawn below proceed once the connection
+// recovers, defeating the point of this reinstall-on-revive change.
+async function hasRemoteWorktree(host: Host, worktreePath: string): Promise<boolean> {
+  const result = await execRemote(host, ['test', '-d', worktreePath], { timeoutMs: 10000 })
+  if (result.timedOut) {
+    throw new Error(`Timed out checking whether ${worktreePath} exists on host ${host.alias}`)
+  }
+  if (result.code === 0) return true
+  if (result.code === 1) return false
+  const detail = result.stderr.trim() || result.stdout.trim() || `exit ${result.code}`
+  throw new Error(`Failed to check whether ${worktreePath} exists on host ${host.alias}: ${detail}`)
 }
 
 // Remote analogue of hasClaudeConversationHistory. Reuses the shared

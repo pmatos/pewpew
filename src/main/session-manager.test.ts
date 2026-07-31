@@ -72,6 +72,11 @@ const state = vi.hoisted(() => ({
   // Captured emitToast payloads for assertion.
   toasts: [] as { severity: string; title: string; detail?: string }[],
   hasPtyResult: new Set<string>(),
+  // Session ids for which the mocked hasTmuxSession (local, synchronous)
+  // reports a live tmux pane — i.e. reviveSession/attachLocalSession should
+  // reattach instead of spawning fresh. Defaults to empty (always false),
+  // matching every existing test's assumption.
+  hasTmuxSessionIds: new Set<string>(),
   // Session ids for which the mocked destroyRemotePty rejects (simulates an
   // SSH teardown failure), for removeSession failure-path coverage.
   destroyRemotePtyThrows: new Set<string>(),
@@ -150,6 +155,13 @@ vi.mock('./project-scanner', async (importOriginal) => {
 vi.mock('./hook-installer', () => ({
   installHooks: vi.fn(async () => undefined),
   installRemoteHooks: vi.fn(async () => undefined),
+  installCodexHooks: vi.fn(async () => ({})),
+  installRemoteCodexHooks: vi.fn(async () => ({})),
+  ensureCodexHooksFeatureFlag: vi.fn(),
+  ensureRemoteCodexHooksFeatureFlag: vi.fn(async () => undefined),
+  rollbackCodexHooks: vi.fn(),
+  rollbackRemoteCodexHooks: vi.fn(async () => undefined),
+  commitRemoteCodexHooks: vi.fn(async () => undefined),
 }))
 
 vi.mock('./host-registry', () => ({
@@ -199,7 +211,7 @@ vi.mock('./pty-manager', () => ({
     }
   }),
   hasPty: vi.fn((sessionId: string) => state.hasPtyResult.has(sessionId)),
-  hasTmuxSession: vi.fn(() => false),
+  hasTmuxSession: vi.fn((sessionId: string) => state.hasTmuxSessionIds.has(sessionId)),
   hasRemoteTmuxSession: vi.fn(async (sessionId: string) => {
     return state.hasRemoteTmuxResult.get(sessionId) ?? false
   }),
@@ -410,6 +422,7 @@ beforeEach(() => {
   state.reconnectConfig = { enabled: true, initialDelayMs: 1000, maxDelayMs: 30000 }
   state.toasts = []
   state.hasPtyResult = new Set()
+  state.hasTmuxSessionIds = new Set()
   state.destroyRemotePtyThrows = new Set()
   state.dialogResponse = 1
   state.dialogThrows = false
@@ -1782,6 +1795,42 @@ describe('attachLocalSession', () => {
     expect(got.connectionState).toBeUndefined()
     expect(state.createPtyCalls).toEqual([])
   })
+
+  it('reinstalls hooks before spawning a fresh pty', async () => {
+    const local = baseLocalSession({ id: 'l1', status: 'idle' })
+    mkdirSync(local.worktreePath, { recursive: true })
+    writeSessionsJson([local])
+    const sm = await loadSessionManager()
+    sm.restoreSessions()
+    const { installHooks } = await import('./hook-installer')
+    vi.mocked(installHooks).mockClear()
+
+    await sm.attachLocalSession('l1')
+
+    expect(installHooks).toHaveBeenCalledWith(local.worktreePath, { skipGitignore: true })
+    expect(state.createPtyCalls.map((c) => c.sessionId)).toEqual(['l1'])
+  })
+
+  // Regression: before this PR, attach never touched hooks, so a pending
+  // session always spawned successfully regardless of hook file state. A
+  // failed reinstall (permissions, full disk, ...) must not turn that
+  // previously-infallible path into one that marks the session dead.
+  it('still spawns when hook reinstall fails', async () => {
+    const local = baseLocalSession({ id: 'l1', status: 'idle' })
+    mkdirSync(local.worktreePath, { recursive: true })
+    writeSessionsJson([local])
+    const sm = await loadSessionManager()
+    sm.restoreSessions()
+    const { installHooks } = await import('./hook-installer')
+    vi.mocked(installHooks).mockRejectedValueOnce(new Error('EACCES'))
+
+    await sm.attachLocalSession('l1')
+
+    const got = sm.getSessions()[0]
+    expect(got.status).toBe('idle')
+    expect(got.connectionState).toBeUndefined()
+    expect(state.createPtyCalls.map((c) => c.sessionId)).toEqual(['l1'])
+  })
 })
 
 describe('attachPendingLocalSessions', () => {
@@ -1997,6 +2046,157 @@ describe('reviveSession — remote resume fallback', () => {
         remoteSocketPath: '/tmp/remote.sock',
       },
     ])
+  })
+})
+
+describe('reviveSession — reinstalls hooks on fresh spawn', () => {
+  // Regression: hooks (notify.sh, worktree-guard.sh) are only installed into
+  // a worktree's settings.local.json at session creation time. A session
+  // revived long after creation — possibly before a hook fix even existed —
+  // would otherwise run forever against whatever was installed back then.
+  // Reinstalling right before a fresh process spawn (never on reattach,
+  // since a live agent process already read its hook config at its own
+  // start) keeps every revived session current.
+  it('local: reinstalls hooks before spawning a fresh pty', async () => {
+    const local = baseLocalSession({ id: 'l1', status: 'idle' })
+    mkdirSync(local.worktreePath, { recursive: true })
+    writeSessionsJson([local])
+    const sm = await loadSessionManager()
+    sm.restoreSessions()
+    await sm.killSession('l1')
+    const { installHooks } = await import('./hook-installer')
+    vi.mocked(installHooks).mockClear()
+    state.createPtyCalls = []
+
+    await sm.reviveSession('l1')
+
+    expect(installHooks).toHaveBeenCalledWith(local.worktreePath, { skipGitignore: true })
+    expect(state.createPtyCalls.map((c) => c.sessionId)).toEqual(['l1'])
+  })
+
+  it('local: does not reinstall hooks when reattaching to a live tmux session', async () => {
+    const local = baseLocalSession({ id: 'l1', status: 'idle' })
+    mkdirSync(local.worktreePath, { recursive: true })
+    writeSessionsJson([local])
+    const sm = await loadSessionManager()
+    sm.restoreSessions()
+    await sm.killSession('l1')
+    state.hasTmuxSessionIds.add('l1')
+    const { installHooks } = await import('./hook-installer')
+    vi.mocked(installHooks).mockClear()
+
+    await sm.reviveSession('l1')
+
+    expect(installHooks).not.toHaveBeenCalled()
+    expect(state.reattachPtyCalls).toEqual(['l1'])
+  })
+
+  it('remote: reinstalls hooks before spawning a fresh pty', async () => {
+    const remote = baseRemoteSession({ id: 'r1', status: 'dead' })
+    writeSessionsJson([remote])
+    const sm = await loadSessionManager()
+    sm.restoreSessions()
+    const { installRemoteHooks } = await import('./hook-installer')
+    vi.mocked(installRemoteHooks).mockClear()
+
+    await sm.reviveSession('r1')
+
+    expect(installRemoteHooks).toHaveBeenCalledTimes(1)
+    const [, worktreePath, notifyScriptPath, guardScriptPath] =
+      vi.mocked(installRemoteHooks).mock.calls[0]
+    expect(worktreePath).toBe(remote.worktreePath)
+    expect(notifyScriptPath).toBe('/tmp/notify-v1.sh')
+    expect(guardScriptPath).toBe('/tmp/worktree-guard-v1.sh')
+    expect(state.createRemotePtyCalls.map((c) => c.sessionId)).toEqual(['r1'])
+  })
+
+  it('remote: does not reinstall hooks when reattaching to a live tmux session', async () => {
+    const remote = baseRemoteSession({ id: 'r1', status: 'dead' })
+    writeSessionsJson([remote])
+    state.hasRemoteTmuxResult.set('r1', true)
+    const sm = await loadSessionManager()
+    sm.restoreSessions()
+    const { installRemoteHooks } = await import('./hook-installer')
+    vi.mocked(installRemoteHooks).mockClear()
+
+    await sm.reviveSession('r1')
+
+    expect(installRemoteHooks).not.toHaveBeenCalled()
+    expect(state.reattachRemotePtyCalls.map((c) => c.sessionId)).toEqual(['r1'])
+  })
+
+  // Regression: installRemoteAgentHooks' mkdir -p would otherwise silently
+  // resurrect a deleted remote worktree as an empty, non-git directory —
+  // mirroring the local branch's existsSync guard so a missing worktree still
+  // reaches (and fails loudly in) the tmux spawn instead.
+  it('remote: does not reinstall hooks, but still attempts spawn, when the worktree no longer exists', async () => {
+    const remote = baseRemoteSession({ id: 'r1', status: 'dead' })
+    writeSessionsJson([remote])
+    state.execRemoteResults.set(`test -d ${remote.worktreePath}`, {
+      stdout: '',
+      stderr: '',
+      code: 1,
+      timedOut: false,
+    })
+    const sm = await loadSessionManager()
+    sm.restoreSessions()
+    const { installRemoteHooks } = await import('./hook-installer')
+    vi.mocked(installRemoteHooks).mockClear()
+
+    await sm.reviveSession('r1')
+
+    expect(installRemoteHooks).not.toHaveBeenCalled()
+    expect(state.createRemotePtyCalls.map((c) => c.sessionId)).toEqual(['r1'])
+  })
+
+  // Regression: hasRemoteWorktree must not treat a transport/exec failure the
+  // same as a genuinely missing worktree (code 1) — execRemote never rejects,
+  // so a probe timeout has to throw explicitly, or a transient SSH hiccup
+  // would silently skip the hook reinstall while still letting the spawn
+  // below proceed once the connection recovers, defeating this PR's point.
+  it('remote: aborts the revive when the worktree probe times out', async () => {
+    const remote = baseRemoteSession({ id: 'r1', status: 'dead' })
+    writeSessionsJson([remote])
+    state.execRemoteResults.set(`test -d ${remote.worktreePath}`, {
+      stdout: '',
+      stderr: '',
+      code: 1,
+      timedOut: true,
+    })
+    const sm = await loadSessionManager()
+    sm.restoreSessions()
+    const { installRemoteHooks } = await import('./hook-installer')
+    vi.mocked(installRemoteHooks).mockClear()
+
+    await expect(sm.reviveSession('r1')).rejects.toThrow(/Timed out/)
+
+    expect(installRemoteHooks).not.toHaveBeenCalled()
+    expect(state.createRemotePtyCalls).toEqual([])
+    expect(sm.getSessions()[0].connectionState).toBe('offline')
+  })
+
+  // Same reasoning, for an SSH-level failure (e.g. exit 255 on a dropped
+  // connection) rather than a timeout — any code other than the clean 0/1
+  // pair from a successfully-run `test -d` must abort, not skip-and-continue.
+  it('remote: aborts the revive when the worktree probe fails at the SSH level', async () => {
+    const remote = baseRemoteSession({ id: 'r1', status: 'dead' })
+    writeSessionsJson([remote])
+    state.execRemoteResults.set(`test -d ${remote.worktreePath}`, {
+      stdout: '',
+      stderr: 'ssh: connect to host example.com port 22: Connection refused',
+      code: 255,
+      timedOut: false,
+    })
+    const sm = await loadSessionManager()
+    sm.restoreSessions()
+    const { installRemoteHooks } = await import('./hook-installer')
+    vi.mocked(installRemoteHooks).mockClear()
+
+    await expect(sm.reviveSession('r1')).rejects.toThrow(/Connection refused/)
+
+    expect(installRemoteHooks).not.toHaveBeenCalled()
+    expect(state.createRemotePtyCalls).toEqual([])
+    expect(sm.getSessions()[0].connectionState).toBe('offline')
   })
 })
 

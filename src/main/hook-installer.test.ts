@@ -4,13 +4,14 @@ import {
   readFileSync,
   writeFileSync,
   mkdirSync,
+  readdirSync,
   existsSync,
   rmSync,
   statSync,
   symlinkSync,
   lstatSync,
 } from 'fs'
-import { execFileSync } from 'child_process'
+import { execFileSync, execFile } from 'child_process'
 import { tmpdir } from 'os'
 import { join } from 'path'
 
@@ -412,6 +413,80 @@ describe('ensureCodexHooksFeatureFlag', () => {
     expect(out).toContain('name = "gpt-5"')
     expect(out).toContain('other_flag = true')
     expect(out).toContain('codex_hooks = true')
+  })
+})
+
+describe('ensureRemoteCodexHooksFeatureFlag', () => {
+  // Regression: the remote script used a fixed `config.toml.tmp` path, so two
+  // sessions reviving concurrently on the same host (sessions:revive-batch)
+  // could race on the same tmp file and crash under `set -e`. A PID-suffixed
+  // tmp path removes that crash; the transform itself is idempotent, so a
+  // lost update between the two concurrent runs is harmless.
+  //
+  // A naive Promise.all over two execFileSync-backed invocations would NOT
+  // catch a regression here: execFileSync blocks the single JS thread, so the
+  // first shell script runs to completion before the second is even spawned —
+  // fully serialized, passing identically against the old shared-tmp-path
+  // script. To force genuine overlap, wrap each invocation's `mv` step in a
+  // barrier: both signal readiness, the test releases them together once both
+  // have arrived, guaranteeing the two writes actually interleave instead of
+  // relying on OS scheduling luck (which would make the test flaky at best).
+  it('does not corrupt config.toml when two invocations for the same host truly overlap', async () => {
+    const barrierDir = mkdtempSync(join(tmpdir(), 'codex-barrier-'))
+    const readyDir = join(barrierDir, 'ready')
+    const barrierFile = join(barrierDir, 'go')
+    mkdirSync(readyDir)
+
+    function execWithBarrier(
+      argv: string[]
+    ): Promise<{ stdout: string; stderr: string; code: number; timedOut: boolean }> {
+      const wrapped =
+        'mv() { : > "$READY_DIR/$$"; while [ ! -f "$BARRIER_FILE" ]; do sleep 0.02; done; command mv "$@"; }\n' +
+        argv[2]
+      return new Promise((resolve) => {
+        execFile(
+          'sh',
+          ['-c', wrapped],
+          {
+            encoding: 'utf-8',
+            env: {
+              ...process.env,
+              HOME: state.tmpHome,
+              READY_DIR: readyDir,
+              BARRIER_FILE: barrierFile,
+            },
+          },
+          (error, stdout, stderr) => {
+            const code = error
+              ? typeof (error as NodeJS.ErrnoException & { code?: unknown }).code === 'number'
+                ? (error as { code: number }).code
+                : 1
+              : 0
+            resolve({ stdout, stderr, code, timedOut: false })
+          }
+        )
+      })
+    }
+
+    try {
+      const { ensureRemoteCodexHooksFeatureFlag } = await loadInstaller()
+      const both = Promise.all([
+        ensureRemoteCodexHooksFeatureFlag(execWithBarrier),
+        ensureRemoteCodexHooksFeatureFlag(execWithBarrier),
+      ])
+      while (readdirSync(readyDir).length < 2) {
+        await new Promise((r) => setTimeout(r, 10))
+      }
+      writeFileSync(barrierFile, '')
+
+      await expect(both).resolves.toBeDefined()
+
+      const out = readFileSync(join(state.tmpHome, '.codex', 'config.toml'), 'utf-8')
+      expect(out).toContain('[features]')
+      expect(out).toContain('codex_hooks = true')
+    } finally {
+      rmSync(barrierDir, { recursive: true, force: true })
+    }
   })
 })
 
