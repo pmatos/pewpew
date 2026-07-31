@@ -2127,6 +2127,56 @@ describe('reviveSession — reinstalls hooks on fresh spawn', () => {
     expect(installRemoteHooks).not.toHaveBeenCalled()
     expect(state.createRemotePtyCalls.map((c) => c.sessionId)).toEqual(['r1'])
   })
+
+  // Regression: hasRemoteWorktree must not treat a transport/exec failure the
+  // same as a genuinely missing worktree (code 1) — execRemote never rejects,
+  // so a probe timeout has to throw explicitly, or a transient SSH hiccup
+  // would silently skip the hook reinstall while still letting the spawn
+  // below proceed once the connection recovers, defeating this PR's point.
+  it('remote: aborts the revive when the worktree probe times out', async () => {
+    const remote = baseRemoteSession({ id: 'r1', status: 'dead' })
+    writeSessionsJson([remote])
+    state.execRemoteResults.set(`test -d ${remote.worktreePath}`, {
+      stdout: '',
+      stderr: '',
+      code: 1,
+      timedOut: true,
+    })
+    const sm = await loadSessionManager()
+    sm.restoreSessions()
+    const { installRemoteHooks } = await import('./hook-installer')
+    vi.mocked(installRemoteHooks).mockClear()
+
+    await expect(sm.reviveSession('r1')).rejects.toThrow(/Timed out/)
+
+    expect(installRemoteHooks).not.toHaveBeenCalled()
+    expect(state.createRemotePtyCalls).toEqual([])
+    expect(sm.getSessions()[0].connectionState).toBe('offline')
+  })
+
+  // Same reasoning, for an SSH-level failure (e.g. exit 255 on a dropped
+  // connection) rather than a timeout — any code other than the clean 0/1
+  // pair from a successfully-run `test -d` must abort, not skip-and-continue.
+  it('remote: aborts the revive when the worktree probe fails at the SSH level', async () => {
+    const remote = baseRemoteSession({ id: 'r1', status: 'dead' })
+    writeSessionsJson([remote])
+    state.execRemoteResults.set(`test -d ${remote.worktreePath}`, {
+      stdout: '',
+      stderr: 'ssh: connect to host example.com port 22: Connection refused',
+      code: 255,
+      timedOut: false,
+    })
+    const sm = await loadSessionManager()
+    sm.restoreSessions()
+    const { installRemoteHooks } = await import('./hook-installer')
+    vi.mocked(installRemoteHooks).mockClear()
+
+    await expect(sm.reviveSession('r1')).rejects.toThrow(/Connection refused/)
+
+    expect(installRemoteHooks).not.toHaveBeenCalled()
+    expect(state.createRemotePtyCalls).toEqual([])
+    expect(sm.getSessions()[0].connectionState).toBe('offline')
+  })
 })
 
 describe('unexpected pty exit listener', () => {

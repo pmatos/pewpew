@@ -2502,16 +2502,26 @@ function hasClaudeConversationHistory(worktreePath: string): boolean {
 // a bare directory-existence test rather than the stricter `git rev-parse
 // --is-inside-work-tree` used by createRemoteSessionForWorktree, so a worktree
 // with a valid directory but transiently broken git metadata still spawns
-// exactly as it did before this reinstall-hooks change. Any SSH/probe failure
-// returns false, skipping the hook reinstall so the tmux spawn below is left
-// to fail loudly on the missing cwd, same as pre-PR behavior.
+// exactly as it did before this reinstall-hooks change.
+//
+// `execRemote` never rejects — SSH-level failures resolve as a nonzero `code`
+// (255 for a connection failure, 127 if the local `ssh` binary is missing),
+// same as a genuinely failed `test -d`. Only a clean `code === 1` means the
+// worktree doesn't exist; a timeout or any other code is a transport/exec
+// failure, not proof of absence, and must throw so it reaches reviveSession's
+// outer try/catch (which marks the session offline) instead of being treated
+// the same as a missing worktree — which would silently skip the hook
+// reinstall while still letting the spawn below proceed once the connection
+// recovers, defeating the point of this reinstall-on-revive change.
 async function hasRemoteWorktree(host: Host, worktreePath: string): Promise<boolean> {
-  try {
-    const result = await execRemote(host, ['test', '-d', worktreePath], { timeoutMs: 10000 })
-    return !result.timedOut && result.code === 0
-  } catch {
-    return false
+  const result = await execRemote(host, ['test', '-d', worktreePath], { timeoutMs: 10000 })
+  if (result.timedOut) {
+    throw new Error(`Timed out checking whether ${worktreePath} exists on host ${host.alias}`)
   }
+  if (result.code === 0) return true
+  if (result.code === 1) return false
+  const detail = result.stderr.trim() || result.stdout.trim() || `exit ${result.code}`
+  throw new Error(`Failed to check whether ${worktreePath} exists on host ${host.alias}: ${detail}`)
 }
 
 // Remote analogue of hasClaudeConversationHistory. Reuses the shared
