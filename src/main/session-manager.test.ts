@@ -2071,6 +2071,30 @@ describe('reviveSession — reinstalls hooks on fresh spawn', () => {
     expect(installRemoteHooks).not.toHaveBeenCalled()
     expect(state.reattachRemotePtyCalls.map((c) => c.sessionId)).toEqual(['r1'])
   })
+
+  // Regression: installRemoteAgentHooks' mkdir -p would otherwise silently
+  // resurrect a deleted remote worktree as an empty, non-git directory —
+  // mirroring the local branch's existsSync guard so a missing worktree still
+  // reaches (and fails loudly in) the tmux spawn instead.
+  it('remote: does not reinstall hooks, but still attempts spawn, when the worktree no longer exists', async () => {
+    const remote = baseRemoteSession({ id: 'r1', status: 'dead' })
+    writeSessionsJson([remote])
+    state.execRemoteResults.set(`test -d ${remote.worktreePath}`, {
+      stdout: '',
+      stderr: '',
+      code: 1,
+      timedOut: false,
+    })
+    const sm = await loadSessionManager()
+    sm.restoreSessions()
+    const { installRemoteHooks } = await import('./hook-installer')
+    vi.mocked(installRemoteHooks).mockClear()
+
+    await sm.reviveSession('r1')
+
+    expect(installRemoteHooks).not.toHaveBeenCalled()
+    expect(state.createRemotePtyCalls.map((c) => c.sessionId)).toEqual(['r1'])
+  })
 })
 
 describe('unexpected pty exit listener', () => {

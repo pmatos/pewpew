@@ -1589,14 +1589,20 @@ export async function reviveSession(id: string): Promise<void> {
             // See the local branch above: reinstall hooks before spawning so
             // a long-since-created remote worktree picks up hook fixes that
             // landed after its last install, instead of running forever
-            // against whatever was current at creation time.
-            await installRemoteAgentHooks(
-              session.tool,
-              host,
-              session.worktreePath,
-              notifyScriptPath,
-              guardScriptPath
-            )
+            // against whatever was current at creation time. Mirrors the
+            // local branch's existsSync guard: installRemoteAgentHooks runs
+            // mkdir -p on the worktree path, which would otherwise silently
+            // resurrect a deleted remote worktree as an empty, non-git
+            // directory instead of letting the tmux spawn below fail loudly.
+            if (await hasRemoteWorktree(host, session.worktreePath)) {
+              await installRemoteAgentHooks(
+                session.tool,
+                host,
+                session.worktreePath,
+                notifyScriptPath,
+                guardScriptPath
+              )
+            }
             session.sandboxed = await createRemotePty(id, session.worktreePath, host, {
               continueSession: canResume,
               tool: session.tool,
@@ -2484,6 +2490,23 @@ function hasClaudeConversationHistory(worktreePath: string): boolean {
   const dir = join(homedir(), '.claude', 'projects', encoded)
   try {
     return readdirSync(dir).length > 0
+  } catch {
+    return false
+  }
+}
+
+// Guards reviveSession's remote fresh-spawn branch against a deleted remote
+// worktree, mirroring the local branch's plain existsSync check — deliberately
+// a bare directory-existence test rather than the stricter `git rev-parse
+// --is-inside-work-tree` used by createRemoteSessionForWorktree, so a worktree
+// with a valid directory but transiently broken git metadata still spawns
+// exactly as it did before this reinstall-hooks change. Any SSH/probe failure
+// returns false, skipping the hook reinstall so the tmux spawn below is left
+// to fail loudly on the missing cwd, same as pre-PR behavior.
+async function hasRemoteWorktree(host: Host, worktreePath: string): Promise<boolean> {
+  try {
+    const result = await execRemote(host, ['test', '-d', worktreePath], { timeoutMs: 10000 })
+    return !result.timedOut && result.code === 0
   } catch {
     return false
   }
