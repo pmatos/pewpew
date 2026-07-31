@@ -14,6 +14,29 @@ export function canonicalPath(p: string): string {
   }
 }
 
+// claude keys its per-worktree conversation directory (~/.claude/projects/<enc>)
+// off the canonical worktree path, replacing every character outside
+// [a-zA-Z0-9-] with '-'. Both the resume-history probe (session-manager.ts) and
+// the sandbox writable-path scoping (pty-manager.ts) must key off this exact
+// name — a mismatch would make one think history exists while the other binds a
+// different directory — so it lives here, the single home for per-worktree
+// agent-state encoding, rather than being reimplemented at each call site. Kept
+// in sync against the POSIX shell port below (CLAUDE_ENCODE_SHELL_SCRIPT) by a
+// parity test in agent-state-paths.test.ts.
+export function encodeClaudeSessionDirName(cwd: string): string {
+  return canonicalPath(cwd).replace(/[^a-zA-Z0-9-]/g, '-')
+}
+
+// Remote analogue of encodeClaudeSessionDirName. Canonicalizes the worktree
+// path with `cd -P`/`pwd -P` (portable, unlike GNU-only `readlink -f`), then
+// applies the same [^a-zA-Z0-9-] → '-' substitution via sed, leaving the result
+// in `$enc`. Mirrors OMP_ENCODE_SHELL_SCRIPT's contract: it sets `$enc` and
+// appends no trailing separator, so call sites compose it as
+// `${CLAUDE_ENCODE_SHELL_SCRIPT}; <tail that uses $enc>`.
+export const CLAUDE_ENCODE_SHELL_SCRIPT =
+  'p=$(CDPATH= cd -P -- "$1" 2>/dev/null && pwd -P); [ -n "$p" ] || p="$1"; ' +
+  "enc=$(printf '%s' \"$p\" | sed 's/[^a-zA-Z0-9-]/-/g')"
+
 function encodeOmpRelativeSessionDirName(prefix: string, relativePath: string): string {
   const encoded = relativePath.replace(/[/\\:]/g, '-')
   if (!encoded) return prefix
