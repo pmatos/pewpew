@@ -8,7 +8,9 @@ import { randomUUID } from 'crypto'
 import { dialog, shell } from 'electron'
 import {
   canonicalPath,
+  encodeClaudeSessionDirName,
   encodeOmpSessionDirName,
+  CLAUDE_ENCODE_SHELL_SCRIPT,
   OMP_ENCODE_SHELL_SCRIPT,
 } from './agent-state-paths'
 export { encodeOmpSessionDirName, OMP_ENCODE_SHELL_SCRIPT } from './agent-state-paths'
@@ -2427,19 +2429,20 @@ export async function relocateProject(
 }
 
 // claude stores per-worktree conversations under
-// `~/.claude/projects/<encoded-path>/`, where the encoding replaces any
-// character outside [a-zA-Z0-9-] with '-'. We use this to decide whether
+// `~/.claude/projects/<encoded-path>/`. We use this to decide whether
 // `claude --continue` would succeed on revival: if the directory is missing,
 // claude prints "No conversation found to continue" and exits with code 1,
 // which collapses the tmux pane immediately and leaves the session unusable.
 // In that case we spawn fresh instead, matching the existing codex fallback
 // (no agentSessionId → spawn fresh) in `restoreSessions`.
 //
-// Claude keys the per-worktree directory off the *canonical* path, so we
-// canonicalize here too. `restoreSessions` migrates legacy symlink-form
-// `worktreePath`s only after the auto-recovery branch runs, so without this
-// `realpathSync` a migrated session would probe an encoded symlink path,
-// find nothing, and silently lose its conversation history on reboot.
+// The encoded directory name (canonicalize the path, then substitute) comes
+// from `encodeClaudeSessionDirName`, shared with pty-manager.ts's sandbox
+// scoping so both key off the exact same directory. The canonicalization there
+// matters here because `restoreSessions` migrates legacy symlink-form
+// `worktreePath`s only after the auto-recovery branch runs — without it a
+// migrated session would probe an encoded symlink path, find nothing, and
+// silently lose its conversation history on reboot.
 //
 // Checks directory *contents*, not mere existence: pty-manager.ts's sandbox
 // wiring pre-creates this exact directory (as a bwrap bind-source, before
@@ -2449,8 +2452,7 @@ export async function relocateProject(
 // before the agent writes anything, would then wrongly resume into an empty
 // directory and immediately exit instead of spawning fresh.
 function hasClaudeConversationHistory(worktreePath: string): boolean {
-  const encoded = canonicalPath(worktreePath).replace(/[^a-zA-Z0-9-]/g, '-')
-  const dir = join(homedir(), '.claude', 'projects', encoded)
+  const dir = join(homedir(), '.claude', 'projects', encodeClaudeSessionDirName(worktreePath))
   try {
     return readdirSync(dir).length > 0
   } catch {
@@ -2458,23 +2460,19 @@ function hasClaudeConversationHistory(worktreePath: string): boolean {
   }
 }
 
-// Remote analogue of hasClaudeConversationHistory. Claude keys the per-worktree
-// directory off the *canonical* path, so we resolve symlinks on the remote
-// before applying the same `[^a-zA-Z0-9-]` → '-' encoding, then test for the
-// directory under the remote $HOME. Canonicalization uses `cd -P`/`pwd -P`
-// (POSIX shell builtins) rather than `readlink -f`, which is GNU-only — BSD
-// (macOS) readlink has no `-f` and would silently leave the symlink path
-// unresolved, missing the conversation. Runs as a single positional-arg `sh -c`
-// so paths with shell metacharacters stay inert. Any SSH/probe failure returns
-// false, so revival falls back to a fresh spawn rather than risk
-// `claude --continue` exiting immediately.
+// Remote analogue of hasClaudeConversationHistory. Reuses the shared
+// CLAUDE_ENCODE_SHELL_SCRIPT (the POSIX port of encodeClaudeSessionDirName —
+// canonicalize with `cd -P`/`pwd -P`, then the `[^a-zA-Z0-9-]` → '-' sed) to
+// leave `$enc` set, then tests for the directory under the remote $HOME. Runs
+// as a single positional-arg `sh -c` so paths with shell metacharacters stay
+// inert. Any SSH/probe failure returns false, so revival falls back to a fresh
+// spawn rather than risk `claude --continue` exiting immediately.
 async function hasRemoteClaudeConversationHistory(
   host: Host,
   worktreePath: string
 ): Promise<boolean> {
   const script =
-    'p=$(CDPATH= cd -P -- "$1" 2>/dev/null && pwd -P); [ -n "$p" ] || p="$1"; ' +
-    "enc=$(printf '%s' \"$p\" | sed 's/[^a-zA-Z0-9-]/-/g'); " +
+    `${CLAUDE_ENCODE_SHELL_SCRIPT}; ` +
     // Check directory *contents*, not mere existence: createRemotePty's
     // resolveRemoteAgentStateDir pre-creates this exact directory (as a bwrap
     // bind-source, before the agent ever runs) so existence alone isn't proof

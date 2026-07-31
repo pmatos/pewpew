@@ -23,8 +23,9 @@ import {
   ensureRemoteCodexProjectConfigDir,
 } from './hook-installer'
 import {
-  canonicalPath,
+  encodeClaudeSessionDirName,
   encodeOmpSessionDirName,
+  CLAUDE_ENCODE_SHELL_SCRIPT,
   OMP_ENCODE_SHELL_SCRIPT,
 } from './agent-state-paths'
 import { getSandboxConfig, resolvePath } from './config'
@@ -252,8 +253,7 @@ function agentStateDir(
   if (tool === 'codex') {
     return join(homeDir, '.codex')
   }
-  const encoded = canonicalPath(worktreePath).replace(/[^a-zA-Z0-9-]/g, '-')
-  return join(homeDir, '.claude', 'projects', encoded)
+  return join(homeDir, '.claude', 'projects', encodeClaudeSessionDirName(worktreePath))
 }
 
 // Claude Code itself (not pewpew) keeps adding new per-invocation scratch
@@ -446,8 +446,7 @@ async function resolveRemoteAgentStateDir(
       ? 'd="$HOME/.codex"; mkdir -p "$d" && printf "%s" "$d"'
       : tool === 'omp'
         ? `${OMP_ENCODE_SHELL_SCRIPT}; d="$HOME/.omp/agent/sessions/$enc"; mkdir -p "$d" && printf "%s" "$d"`
-        : 'p=$(CDPATH= cd -P -- "$1" 2>/dev/null && pwd -P); [ -n "$p" ] || p="$1"; ' +
-          "enc=$(printf '%s' \"$p\" | sed 's/[^a-zA-Z0-9-]/-/g'); " +
+        : `${CLAUDE_ENCODE_SHELL_SCRIPT}; ` +
           'd="$HOME/.claude/projects/$enc"; c="$HOME/.claude"; ' +
           'mkdir -p "$d" "$c" && { ' +
           `for x in ${claudeRoDirsNames}; do mkdir -p "$c/$x" 2>/dev/null; done; ` +
