@@ -1714,8 +1714,17 @@ export async function attachLocalSession(id: string): Promise<void> {
       }
       // See reviveSession's local branch: reinstall hooks before spawning so
       // a session that's been pending since long before its worktree's last
-      // installHooks() call picks up hook fixes landed since then.
-      await installAgentHooks(session.tool, session.worktreePath)
+      // installHooks() call picks up hook fixes landed since then. Best
+      // effort: unlike reviveSession, this path had no hook-install call (and
+      // so no way to fail on one) before this change — a pending session
+      // always spawned successfully regardless of hook file state. Swallow a
+      // failure here rather than let it flip an otherwise-healthy attach to
+      // 'dead', since a stale-hooks spawn is strictly better than no spawn.
+      try {
+        await installAgentHooks(session.tool, session.worktreePath)
+      } catch (err) {
+        console.error(`Session ${id}: failed to reinstall hooks before attach`, err)
+      }
       session.sandboxed = createPty(id, session.worktreePath, {
         continueSession: canResume,
         tool: session.tool,

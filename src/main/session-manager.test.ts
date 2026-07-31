@@ -1810,6 +1810,27 @@ describe('attachLocalSession', () => {
     expect(installHooks).toHaveBeenCalledWith(local.worktreePath, { skipGitignore: true })
     expect(state.createPtyCalls.map((c) => c.sessionId)).toEqual(['l1'])
   })
+
+  // Regression: before this PR, attach never touched hooks, so a pending
+  // session always spawned successfully regardless of hook file state. A
+  // failed reinstall (permissions, full disk, ...) must not turn that
+  // previously-infallible path into one that marks the session dead.
+  it('still spawns when hook reinstall fails', async () => {
+    const local = baseLocalSession({ id: 'l1', status: 'idle' })
+    mkdirSync(local.worktreePath, { recursive: true })
+    writeSessionsJson([local])
+    const sm = await loadSessionManager()
+    sm.restoreSessions()
+    const { installHooks } = await import('./hook-installer')
+    vi.mocked(installHooks).mockRejectedValueOnce(new Error('EACCES'))
+
+    await sm.attachLocalSession('l1')
+
+    const got = sm.getSessions()[0]
+    expect(got.status).toBe('idle')
+    expect(got.connectionState).toBeUndefined()
+    expect(state.createPtyCalls.map((c) => c.sessionId)).toEqual(['l1'])
+  })
 })
 
 describe('attachPendingLocalSessions', () => {
