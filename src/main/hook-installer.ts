@@ -452,10 +452,15 @@ export async function ensureRemoteCodexHooksFeatureFlag(
 ): Promise<void> {
   // Mirrors mergeCodexHooksFlag in shell: parse line-by-line via awk, set
   // codex_hooks=true inside [features], inserting the table if absent. Atomic
-  // via tmp+mv. Idempotent — re-running yields identical content.
+  // via tmp+mv, using a PID-suffixed tmp path so concurrent revives of two
+  // sessions on the same host (e.g. sessions:revive-batch) don't clobber each
+  // other's in-flight tmp file or race on the final mv. Idempotent — whichever
+  // invocation's mv lands last still yields identical content, so a lost
+  // update between concurrent runs is harmless.
   const script =
     'set -e\n' +
     'cfg="$HOME/.codex/config.toml"\n' +
+    'tmp="$cfg.tmp.$$"\n' +
     'mkdir -p "$HOME/.codex"\n' +
     '[ -f "$cfg" ] || printf "" > "$cfg"\n' +
     "awk '\n" +
@@ -472,8 +477,8 @@ export async function ensureRemoteCodexHooksFeatureFlag(
     '    if (inFeat==1 && injected==0) { print "codex_hooks = true"; exit 0 }\n' +
     '    if (injected==0) { print ""; print "[features]"; print "codex_hooks = true" }\n' +
     '  }\n' +
-    '\' "$cfg" > "$cfg.tmp"\n' +
-    'mv "$cfg.tmp" "$cfg"\n'
+    '\' "$cfg" > "$tmp"\n' +
+    'mv "$tmp" "$cfg"\n'
   const result = await execRemote(['sh', '-c', script], { timeoutMs: 10000 })
   if (result.timedOut || result.code !== 0) {
     const detail = result.stderr.trim() || result.stdout.trim() || `exit ${result.code}`

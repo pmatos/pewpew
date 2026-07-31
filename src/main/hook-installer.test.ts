@@ -415,6 +415,50 @@ describe('ensureCodexHooksFeatureFlag', () => {
   })
 })
 
+describe('ensureRemoteCodexHooksFeatureFlag', () => {
+  // Regression: the remote script used a fixed `config.toml.tmp` path, so two
+  // sessions reviving concurrently on the same host (sessions:revive-batch)
+  // could race on the same tmp file and crash under `set -e`. A PID-suffixed
+  // tmp path removes that crash; the transform itself is idempotent, so a
+  // lost update between the two concurrent runs is harmless.
+  async function execAgainstTmpHome(argv: string[]) {
+    try {
+      const stdout = execFileSync(argv[0], argv.slice(1), {
+        encoding: 'utf-8',
+        env: { ...process.env, HOME: state.tmpHome },
+      })
+      return { stdout, stderr: '', code: 0, timedOut: false }
+    } catch (err) {
+      const failure = err as {
+        stdout?: Buffer | string
+        stderr?: Buffer | string
+        status?: number
+      }
+      return {
+        stdout: failure.stdout?.toString() ?? '',
+        stderr: failure.stderr?.toString() ?? '',
+        code: failure.status ?? 1,
+        timedOut: false,
+      }
+    }
+  }
+
+  it('does not crash when two invocations for the same host run concurrently', async () => {
+    const { ensureRemoteCodexHooksFeatureFlag } = await loadInstaller()
+
+    await expect(
+      Promise.all([
+        ensureRemoteCodexHooksFeatureFlag(execAgainstTmpHome),
+        ensureRemoteCodexHooksFeatureFlag(execAgainstTmpHome),
+      ])
+    ).resolves.toBeDefined()
+
+    const out = readFileSync(join(state.tmpHome, '.codex', 'config.toml'), 'utf-8')
+    expect(out).toContain('[features]')
+    expect(out).toContain('codex_hooks = true')
+  })
+})
+
 describe('rollbackCodexHooks', () => {
   it('removes .codex/hooks.json when there was no prior file', async () => {
     const { installCodexHooks, rollbackCodexHooks } = await loadInstaller()
