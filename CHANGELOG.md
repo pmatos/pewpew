@@ -1,3 +1,10 @@
+## [0.10.4](https://github.com/pmatos/pewpew/compare/v0.10.3...v0.10.4) (2026-08-02)
+
+
+### Bug Fixes
+
+* **sessions:** reinstall hooks on every fresh revive/attach spawn ([#267](https://github.com/pmatos/pewpew/issues/267)) ([acdeb44](https://github.com/pmatos/pewpew/commit/acdeb44e3a0e0e5a69a78d915835be619650e40e))
+
 ## [0.10.3](https://github.com/pmatos/pewpew/compare/v0.10.2...v0.10.3) (2026-07-30)
 
 
