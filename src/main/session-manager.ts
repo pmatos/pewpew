@@ -1,19 +1,12 @@
 import { execFile, execFileSync } from 'child_process'
 import { promisify } from 'util'
-import { readFileSync, writeFileSync, existsSync, readdirSync } from 'fs'
+import { readFileSync, writeFileSync, existsSync } from 'fs'
 import { join, basename, sep } from 'path'
 import { posix } from 'path'
-import { homedir } from 'os'
 import { randomUUID } from 'crypto'
 import { dialog, shell } from 'electron'
-import {
-  canonicalPath,
-  encodeClaudeSessionDirName,
-  encodeOmpSessionDirName,
-  CLAUDE_ENCODE_SHELL_SCRIPT,
-  OMP_ENCODE_SHELL_SCRIPT,
-} from './agent-state-paths'
-export { encodeOmpSessionDirName, OMP_ENCODE_SHELL_SCRIPT } from './agent-state-paths'
+import { canonicalPath } from './agent-state-paths'
+import { canResumeLocal, canResumeRemote } from './agent-resumability'
 import { broadcastToAll, getMainWindow } from './window-registry'
 import { CONFIG_DIR, getConfig, getReconnectConfig, saveConfig } from './config'
 import { updateTray } from './tray'
@@ -1582,7 +1575,7 @@ export async function reviveSession(id: string): Promise<void> {
                 `${session.tool} is not installed on host ${host.label || host.alias}`
               )
             }
-            const canResume = await canResumeRemoteAgent(session, host)
+            const canResume = await canResumeRemote(session, host, execRemote)
             if (!canResume) {
               console.warn(
                 `Session ${id} (${session.tool}) has no prior conversation on host ${host.alias}; spawning fresh instead of resuming`
@@ -1636,7 +1629,7 @@ export async function reviveSession(id: string): Promise<void> {
   if (hasTmuxSession(id)) {
     reattachPty(id)
   } else {
-    const canResume = canResumeAgent(session)
+    const canResume = canResumeLocal(session)
     if (!canResume) {
       console.warn(
         `Session ${id} (${session.tool}) has no prior conversation; spawning fresh instead of resuming`
@@ -1661,30 +1654,6 @@ export async function reviveSession(id: string): Promise<void> {
   updateSession(id, 'idle')
 }
 
-// Decides whether resuming an agent will work. For claude, --continue exits
-// non-zero when there's no per-worktree project directory in ~/.claude/projects,
-// killing the tmux pane on spawn. For codex, `codex resume <id>` requires the
-// captured agentSessionId from the SessionStart hook. omp's `--continue` is
-// cwd-scoped like claude's (no session id capture needed), so it gets the same
-// filesystem-history gate, just against omp's own session directory.
-function canResumeAgent(session: Session): boolean {
-  if (session.tool === 'codex') return !!session.agentSessionId
-  if (session.tool === 'omp') return hasOmpConversationHistory(session.worktreePath)
-  return hasClaudeConversationHistory(session.worktreePath)
-}
-
-// Remote analogue of canResumeAgent. The remote branch of reviveSession used to
-// hardcode `--continue`, so reviving a remote session with no prior
-// conversation (e.g. a freshly mirrored worktree that was never talked to) made
-// `claude --continue` print "No conversation found to continue" and collapse
-// the pane on spawn. Probe the remote first and spawn fresh when there's
-// nothing to resume, matching the local guard.
-async function canResumeRemoteAgent(session: Session, host: Host): Promise<boolean> {
-  if (session.tool === 'codex') return !!session.agentSessionId
-  if (session.tool === 'omp') return hasRemoteOmpConversationHistory(host, session.worktreePath)
-  return hasRemoteClaudeConversationHistory(host, session.worktreePath)
-}
-
 // On-demand local attach for sessions deferred during restoreSessions().
 // Idempotent: if the pty is already live (or the session is remote/dead),
 // it's a no-op. Renderer calls this when the user opens a pending card so
@@ -1706,7 +1675,7 @@ export async function attachLocalSession(id: string): Promise<void> {
     if (hasTmuxSession(id)) {
       reattachPty(id)
     } else {
-      const canResume = canResumeAgent(session)
+      const canResume = canResumeLocal(session)
       if (!canResume) {
         console.warn(
           `Session ${id} (${session.tool}) has no prior conversation; spawning fresh instead of resuming`
@@ -2474,38 +2443,6 @@ export async function relocateProject(
   return { migratedCount: plan.length }
 }
 
-// claude stores per-worktree conversations under
-// `~/.claude/projects/<encoded-path>/`. We use this to decide whether
-// `claude --continue` would succeed on revival: if the directory is missing,
-// claude prints "No conversation found to continue" and exits with code 1,
-// which collapses the tmux pane immediately and leaves the session unusable.
-// In that case we spawn fresh instead, matching the existing codex fallback
-// (no agentSessionId → spawn fresh) in `restoreSessions`.
-//
-// The encoded directory name (canonicalize the path, then substitute) comes
-// from `encodeClaudeSessionDirName`, shared with pty-manager.ts's sandbox
-// scoping so both key off the exact same directory. The canonicalization there
-// matters here because `restoreSessions` migrates legacy symlink-form
-// `worktreePath`s only after the auto-recovery branch runs — without it a
-// migrated session would probe an encoded symlink path, find nothing, and
-// silently lose its conversation history on reboot.
-//
-// Checks directory *contents*, not mere existence: pty-manager.ts's sandbox
-// wiring pre-creates this exact directory (as a bwrap bind-source, before
-// the agent ever runs) so its first write doesn't resolve EROFS. Plain
-// `existsSync` would treat that pre-creation itself as proof of a real prior
-// conversation — a worktree's very first session, if the app restarts
-// before the agent writes anything, would then wrongly resume into an empty
-// directory and immediately exit instead of spawning fresh.
-function hasClaudeConversationHistory(worktreePath: string): boolean {
-  const dir = join(homedir(), '.claude', 'projects', encodeClaudeSessionDirName(worktreePath))
-  try {
-    return readdirSync(dir).length > 0
-  } catch {
-    return false
-  }
-}
-
 // Guards reviveSession's remote fresh-spawn branch against a deleted remote
 // worktree, mirroring the local branch's plain existsSync check — deliberately
 // a bare directory-existence test rather than the stricter `git rev-parse
@@ -2531,77 +2468,6 @@ async function hasRemoteWorktree(host: Host, worktreePath: string): Promise<bool
   if (result.code === 1) return false
   const detail = result.stderr.trim() || result.stdout.trim() || `exit ${result.code}`
   throw new Error(`Failed to check whether ${worktreePath} exists on host ${host.alias}: ${detail}`)
-}
-
-// Remote analogue of hasClaudeConversationHistory. Reuses the shared
-// CLAUDE_ENCODE_SHELL_SCRIPT (the POSIX port of encodeClaudeSessionDirName —
-// canonicalize with `cd -P`/`pwd -P`, then the `[^a-zA-Z0-9-]` → '-' sed) to
-// leave `$enc` set, then tests for the directory under the remote $HOME. Runs
-// as a single positional-arg `sh -c` so paths with shell metacharacters stay
-// inert. Any SSH/probe failure returns false, so revival falls back to a fresh
-// spawn rather than risk `claude --continue` exiting immediately.
-async function hasRemoteClaudeConversationHistory(
-  host: Host,
-  worktreePath: string
-): Promise<boolean> {
-  const script =
-    `${CLAUDE_ENCODE_SHELL_SCRIPT}; ` +
-    // Check directory *contents*, not mere existence: createRemotePty's
-    // resolveRemoteAgentStateDir pre-creates this exact directory (as a bwrap
-    // bind-source, before the agent ever runs) so existence alone isn't proof
-    // of a real prior conversation — a worktree's very first session, if the
-    // app restarts before the agent writes anything, would wrongly resume.
-    '[ -n "$(ls -A "$HOME/.claude/projects/$enc" 2>/dev/null)" ]'
-  try {
-    const result = await execRemote(host, ['sh', '-c', script, '_', worktreePath], {
-      timeoutMs: 10000,
-    })
-    return !result.timedOut && result.code === 0
-  } catch {
-    return false
-  }
-}
-
-// Checks directory contents, not mere existence — same reasoning as
-// hasClaudeConversationHistory above: pty-manager.ts pre-creates this exact
-// directory before omp ever runs, so existence alone isn't proof of a real
-// prior conversation.
-function hasOmpConversationHistory(worktreePath: string): boolean {
-  const encoded = encodeOmpSessionDirName(worktreePath)
-  const dir = join(homedir(), '.omp', 'agent', 'sessions', encoded)
-  try {
-    return readdirSync(dir).length > 0
-  } catch {
-    return false
-  }
-}
-
-// Remote analogue of hasOmpConversationHistory, mirroring the same
-// home-relative / tmp-relative / legacy-absolute encoding in POSIX shell.
-// Canonicalizes cwd, $HOME, and the temp root with `cd -P`/`pwd -P` (portable,
-// unlike GNU-only `readlink -f`), then pattern-matches which root the cwd
-// falls under via `case`. The temp root resolves TMPDIR, then TMP, then TEMP,
-// then /tmp — matching Node's own os.tmpdir() fallback order (which the local
-// encodeOmpSessionDirName delegates to via tmpdir()), so a remote host that
-// sets only TMP or TEMP still encodes a temp-rooted worktree the same way
-// omp itself would. Any SSH/probe failure returns false, so revival falls
-// back to a fresh spawn rather than risk `omp --continue` exiting
-// immediately on a directory that doesn't exist yet.
-//
-// Checks directory *contents*, not mere existence — same reasoning as
-// hasOmpConversationHistory above: createRemotePty's resolveRemoteAgentStateDir
-// pre-creates this exact directory before omp ever runs, so existence alone
-// isn't proof of a real prior conversation.
-async function hasRemoteOmpConversationHistory(host: Host, worktreePath: string): Promise<boolean> {
-  const script = `${OMP_ENCODE_SHELL_SCRIPT}; [ -n "$(ls -A "$h/.omp/agent/sessions/$enc" 2>/dev/null)" ]`
-  try {
-    const result = await execRemote(host, ['sh', '-c', script, '_', worktreePath], {
-      timeoutMs: 10000,
-    })
-    return !result.timedOut && result.code === 0
-  } catch {
-    return false
-  }
 }
 
 // Backfill / reconcile fields added in later versions. The reconciliation rules

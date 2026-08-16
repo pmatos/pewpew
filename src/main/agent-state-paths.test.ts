@@ -6,7 +6,9 @@ import { afterEach, beforeEach, describe, expect, it } from 'vitest'
 import {
   canonicalPath,
   encodeClaudeSessionDirName,
+  encodeOmpSessionDirName,
   CLAUDE_ENCODE_SHELL_SCRIPT,
+  OMP_ENCODE_SHELL_SCRIPT,
 } from './agent-state-paths'
 
 describe('encodeClaudeSessionDirName', () => {
@@ -90,5 +92,109 @@ describe('CLAUDE_ENCODE_SHELL_SCRIPT', () => {
   it('matches the Node encoder on a non-existent path (both fall back to input)', () => {
     const missing = join(root, 'no-such-sub', 'wt')
     expect(shellEncode(missing)).toBe(encodeClaudeSessionDirName(missing))
+  })
+})
+
+describe('OMP_ENCODE_SHELL_SCRIPT shell/JS parity', () => {
+  // Regression: OMP_ENCODE_SHELL_SCRIPT (nested case branches, multiply-escaped
+  // sed substitutions) is meaningfully more complex than the single-sed claude
+  // equivalent. Run it for real (via a real `sh`, with a controlled
+  // $HOME/$TMPDIR/$TMP/$TEMP) and assert its `enc` output matches
+  // encodeOmpSessionDirName's JS output, across the same home-relative /
+  // tmp-relative / legacy-absolute cases the production code branches on, plus a
+  // path with an embedded ':' to exercise the sed character-class escaping both
+  // implementations share. The remote resume probe (agent-resumability.ts)
+  // composes this fragment, so keeping the two implementations in lockstep is
+  // what lets that probe be tested with only a byte-pin of the composed script.
+  it('produces the same encoding as encodeOmpSessionDirName for representative paths', () => {
+    const fakeHome = mkdtempSync(join(tmpdir(), 'omp-parity-home-'))
+    const fakeTmpRoot = mkdtempSync(join(tmpdir(), 'omp-parity-tmp-'))
+    const outsideBoth = mkdtempSync(join(tmpdir(), 'omp-parity-outside-'))
+    try {
+      const nestedInHome = join(fakeHome, 'dev', 'proj:ect')
+      mkdirSync(nestedInHome, { recursive: true })
+      const nestedInTmp = join(fakeTmpRoot, 'scratch')
+      mkdirSync(nestedInTmp, { recursive: true })
+
+      const cases = [fakeHome, nestedInHome, fakeTmpRoot, nestedInTmp, outsideBoth]
+
+      const savedHome = process.env.HOME
+      const savedTmpdir = process.env.TMPDIR
+      const savedTmp = process.env.TMP
+      const savedTemp = process.env.TEMP
+      try {
+        process.env.HOME = fakeHome
+        process.env.TMPDIR = fakeTmpRoot
+        delete process.env.TMP
+        delete process.env.TEMP
+
+        for (const target of cases) {
+          const jsEncoded = encodeOmpSessionDirName(target)
+          const shellEncoded = execFileSync(
+            'sh',
+            ['-c', `${OMP_ENCODE_SHELL_SCRIPT}; printf '%s' "$enc"`, '_', target],
+            { env: { ...process.env }, encoding: 'utf-8' }
+          )
+          expect(shellEncoded).toBe(jsEncoded)
+        }
+      } finally {
+        if (savedHome === undefined) delete process.env.HOME
+        else process.env.HOME = savedHome
+        if (savedTmpdir === undefined) delete process.env.TMPDIR
+        else process.env.TMPDIR = savedTmpdir
+        if (savedTmp === undefined) delete process.env.TMP
+        else process.env.TMP = savedTmp
+        if (savedTemp === undefined) delete process.env.TEMP
+        else process.env.TEMP = savedTemp
+      }
+    } finally {
+      rmSync(fakeHome, { recursive: true, force: true })
+      rmSync(fakeTmpRoot, { recursive: true, force: true })
+      rmSync(outsideBoth, { recursive: true, force: true })
+    }
+  })
+
+  // Regression for the TMPDIR/TMP/TEMP parity bug: a remote host that sets
+  // only TMP (not TMPDIR) must still classify a worktree under that root as
+  // tmp-relative, matching Node's os.tmpdir() fallback order.
+  it('resolves TMP when TMPDIR is unset, matching os.tmpdir()', () => {
+    const fakeHome = mkdtempSync(join(tmpdir(), 'omp-parity-home-'))
+    const fakeTmpRoot = mkdtempSync(join(tmpdir(), 'omp-parity-tmp-'))
+    try {
+      const nestedInTmp = join(fakeTmpRoot, 'scratch')
+      mkdirSync(nestedInTmp, { recursive: true })
+
+      const savedHome = process.env.HOME
+      const savedTmpdir = process.env.TMPDIR
+      const savedTmp = process.env.TMP
+      const savedTemp = process.env.TEMP
+      try {
+        process.env.HOME = fakeHome
+        delete process.env.TMPDIR
+        process.env.TMP = fakeTmpRoot
+        delete process.env.TEMP
+
+        const jsEncoded = encodeOmpSessionDirName(nestedInTmp)
+        expect(jsEncoded).toBe('-tmp-scratch')
+        const shellEncoded = execFileSync(
+          'sh',
+          ['-c', `${OMP_ENCODE_SHELL_SCRIPT}; printf '%s' "$enc"`, '_', nestedInTmp],
+          { env: { ...process.env }, encoding: 'utf-8' }
+        )
+        expect(shellEncoded).toBe(jsEncoded)
+      } finally {
+        if (savedHome === undefined) delete process.env.HOME
+        else process.env.HOME = savedHome
+        if (savedTmpdir === undefined) delete process.env.TMPDIR
+        else process.env.TMPDIR = savedTmpdir
+        if (savedTmp === undefined) delete process.env.TMP
+        else process.env.TMP = savedTmp
+        if (savedTemp === undefined) delete process.env.TEMP
+        else process.env.TEMP = savedTemp
+      }
+    } finally {
+      rmSync(fakeHome, { recursive: true, force: true })
+      rmSync(fakeTmpRoot, { recursive: true, force: true })
+    }
   })
 })
