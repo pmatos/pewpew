@@ -55,6 +55,7 @@ import { applyHookEvent, type SideEffectIntent } from './session-state-machine'
 import { deriveRestoredState } from './restore-planner'
 import { applyProbeTransition, computeProbeTransition } from './probe-transition'
 import { planIssueWorktree } from './worktree-plan'
+import { createOrAdoptWorktree, worktreeCreationError } from './worktree-adoption'
 import { planRelocation } from './relocation-plan'
 import {
   PR_VIEW_FIELDS,
@@ -796,31 +797,35 @@ async function createRemoteSession(
             })
           )
         )
-        try {
-          await expectRemoteOk(
-            host,
-            [
-              'git',
-              '-C',
-              projectPath,
-              'worktree',
-              'add',
-              worktreePath,
-              '--no-track',
-              '-b',
-              branchName,
-              originRef,
-            ],
-            'Failed to create remote worktree'
-          )
-        } catch (err) {
-          if (!(await remoteBranchExists(host, projectPath, branchName))) throw err
-          await expectRemoteOk(
-            host,
-            ['git', '-C', projectPath, 'worktree', 'add', worktreePath, branchName],
-            'Failed to create remote worktree'
-          )
-        }
+        const adoption = await createOrAdoptWorktree({
+          addNewBranch: async () => {
+            await expectRemoteOk(
+              host,
+              [
+                'git',
+                '-C',
+                projectPath,
+                'worktree',
+                'add',
+                worktreePath,
+                '--no-track',
+                '-b',
+                branchName,
+                originRef,
+              ],
+              'Failed to create remote worktree'
+            )
+          },
+          branchExists: () => remoteBranchExists(host, projectPath, branchName),
+          adoptExistingBranch: async () => {
+            await expectRemoteOk(
+              host,
+              ['git', '-C', projectPath, 'worktree', 'add', worktreePath, branchName],
+              'Failed to create remote worktree'
+            )
+          },
+        })
+        if (!adoption.ok) throw adoption.cause
       } else {
         const addWithBranch = await execRemote(host, [
           'git',
@@ -1098,22 +1103,26 @@ export async function createSession(
       })
       return { stdout: String(stdout) }
     })
-    try {
-      await execFileAsync('git', [
-        '-C',
-        projectPath,
-        'worktree',
-        'add',
-        worktreePath,
-        '--no-track',
-        '-b',
-        branchName,
-        originRef,
-      ])
-    } catch (err) {
-      if (!(await branchExists(projectPath, branchName))) throw err
-      await execFileAsync('git', ['-C', projectPath, 'worktree', 'add', worktreePath, branchName])
-    }
+    const adoption = await createOrAdoptWorktree({
+      addNewBranch: async () => {
+        await execFileAsync('git', [
+          '-C',
+          projectPath,
+          'worktree',
+          'add',
+          worktreePath,
+          '--no-track',
+          '-b',
+          branchName,
+          originRef,
+        ])
+      },
+      branchExists: () => branchExists(projectPath, branchName),
+      adoptExistingBranch: async () => {
+        await execFileAsync('git', ['-C', projectPath, 'worktree', 'add', worktreePath, branchName])
+      },
+    })
+    if (!adoption.ok) throw adoption.cause
   } else {
     try {
       await execFileAsync('git', [
@@ -2171,18 +2180,16 @@ export async function createIssueSession(
     return `Failed to resolve origin default: ${msg}`
   }
 
-  try {
-    await runGit(['worktree', 'add', worktreePath, '--no-track', '-b', branch, originRef])
-  } catch (err) {
-    if (!(await hasBranch(projectPath, branch))) {
-      return `Failed to create worktree for branch "${branch}": ${(err as Error).message}`
-    }
-    try {
+  const adoption = await createOrAdoptWorktree({
+    addNewBranch: async () => {
+      await runGit(['worktree', 'add', worktreePath, '--no-track', '-b', branch, originRef])
+    },
+    branchExists: () => hasBranch(projectPath, branch),
+    adoptExistingBranch: async () => {
       await runGit(['worktree', 'add', worktreePath, branch])
-    } catch (fallbackErr) {
-      return `Failed to create worktree for branch "${branch}": ${(fallbackErr as Error).message}`
-    }
-  }
+    },
+  })
+  if (!adoption.ok) return worktreeCreationError(branch, adoption.cause)
 
   const session = await adopt(projectPath, worktreePath, worktreeName, options.tool)
   session.issueNumber = issueNumber
@@ -2240,37 +2247,35 @@ async function createRemoteIssueSession(
         return `Failed to resolve origin default: ${msg}`
       }
 
-      try {
-        await expectRemoteOk(
-          host,
-          [
-            'git',
-            '-C',
-            projectPath,
-            'worktree',
-            'add',
-            worktreePath,
-            '--no-track',
-            '-b',
-            branch,
-            originRef,
-          ],
-          'Failed to create remote worktree'
-        )
-      } catch (err) {
-        if (!(await remoteBranchExists(host, projectPath, branch))) {
-          return `Failed to create worktree for branch "${branch}": ${(err as Error).message}`
-        }
-        try {
+      const adoption = await createOrAdoptWorktree({
+        addNewBranch: async () => {
+          await expectRemoteOk(
+            host,
+            [
+              'git',
+              '-C',
+              projectPath,
+              'worktree',
+              'add',
+              worktreePath,
+              '--no-track',
+              '-b',
+              branch,
+              originRef,
+            ],
+            'Failed to create remote worktree'
+          )
+        },
+        branchExists: () => remoteBranchExists(host, projectPath, branch),
+        adoptExistingBranch: async () => {
           await expectRemoteOk(
             host,
             ['git', '-C', projectPath, 'worktree', 'add', worktreePath, branch],
             'Failed to create remote worktree'
           )
-        } catch (fallbackErr) {
-          return `Failed to create worktree for branch "${branch}": ${(fallbackErr as Error).message}`
-        }
-      }
+        },
+      })
+      if (!adoption.ok) return worktreeCreationError(branch, adoption.cause)
 
       const resolvedBranch =
         (
