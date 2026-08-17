@@ -72,7 +72,7 @@ describe('bootstrapHost', () => {
 
     expect(result).toEqual({
       notifyScriptPath: '/home/dev/.config/pewpew/hooks/notify-v1.sh',
-      guardScriptPath: '/home/dev/.config/pewpew/hooks/worktree-guard-v6.sh',
+      guardScriptPath: '/home/dev/.config/pewpew/hooks/worktree-guard-v7.sh',
       ompHookScriptPath: '/home/dev/.config/pewpew/hooks/omp-notify-v1.ts',
       remoteSocketPath: '/tmp/ipc',
       sandboxAvailable: true,
