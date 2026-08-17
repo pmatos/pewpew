@@ -47,6 +47,20 @@ function run(payload: unknown, guardRoot = root): Decision | null {
   return trimmed ? (JSON.parse(trimmed) as Decision) : null
 }
 
+// Runs with a caller-controlled HOME so the ~/.claude exemption tests never
+// touch this machine's real ~/.claude — execFileSync's `env` option replaces
+// the whole child environment rather than merging, so PATH (needed for
+// bash/jq) must be forwarded explicitly alongside the fake HOME.
+function runWithHome(payload: unknown, guardRoot: string, home: string): Decision | null {
+  const out = execFileSync('bash', [SCRIPT, guardRoot], {
+    input: JSON.stringify(payload),
+    encoding: 'utf-8',
+    env: { ...process.env, HOME: home },
+  })
+  const trimmed = out.trim()
+  return trimmed ? (JSON.parse(trimmed) as Decision) : null
+}
+
 function writePayload(filePath: string): unknown {
   return { tool_name: 'Write', tool_input: { file_path: filePath, content: 'x' } }
 }
@@ -298,5 +312,67 @@ describe('worktree-guard.sh', () => {
     } finally {
       rmSync(outside, { recursive: true, force: true })
     }
+  })
+
+  // ~/.claude is exempt from the worktree boundary (minus
+  // CLAUDE_DIR_WRITE_DENYLIST) — see claude_real's comment in the script.
+  // Every case here runs against a synthetic HOME under FIXTURE_BASE, never
+  // the real ~/.claude, and covers the specific bug this exemption fixes:
+  // Claude Code's auto-memory system writes under
+  // ~/.claude/projects/<OTHER project's encoded path>/memory/, which is
+  // outside this session's own worktree AND outside its own per-worktree
+  // ~/.claude/projects/<this-worktree> subdir — a narrower exemption than
+  // "the whole ~/.claude dir" would still have denied it.
+  describe('~/.claude exemption', () => {
+    let fakeHome: string
+    let claudeDir: string
+
+    beforeEach(() => {
+      fakeHome = mkFixtureDir('guard-home-')
+      claudeDir = join(fakeHome, '.claude')
+      mkdirSync(claudeDir, { recursive: true })
+    })
+
+    it("allows a write under another project's memory dir", () => {
+      const memoryDir = join(claudeDir, 'projects', '-home-pmatos-dev-other-project', 'memory')
+      mkdirSync(memoryDir, { recursive: true })
+      const decision = runWithHome(writePayload(join(memoryDir, 'MEMORY.md')), root, fakeHome)
+      expect(decision).toBeNull()
+    })
+
+    it('allows a write to a not-yet-existing path under ~/.claude', () => {
+      const decision = runWithHome(
+        writePayload(join(claudeDir, 'tasks', 'session-1', '.lock')),
+        root,
+        fakeHome
+      )
+      expect(decision).toBeNull()
+    })
+
+    it('denies a write to a CLAUDE_DIR_WRITE_DENYLIST file (settings.json)', () => {
+      const decision = runWithHome(writePayload(join(claudeDir, 'settings.json')), root, fakeHome)
+      expect(decision?.hookSpecificOutput?.permissionDecision).toBe('deny')
+      expect(decision?.hookSpecificOutput?.permissionDecisionReason).toContain(
+        '~/.claude/settings.json'
+      )
+    })
+
+    it('denies a write under a CLAUDE_DIR_WRITE_DENYLIST directory (skills/)', () => {
+      const decision = runWithHome(
+        writePayload(join(claudeDir, 'skills', 'foo', 'SKILL.md')),
+        root,
+        fakeHome
+      )
+      expect(decision?.hookSpecificOutput?.permissionDecision).toBe('deny')
+      expect(decision?.hookSpecificOutput?.permissionDecisionReason).toContain('~/.claude/skills')
+    })
+
+    it('does not exempt ~/.claude.json, a sibling of the exempted dir', () => {
+      const decision = runWithHome(writePayload(`${claudeDir}.json`), root, fakeHome)
+      expect(decision?.hookSpecificOutput?.permissionDecision).toBe('deny')
+      expect(decision?.hookSpecificOutput?.permissionDecisionReason).toContain(
+        'outside the session worktree'
+      )
+    })
   })
 })

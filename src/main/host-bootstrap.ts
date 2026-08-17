@@ -3,7 +3,7 @@ import type { ExecResult } from './host-connection'
 import type { AgentTool } from '../shared/types'
 
 export const NOTIFY_SCRIPT_VERSION = 1
-export const WORKTREE_GUARD_SCRIPT_VERSION = 6
+export const WORKTREE_GUARD_SCRIPT_VERSION = 7
 
 // Tools pewpew strictly requires on a remote host for sessions and the notify
 // hook to work. Exported so the connection-test flow can surface missing ones
@@ -102,6 +102,34 @@ fi
 # just this one. Canonicalized the same way as root_real so a symlinked
 # /tmp (e.g. macOS's /tmp -> /private/tmp) still matches.
 tmp_real=$(cd /tmp 2>/dev/null && pwd -P)
+
+# ~/.claude is exempt from the worktree boundary too, mirroring the bwrap
+# sandbox's own writable exception for the claude tool (claudeDir() in
+# pty-manager.ts): Claude Code keeps adding per-invocation scratch state
+# directly under ~/.claude (session-env/, tasks/, and its cross-project
+# auto-memory system under projects/<other-project>/memory/, keyed by the
+# MAIN repo's path — not this worktree's), so a write there is expected and
+# this hook would otherwise be the one thing left blocking it even though
+# the bwrap mount already permits it. CLAUDE_DIR_WRITE_DENYLIST below
+# re-closes the specific entries that would turn a compromised sandboxed
+# write into a persistence vector for every later session (sandboxed or
+# not) that loads them — hand-synced against the identically-named list in
+# pty-manager.ts; nothing enforces the two staying identical, so a change to
+# one must be mirrored in the other by hand. Canonicalized the same way as
+# root_real/tmp_real so a symlinked ~/.claude (e.g. a dotfiles-managed home)
+# still matches, and gated the same way below on being non-empty so a failed
+# \`cd\` can't collapse the case pattern into a match-everything wildcard.
+#
+# Deliberately NOT extended to ~/.claude.json (sibling of this dir, not a
+# child — mixes benign per-project bookkeeping with global MCP server
+# config): the boundary check below only matches "$claude_real" or
+# "$claude_real"/*, which a sibling file never does, so no extra exclusion
+# is needed for it.
+claude_real=$(cd "$HOME/.claude" 2>/dev/null && pwd -P)
+CLAUDE_DIR_WRITE_DENYLIST=(
+  commands output-styles skills agents plugins backups daemon shell-snapshots
+  settings.json settings.backup.json CLAUDE.md statusline.sh .credentials.json
+)
 
 # Check for an embedded/trailing newline in the raw JSON string BEFORE ever
 # assigning it into a shell variable: \`target=$(...)\` below would silently
@@ -226,6 +254,25 @@ else
       "$tmp_real") allowed=1 ;;
       "$tmp_real"/*) allowed=1 ;;
     esac
+  fi
+
+  # ~/.claude exemption (see claude_real above), minus CLAUDE_DIR_WRITE_DENYLIST.
+  if [ "$allowed" != "1" ] && [ -n "$claude_real" ]; then
+    case "$target_real" in
+      "$claude_real") allowed=1 ;;
+      "$claude_real"/*) allowed=1 ;;
+    esac
+    if [ "$allowed" = "1" ]; then
+      for entry in "\${CLAUDE_DIR_WRITE_DENYLIST[@]}"; do
+        denylisted="$claude_real/$entry"
+        case "$target_real" in
+          "$denylisted" | "$denylisted"/*)
+            allowed=0
+            reason="pewpew: ~/.claude/$entry is a global execution/config surface loaded by every future session; blocking the write (fail-closed)"
+            ;;
+        esac
+      done
+    fi
   fi
 
   guard_settings="$root_real/.claude/settings.local.json"
