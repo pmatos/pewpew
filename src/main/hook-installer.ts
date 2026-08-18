@@ -31,10 +31,13 @@ export const OMP_HOOK_SCRIPT = join(CONFIG_DIR, 'hooks', 'omp-notify.ts')
 
 // Claude Code's own sandbox only isolates Bash subprocesses; the built-in
 // Write/Edit/MultiEdit/NotebookEdit tools go through the permission system
-// instead, which --dangerously-skip-permissions (always passed by pewpew)
-// disables. This PreToolUse hook is the only thing left that stops an agent
-// from writing outside its session worktree through those tools — see
-// hooks/worktree-guard.sh. It does not cover Bash writes.
+// instead. pewpew runs claude under --permission-mode=auto (see
+// buildAgentArgs in pty-manager.ts) rather than --dangerously-skip-
+// permissions, so that system's own classifier is in the loop — but it's a
+// probabilistic approval mode, not a hard boundary. This PreToolUse hook is
+// the backstop that unconditionally stops an agent from writing outside its
+// session worktree through those tools — see hooks/worktree-guard.sh. It
+// does not cover Bash writes.
 function buildHooks(
   notifyScript: string,
   guardScript: string,

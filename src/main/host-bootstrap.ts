@@ -103,22 +103,20 @@ fi
 # /tmp (e.g. macOS's /tmp -> /private/tmp) still matches.
 tmp_real=$(cd /tmp 2>/dev/null && pwd -P)
 
-# ~/.claude is exempt from the worktree boundary too, mirroring the bwrap
-# sandbox's own writable exception for the claude tool (claudeDir() in
-# pty-manager.ts): Claude Code keeps adding per-invocation scratch state
-# directly under ~/.claude (session-env/, tasks/, and its cross-project
-# auto-memory system under projects/<other-project>/memory/, keyed by the
-# MAIN repo's path — not this worktree's), so a write there is expected and
-# this hook would otherwise be the one thing left blocking it even though
-# the bwrap mount already permits it. CLAUDE_DIR_WRITE_DENYLIST below
-# re-closes the specific entries that would turn a compromised sandboxed
-# write into a persistence vector for every later session (sandboxed or
-# not) that loads them — hand-synced against the identically-named list in
-# pty-manager.ts; nothing enforces the two staying identical, so a change to
-# one must be mirrored in the other by hand. Canonicalized the same way as
-# root_real/tmp_real so a symlinked ~/.claude (e.g. a dotfiles-managed home)
-# still matches, and gated the same way below on being non-empty so a failed
-# \`cd\` can't collapse the case pattern into a match-everything wildcard.
+# ~/.claude is exempt from the worktree boundary too: Claude Code keeps
+# adding per-invocation scratch state directly under ~/.claude
+# (session-env/, tasks/, and its cross-project auto-memory system under
+# projects/<other-project>/memory/, keyed by the MAIN repo's path — not
+# this worktree's), so a write there is expected and this hook would
+# otherwise be the one thing left blocking it. claude sessions are never
+# bwrap-sandboxed (see buildAgentArgs in pty-manager.ts), so
+# CLAUDE_DIR_WRITE_DENYLIST below — this hook's own list, not shared with
+# any other file — is what re-closes the specific entries that would turn
+# a compromised write into a persistence vector for every later session
+# that loads them. Canonicalized the same way as root_real/tmp_real so a
+# symlinked ~/.claude (e.g. a dotfiles-managed home) still matches, and
+# gated the same way below on being non-empty so a failed \`cd\` can't
+# collapse the case pattern into a match-everything wildcard.
 #
 # Deliberately NOT extended to ~/.claude.json (sibling of this dir, not a
 # child — mixes benign per-project bookkeeping with global MCP server
