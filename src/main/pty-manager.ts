@@ -22,12 +22,12 @@ import {
   ensureCodexProjectConfigDir,
   ensureRemoteCodexProjectConfigDir,
 } from './hook-installer'
+import { encodeClaudeSessionDirName, encodeOmpSessionDirName } from './agent-state-paths'
 import {
-  encodeClaudeSessionDirName,
-  encodeOmpSessionDirName,
-  CLAUDE_ENCODE_SHELL_SCRIPT,
-  OMP_ENCODE_SHELL_SCRIPT,
-} from './agent-state-paths'
+  buildRemoteAgentStateScript,
+  parseRemoteAgentState,
+  type RemoteAgentState,
+} from './remote-agent-state'
 import { getSandboxConfig, resolvePath } from './config'
 import type { AgentTool, Host } from '../shared/types'
 
@@ -397,78 +397,27 @@ async function resolveRemoteGitDir(host: Host, projectPath: string): Promise<str
 // the local agentStateDir()/claudeDir(): the local helpers use local
 // realpathSync/homedir/tmpdir and platform-local path.join, all of which
 // compute the wrong path for a remote session (wrong symlinks, wrong $HOME,
-// wrong tmpdir, wrong omp encoding). The shell canonicalization here mirrors
-// the remote history probes in session-manager.ts exactly so the bind-source
-// and the resume-probe check the same directory.
-//
-interface RemoteAgentState {
-  writablePaths: string[]
-  // The remote ~/.claude dir, populated only for the claude tool (undefined
-  // for codex/omp). Named explicitly rather than read positionally off
-  // writablePaths so a future script/parsing change can't silently stop
-  // applying CLAUDE_DIR_WRITE_DENYLIST without a type error.
-  claudeDir?: string
-}
-
-// Returns the writable paths to bind (or undefined on failure — a transient
-// SSH error degrades to unsandboxed rather than blocking session creation).
+// wrong tmpdir, wrong omp encoding). The shell canonicalization mirrors the
+// remote history probes in session-manager.ts exactly so the bind-source and
+// the resume-probe check the same directory. The script bytes and the parse of
+// their output are the contract of ./remote-agent-state; this is only the IO
+// seam that runs one against the other and degrades to unsandboxed on any SSH
+// failure.
 async function resolveRemoteAgentStateDir(
   host: Host,
   tool: AgentTool | undefined,
   worktreePath: string
 ): Promise<RemoteAgentState | undefined> {
-  // codex has no per-worktree dir convention — its resume is keyed on
-  // agentSessionId, not a filesystem path — so the whole ~/.codex dir is the
-  // writable exception (matching the local agentStateDir for codex).
-  //
-  // claude additionally needs the whole ~/.claude dir writable — see
-  // claudeDir's local counterpart for why (keeps adding new global scratch
-  // state under unpredictable names). The second printed line is that whole
-  // directory; createRemotePty re-closes CLAUDE_DIR_WRITE_DENYLIST under it
-  // as extraReadOnlyPaths, mirroring buildLocalSandboxPrefix — including
-  // mkdir'ing the directory-type denylist entries here so their --ro-bind-try
-  // can't silently skip an absent one (see CLAUDE_DIR_RO_DIRS' comment).
-  // The essential mkdirs ($d, $c) are `&&`-gated ahead of the denylist
-  // pre-creates deliberately: a failure there means sandboxing genuinely
-  // can't proceed (no writable exception to bind), so falling back to
-  // unsandboxed is correct. The denylist directory names, by contrast, are
-  // each mkdir'd individually inside their own loop with stderr suppressed
-  // and no `&&` between iterations — one name already occupied by a stray
-  // file or dangling symlink must not take the whole remote sandbox down
-  // (as a single `mkdir -p a b c && ...` chain would: GNU mkdir -p keeps
-  // going past a failing operand but still exits non-zero overall, which
-  // used to make the trailing `&& printf` never run, returning undefined
-  // here and disabling bwrap entirely for the session). Mirrors the local
-  // path's per-entry try/catch in buildLocalSandboxPrefix.
-  const claudeRoDirsNames = CLAUDE_DIR_RO_DIRS.join(' ')
-  const script =
-    tool === 'codex'
-      ? 'd="$HOME/.codex"; mkdir -p "$d" && printf "%s" "$d"'
-      : tool === 'omp'
-        ? `${OMP_ENCODE_SHELL_SCRIPT}; d="$HOME/.omp/agent/sessions/$enc"; mkdir -p "$d" && printf "%s" "$d"`
-        : `${CLAUDE_ENCODE_SHELL_SCRIPT}; ` +
-          'd="$HOME/.claude/projects/$enc"; c="$HOME/.claude"; ' +
-          'mkdir -p "$d" "$c" && { ' +
-          `for x in ${claudeRoDirsNames}; do mkdir -p "$c/$x" 2>/dev/null; done; ` +
-          'printf "%s\\n%s" "$d" "$c"; }'
+  const script = buildRemoteAgentStateScript(tool, CLAUDE_DIR_RO_DIRS)
   try {
     const result = await execRemote(host, ['sh', '-c', script, '_', worktreePath], {
       timeoutMs: 8000,
     })
-    if (!result.timedOut && result.code === 0) {
-      const dirs = result.stdout
-        .trim()
-        .split('\n')
-        .filter((dir) => dir.startsWith('/'))
-      if (dirs.length > 0) {
-        const isClaudeTool = tool !== 'codex' && tool !== 'omp'
-        return { writablePaths: dirs, claudeDir: isClaudeTool ? dirs[1] : undefined }
-      }
-    }
+    return parseRemoteAgentState(tool, result)
   } catch {
     // fall through — unsandboxed is the safe fallback
+    return undefined
   }
-  return undefined
 }
 
 export function initPtyManager(): void {
