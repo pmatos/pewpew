@@ -375,7 +375,8 @@ function buildLocalSandboxPrefix(
 }
 
 // Returns whether this session's agent process is running inside the bwrap
-// sandbox — false when projectPath was omitted, sandboxing is disabled in
+// sandbox — false when the tool is claude (never sandboxed, see
+// buildAgentArgs), projectPath was omitted, sandboxing is disabled in
 // config, or bwrap isn't available. Callers persist this on the Session so
 // the UI can show an accurate per-session indicator; it reflects reality at
 // spawn time only (reattachPty reuses the existing process and doesn't call
