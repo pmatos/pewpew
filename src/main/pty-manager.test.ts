@@ -12,42 +12,15 @@ const state = {
   tmuxArgvCalls: [] as string[][],
   remoteArgvCalls: [] as string[][],
   mkdirCalls: [] as string[],
-  // When set, the mocked mkdirSync throws for this exact path — simulates a
-  // CLAUDE_DIR_RO_DIRS entry occupied by something other than a directory
-  // (stray file, dangling symlink) to test that one bad entry doesn't crash
-  // the whole spawn.
-  mkdirFailFor: null as string | null,
   // Controls what resolveRemoteGitDir returns (empty → fallback to
   // `<project>/.git`).
   remoteGitDir: '' as string,
   // Controls what resolveRemoteAgentStateDir returns (undefined → sandbox
   // disabled, since a missing state bind would make the agent's first write
-  // hit EROFS under --ro-bind / /).
-  remoteStateDir: '/home/dev/.claude/projects/encoded-wt1' as string | undefined,
-  // Second writable dir the claude-tool branch of resolveRemoteAgentStateDir
-  // reports (the whole remote ~/.claude dir, mkdir'd by the same script).
-  // Ignored for the codex/omp branches, which only ever return one dir.
-  remoteClaudeDir: '/home/dev/.claude' as string | undefined,
+  // hit EROFS under --ro-bind / /). Only codex/omp ever call it — claude is
+  // never sandboxed.
+  remoteStateDir: '/home/dev/.omp/agent/sessions/encoded-wt1' as string | undefined,
 }
-
-// Mirrors CLAUDE_DIR_WRITE_DENYLIST in pty-manager.ts — kept as an
-// independent literal so a drift between the implementation and this list
-// fails the test instead of both changing in lockstep unnoticed.
-const CLAUDE_DIR_WRITE_DENYLIST = [
-  'commands',
-  'output-styles',
-  'skills',
-  'agents',
-  'plugins',
-  'backups',
-  'daemon',
-  'shell-snapshots',
-  'settings.json',
-  'settings.backup.json',
-  'CLAUDE.md',
-  'statusline.sh',
-  '.credentials.json',
-]
 
 function fakePty() {
   return {
@@ -88,9 +61,6 @@ vi.mock('fs', () => ({
   existsSync: () => true,
   mkdirSync: (path: string) => {
     state.mkdirCalls.push(path)
-    if (path === state.mkdirFailFor) {
-      throw Object.assign(new Error('EEXIST: file already exists, mkdir'), { code: 'EEXIST' })
-    }
   },
   realpathSync: (path: string) => path,
 }))
@@ -106,24 +76,13 @@ vi.mock('./host-connection', () => ({
     if (argv[0] === 'git' && argv.includes('--git-common-dir')) {
       return { stdout: state.remoteGitDir ?? '', stderr: '', code: 0, timedOut: false }
     }
-    // resolveRemoteAgentStateDir: `sh -c <script> _ <worktreePath>` — the
-    // script prints the writable dir path(s), one per line, after mkdir'ing
-    // them. Return a fixed path so sandboxing can be enabled; tests that need
-    // it disabled set state.remoteStateDir to undefined. The claude branch
-    // additionally reports remoteClaudeDir (its whole ~/.claude
-    // counterpart), matching the real script's two-line stdout.
+    // resolveRemoteAgentStateDir (codex/omp only — claude is never
+    // sandboxed): `sh -c <script> _ <worktreePath>` — the script prints the
+    // writable dir path after mkdir'ing it. Return a fixed path so
+    // sandboxing can be enabled; tests that need it disabled set
+    // state.remoteStateDir to undefined.
     if (argv[0] === 'sh' && typeof argv[2] === 'string') {
       const script = argv[2]
-      if (script.includes('.claude/projects')) {
-        const dir = state.remoteStateDir
-        const dirs = dir ? [dir, ...(state.remoteClaudeDir ? [state.remoteClaudeDir] : [])] : []
-        return {
-          stdout: dirs.join('\n'),
-          stderr: '',
-          code: dir ? 0 : 1,
-          timedOut: false,
-        }
-      }
       if (script.includes('.codex') || script.includes('.omp/agent/sessions')) {
         const dir = state.remoteStateDir
         return {
@@ -167,14 +126,15 @@ const agentArgsFromCall = (argv: string[]): string[] => argv.slice(10)
 const remoteAgentArgsFromCall = (argv: string[]): string[] => argv.slice(11)
 
 describe('buildAgentArgs', () => {
-  it('defaults to claude with --dangerously-skip-permissions', () => {
-    expect(buildAgentArgs()).toEqual(['claude', '--dangerously-skip-permissions'])
+  it('defaults to claude with --permission-mode auto', () => {
+    expect(buildAgentArgs()).toEqual(['claude', '--permission-mode', 'auto'])
   })
 
   it('claude with continueSession appends --continue', () => {
     expect(buildAgentArgs({ tool: 'claude', continueSession: true })).toEqual([
       'claude',
-      '--dangerously-skip-permissions',
+      '--permission-mode',
+      'auto',
       '--continue',
     ])
   })
@@ -206,7 +166,8 @@ describe('buildAgentArgs', () => {
   it('uses agentPath as argv[0] when provided (claude)', () => {
     expect(buildAgentArgs({ agentPath: '/u/.local/bin/claude' })).toEqual([
       '/u/.local/bin/claude',
-      '--dangerously-skip-permissions',
+      '--permission-mode',
+      'auto',
     ])
   })
 
@@ -267,7 +228,6 @@ describe('createPty', () => {
     state.bwrapAvailable = true
     state.tmuxArgvCalls = []
     state.mkdirCalls = []
-    state.mkdirFailFor = null
     // isSandboxAvailable() memoizes a successful real-bwrap probe; without
     // resetting it here, the first test to see bwrapAvailable=true would
     // permanently mask every later test simulating bwrap being unusable.
@@ -275,20 +235,15 @@ describe('createPty', () => {
     warnSpy.mockClear()
   })
 
-  it('prepends the bwrap sandbox prefix, binding the whole ~/.claude dir writable, to the composed tmux argv when available', () => {
+  it('never sandboxes claude, even when bwrap is available, and never probes or warns about it', () => {
     createPty('s1', WORKTREE, { tool: 'claude', projectPath: PROJECT })
     const argv = agentArgsFromCall(state.tmuxArgvCalls[0])
-    const claudeDirPath = join(homedir(), '.claude')
-    const expectedPrefix = buildSandboxArgs(PROJECT, WORKTREE, {
-      enabled: true,
-      extraWritablePaths: [claudeDirPath],
-      extraReadOnlyPaths: CLAUDE_DIR_WRITE_DENYLIST.map((name) => join(claudeDirPath, name)),
-    })
-    expect(argv).toEqual([...expectedPrefix, ...buildAgentArgs({ tool: 'claude' })])
+    expect(argv).toEqual(buildAgentArgs({ tool: 'claude' }))
+    expect(argv).not.toContain('bwrap')
     expect(warnSpy).not.toHaveBeenCalled()
   })
 
-  it("still creates the per-worktree ~/.claude/projects/<encoded> dir as session-manager's resume marker, even though the sandbox exception is the whole ~/.claude dir", () => {
+  it("still creates the per-worktree ~/.claude/projects/<encoded> dir as session-manager's resume marker, even though claude is never sandboxed", () => {
     createPty('s1', WORKTREE, { tool: 'claude', projectPath: PROJECT })
     const claudeStateDir = join(
       homedir(),
@@ -299,29 +254,7 @@ describe('createPty', () => {
     expect(state.mkdirCalls).toContain(claudeStateDir)
   })
 
-  it('re-closes CLAUDE_DIR_WRITE_DENYLIST entries read-only after the wide ~/.claude bind for claude', () => {
-    createPty('s1', WORKTREE, { tool: 'claude', projectPath: PROJECT })
-    const argv = agentArgsFromCall(state.tmuxArgvCalls[0])
-    const claudeDirPath = join(homedir(), '.claude')
-    const firstDenyEntry = join(claudeDirPath, CLAUDE_DIR_WRITE_DENYLIST[0])
-    const credentials = join(claudeDirPath, '.credentials.json')
-    const roIdx = argv.indexOf('--ro-bind-try', argv.indexOf(`${PROJECT}/.git/hooks`) + 1)
-    expect(argv.slice(roIdx, roIdx + 3)).toEqual(['--ro-bind-try', firstDenyEntry, firstDenyEntry])
-    expect(argv).toContain(credentials)
-    // The read-only re-close comes after the wide writable bind, so a
-    // duplicated entry can't accidentally stay writable (bind order matters).
-    expect(argv.indexOf('--bind-try', argv.indexOf(`${PROJECT}/.git/hooks`))).toBeLessThan(roIdx)
-  })
-
-  it('mkdirs the directory-type denylist entries so their --ro-bind-try can never fail-open on an absent source', () => {
-    createPty('s1', WORKTREE, { tool: 'claude', projectPath: PROJECT })
-    const claudeDirPath = join(homedir(), '.claude')
-    for (const name of ['commands', 'output-styles', 'skills', 'plugins', 'backups', 'daemon']) {
-      expect(state.mkdirCalls).toContain(join(claudeDirPath, name))
-    }
-  })
-
-  it('creates the tool-specific per-worktree state dir and opens only that as an extra writable path', () => {
+  it('creates the tool-specific per-worktree state dir and opens only that as an extra writable path (omp)', () => {
     createPty('s1', WORKTREE, { tool: 'omp', projectPath: PROJECT })
     const ompStateDir = join(
       homedir(),
@@ -333,7 +266,7 @@ describe('createPty', () => {
     expect(state.mkdirCalls).toContain(ompStateDir)
     // Not the whole ~/.omp dir — only this worktree's own session subdirectory.
     expect(state.mkdirCalls).not.toContain(join(homedir(), '.omp'))
-    // omp doesn't touch the whole ~/.claude dir — that's claude-specific.
+    // omp doesn't touch ~/.claude at all — that's claude-specific bookkeeping.
     expect(state.mkdirCalls).not.toContain(join(homedir(), '.claude'))
     const argv = agentArgsFromCall(state.tmuxArgvCalls[0])
     // The extra writable path is bound after the project's own `.git`/`.git/hooks`
@@ -343,39 +276,15 @@ describe('createPty', () => {
     expect(argv.slice(bindIdx, bindIdx + 3)).toEqual(['--bind-try', ompStateDir, ompStateDir])
   })
 
-  it('omits the sandbox prefix and warns when bwrap is unavailable', () => {
+  it('omits the sandbox prefix and warns when bwrap is unavailable (omp)', () => {
     state.bwrapAvailable = false
-    createPty('s1', WORKTREE, { tool: 'claude', projectPath: PROJECT })
+    createPty('s1', WORKTREE, { tool: 'omp', projectPath: PROJECT })
     const argv = agentArgsFromCall(state.tmuxArgvCalls[0])
-    expect(argv).toEqual(buildAgentArgs({ tool: 'claude' }))
+    expect(argv).toEqual(buildAgentArgs({ tool: 'omp' }))
     expect(argv).not.toContain('bwrap')
     expect(warnSpy).toHaveBeenCalledWith(
       expect.stringContaining('bwrap missing or unable to sandbox')
     )
-    // The CLAUDE_DIR_RO_DIRS mkdirs are real writes against the user's real
-    // global ~/.claude with no payoff when the sandbox won't be used at all
-    // (buildSandboxArgs ignores extraWritablePaths/extraReadOnlyPaths when
-    // disabled) — must not run on a host that isn't sandboxing this session.
-    const claudeDirPath = join(homedir(), '.claude')
-    for (const name of CLAUDE_DIR_WRITE_DENYLIST) {
-      expect(state.mkdirCalls).not.toContain(join(claudeDirPath, name))
-    }
-  })
-
-  it('does not throw when a CLAUDE_DIR_RO_DIRS entry fails to mkdir, and still mkdirs the rest', () => {
-    const claudeDirPath = join(homedir(), '.claude')
-    state.mkdirFailFor = join(claudeDirPath, 'skills')
-    expect(() => createPty('s1', WORKTREE, { tool: 'claude', projectPath: PROJECT })).not.toThrow()
-    expect(warnSpy).toHaveBeenCalledWith(
-      expect.stringContaining('could not prepare ~/.claude/skills')
-    )
-    // A single bad entry doesn't abort the rest of the loop.
-    expect(state.mkdirCalls).toContain(join(claudeDirPath, 'commands'))
-    expect(state.mkdirCalls).toContain(join(claudeDirPath, 'agents'))
-    // The sandbox still spawns — the failed entry just falls back to
-    // --ro-bind-try's existing fail-open-on-absent behavior for that one name.
-    const argv = agentArgsFromCall(state.tmuxArgvCalls[0])
-    expect(argv).toContain('bwrap')
   })
 
   it('skips sandboxing entirely (and never creates a state dir) when no projectPath is given', () => {
@@ -389,16 +298,14 @@ describe('createPty', () => {
 
 describe('createRemotePty', () => {
   const host = { hostId: 'h1', alias: 'dev', label: 'Dev' } as Host
-  const STATE_DIR = '/home/dev/.claude/projects/encoded-wt1'
-  const CLAUDE_DIR = '/home/dev/.claude'
+  const OMP_STATE_DIR = '/home/dev/.omp/agent/sessions/encoded-wt1'
   const REMOTE_SOCKET_DIR = '/tmp/pewpew-remote'
   const REMOTE_SOCKET = `${REMOTE_SOCKET_DIR}/hook.sock`
 
   beforeEach(() => {
     state.remoteArgvCalls = []
     state.remoteGitDir = ''
-    state.remoteStateDir = STATE_DIR
-    state.remoteClaudeDir = CLAUDE_DIR
+    state.remoteStateDir = OMP_STATE_DIR
   })
 
   // The tmux new-session call is the one whose argv starts with 'tmux' — the
@@ -407,7 +314,7 @@ describe('createRemotePty', () => {
     return state.remoteArgvCalls.find((argv) => argv[0] === 'tmux') ?? []
   }
 
-  it('includes the sandbox prefix with state and stable hook socket directory when sandboxAvailable is true', async () => {
+  it('never sandboxes claude remotely, even when sandboxAvailable is true, and skips the state-dir SSH round trip entirely', async () => {
     await createRemotePty('s1', WORKTREE, host, {
       tool: 'claude',
       projectPath: PROJECT,
@@ -415,70 +322,32 @@ describe('createRemotePty', () => {
       remoteSocketPath: REMOTE_SOCKET,
     })
     const argv = remoteAgentArgsFromCall(tmuxCall())
-    const expectedPrefix = buildSandboxArgs(PROJECT, WORKTREE, {
-      enabled: true,
-      extraWritablePaths: [STATE_DIR, CLAUDE_DIR],
-      extraReadOnlyPaths: [
-        REMOTE_SOCKET_DIR,
-        ...CLAUDE_DIR_WRITE_DENYLIST.map((name) => `${CLAUDE_DIR}/${name}`),
-      ],
-      gitDir: `${PROJECT}/.git`,
-    })
-    expect(argv).toEqual([...expectedPrefix, ...buildAgentArgs({ tool: 'claude' })])
+    expect(argv).toEqual(buildAgentArgs({ tool: 'claude' }))
+    expect(argv).not.toContain('bwrap')
+    expect(state.remoteArgvCalls.some((argv) => argv[0] === 'sh')).toBe(false)
   })
 
-  // Byte-pin the composed remote sandbox-prep script. The mock recognizes it by
-  // the `.claude/projects` substring, so a dropped `; ` or altered quoting in
-  // the shared CLAUDE_ENCODE_SHELL_SCRIPT fragment (or the d=/c= seam that
-  // consumes its $enc) would otherwise ship green. Expected bytes are the exact
-  // literal that sat inline before extraction (independent source of truth);
-  // the RO-dirs middle is intentionally covered by endsWith so this stays
-  // robust to that unrelated list changing.
-  it('sends the exact remote claude sandbox-prep script through the shared encoder seam', async () => {
-    await createRemotePty('s1', WORKTREE, host, {
-      tool: 'claude',
-      projectPath: PROJECT,
-      sandboxAvailable: true,
-    })
-    const prep = state.remoteArgvCalls.find(
-      (argv) =>
-        argv[0] === 'sh' && typeof argv[2] === 'string' && argv[2].includes('.claude/projects')
-    )
-    expect(prep).toBeDefined()
-    const script = prep?.[2] ?? ''
-    const expectedPrefix =
-      `p=$(CDPATH= cd -P -- "$1" 2>/dev/null && pwd -P); [ -n "$p" ] || p="$1"; ` +
-      `enc=$(printf '%s' "$p" | sed 's/[^a-zA-Z0-9-]/-/g'); ` +
-      `d="$HOME/.claude/projects/$enc"; c="$HOME/.claude"; mkdir -p "$d" "$c" && { `
-    expect(script.startsWith(expectedPrefix)).toBe(true)
-    expect(script.endsWith(`printf "%s\\n%s" "$d" "$c"; }`)).toBe(true)
-  })
-
-  it('re-closes CLAUDE_DIR_WRITE_DENYLIST entries under the remote ~/.claude dir even without a remote socket path', async () => {
-    await createRemotePty('s1', WORKTREE, host, {
-      tool: 'claude',
-      projectPath: PROJECT,
-      sandboxAvailable: true,
-    })
-    const argv = remoteAgentArgsFromCall(tmuxCall())
-    expect(argv).toContain(`${CLAUDE_DIR}/.credentials.json`)
-    expect(argv).toContain(`${CLAUDE_DIR}/settings.json`)
-  })
-
-  it('does not re-close the denylist for omp/codex, which never report a remote ~/.claude dir', async () => {
+  it('includes the sandbox prefix with state and stable hook socket directory when sandboxAvailable is true (omp)', async () => {
     await createRemotePty('s1', WORKTREE, host, {
       tool: 'omp',
       projectPath: PROJECT,
       sandboxAvailable: true,
+      remoteSocketPath: REMOTE_SOCKET,
     })
     const argv = remoteAgentArgsFromCall(tmuxCall())
-    expect(argv).not.toContain(`${CLAUDE_DIR}/settings.json`)
+    const expectedPrefix = buildSandboxArgs(PROJECT, WORKTREE, {
+      enabled: true,
+      extraWritablePaths: [OMP_STATE_DIR],
+      extraReadOnlyPaths: [REMOTE_SOCKET_DIR],
+      gitDir: `${PROJECT}/.git`,
+    })
+    expect(argv).toEqual([...expectedPrefix, ...buildAgentArgs({ tool: 'omp' })])
   })
 
-  it('uses the resolved gitDir when the remote reports a gitfile root', async () => {
+  it('uses the resolved gitDir when the remote reports a gitfile root (omp)', async () => {
     state.remoteGitDir = '/home/dev/real-repo/.git'
     await createRemotePty('s1', WORKTREE, host, {
-      tool: 'claude',
+      tool: 'omp',
       projectPath: PROJECT,
       sandboxAvailable: true,
     })
@@ -488,39 +357,39 @@ describe('createRemotePty', () => {
     expect(argv).not.toContain(`${PROJECT}/.git`)
   })
 
-  it('disables sandboxing when the remote state dir cannot be resolved', async () => {
+  it('disables sandboxing when the remote state dir cannot be resolved (omp)', async () => {
     state.remoteStateDir = undefined
     await createRemotePty('s1', WORKTREE, host, {
-      tool: 'claude',
+      tool: 'omp',
       projectPath: PROJECT,
       sandboxAvailable: true,
     })
     const argv = remoteAgentArgsFromCall(tmuxCall())
-    expect(argv).toEqual(buildAgentArgs({ tool: 'claude' }))
+    expect(argv).toEqual(buildAgentArgs({ tool: 'omp' }))
     expect(argv).not.toContain('bwrap')
   })
 
-  it('omits the sandbox prefix when sandboxAvailable is not set', async () => {
-    await createRemotePty('s1', WORKTREE, host, { tool: 'claude', projectPath: PROJECT })
+  it('omits the sandbox prefix when sandboxAvailable is not set (omp)', async () => {
+    await createRemotePty('s1', WORKTREE, host, { tool: 'omp', projectPath: PROJECT })
     const argv = remoteAgentArgsFromCall(tmuxCall())
-    expect(argv).toEqual(buildAgentArgs({ tool: 'claude' }))
+    expect(argv).toEqual(buildAgentArgs({ tool: 'omp' }))
     expect(argv).not.toContain('bwrap')
   })
 
-  it('skips the remote state-dir SSH round trip entirely when sandboxAvailable is not set', async () => {
-    await createRemotePty('s1', WORKTREE, host, { tool: 'claude', projectPath: PROJECT })
-    // Not just "its result is discarded" — the `sh -c` call that mkdir's
-    // real directories under the remote ~/.claude must never be issued when
-    // the sandbox won't be used on this host at all.
+  it('skips the remote state-dir SSH round trip entirely when sandboxAvailable is not set (omp)', async () => {
+    await createRemotePty('s1', WORKTREE, host, { tool: 'omp', projectPath: PROJECT })
+    // Not just "its result is discarded" — the `sh -c` call that mkdir's a
+    // real directory under the remote home must never be issued when the
+    // sandbox won't be used on this host at all.
     expect(state.remoteArgvCalls.some((argv) => argv[0] === 'sh')).toBe(false)
   })
 
   it('omits the sandbox prefix when no projectPath is given, regardless of sandboxAvailable', async () => {
     await createRemotePty('s1', WORKTREE, host, {
-      tool: 'claude',
+      tool: 'omp',
       sandboxAvailable: true,
     })
     const argv = remoteAgentArgsFromCall(tmuxCall())
-    expect(argv).toEqual(buildAgentArgs({ tool: 'claude' }))
+    expect(argv).toEqual(buildAgentArgs({ tool: 'omp' }))
   })
 })
