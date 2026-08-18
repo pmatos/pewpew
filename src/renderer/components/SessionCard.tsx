@@ -248,7 +248,9 @@ export default function SessionCard({ session, thumbnail, style, onOpenSession, 
               title={
                 session.sandboxed
                   ? 'Sandboxed — Bash commands are confined to this worktree'
-                  : 'Not sandboxed — bwrap is unavailable, but file-tool writes are still blocked by the guard hook'
+                  : session.tool === 'claude'
+                    ? 'Not sandboxed — claude runs under --permission-mode=auto; file-tool writes are still blocked by the guard hook'
+                    : 'Not sandboxed — bwrap is unavailable, and this tool has no guard-hook fallback'
               }
             >
               sandbox

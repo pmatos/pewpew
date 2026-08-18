@@ -1,9 +1,13 @@
 // Pure derivation of the bubblewrap argv prefix that confines an agent
-// process to its session worktree. Claude Code's own sandbox only isolates
-// Bash subprocesses — the built-in Write/Edit tools bypass it entirely under
-// --dangerously-skip-permissions — so pewpew owns this boundary itself at the
-// tmux spawn layer instead. Kept free of fs/child_process so bind order (see
-// below) can be asserted directly in unit tests.
+// process to its session worktree. Used for codex and omp, both of which run
+// with their own approval checks bypassed (--dangerously-bypass-approvals-
+// and-sandbox / --auto-approve), so pewpew owns this write boundary itself at
+// the tmux spawn layer instead. claude does NOT go through this module — it
+// runs under --permission-mode=auto instead (see buildAgentArgs in
+// pty-manager.ts), relying on that mode's own approval gating plus the
+// worktree guard hook (host-bootstrap.ts) rather than an OS-level sandbox.
+// Kept free of fs/child_process so bind order (see below) can be asserted
+// directly in unit tests.
 //
 // The host filesystem is read-only by default (--ro-bind / /) — Bash writes
 // to anything outside the explicit writable mounts below (a sibling repo,
@@ -31,9 +35,10 @@
 // process tree (5 entries) is visible, and worktree writes, git operations,
 // and /tmp scratch space all continue to work normally.
 //
-// Verified against the real bwrap + claude CLI: a write to <project>, a
-// sibling worktree, or an arbitrary host path (e.g. $HOME) resolves EROFS
-// from both the Write tool and Bash, while worktree writes, `npm ci`,
+// Verified against real bwrap (originally with the claude CLI, back when
+// claude also ran through this module): a write to <project>, a sibling
+// worktree, or an arbitrary host path (e.g. $HOME) resolves EROFS from both
+// an agent's file-edit tool and Bash, while worktree writes, `npm ci`,
 // `git add`/`commit`, and `git config --local` all succeed.
 //
 // Bind order is load-bearing — later binds override earlier ones:

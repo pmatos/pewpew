@@ -42,7 +42,9 @@ interface SpawnOptions {
   // sessions where the GUI process inherits a usable PATH.
   agentPath?: string
   // Project root — the read-only boundary the bwrap sandbox draws around the
-  // worktree (see agent-sandbox.ts). Omitted skips sandboxing entirely.
+  // worktree (see agent-sandbox.ts), for codex/omp only. Omitted skips
+  // sandboxing entirely; claude skips it regardless of this value (see
+  // buildAgentArgs).
   projectPath?: string
   // Remote-only: whether bwrap was confirmed present on the target host by
   // the remote bootstrap probe. Local sessions self-check via
@@ -75,7 +77,7 @@ export function buildAgentArgs(options?: SpawnOptions): string[] {
     if (options?.continueSession) args.push('--continue')
     return args
   }
-  const args = [cmd, '--dangerously-skip-permissions']
+  const args = [cmd, '--permission-mode', 'auto']
   if (options?.continueSession) args.push('--continue')
   return args
 }
@@ -224,13 +226,11 @@ export function isSandboxAvailable(): boolean {
 // rest of $HOME, so a sandboxed write can't reach global config that every
 // future session across every project loads.
 //
-// For claude, the sandbox's writable exception is the whole ~/.claude dir
-// (see claudeDir() below and CLAUDE_DIR_WRITE_DENYLIST, which re-closes the
-// global-config entries the narrowing above still protects for the other
-// tools). This function is still called for claude, but only to locate —
-// and mkdir ahead of first run — the per-worktree resume-history marker dir
-// that hasClaudeConversationHistory (session-manager.ts) checks; it no
-// longer determines what the sandbox binds writable there.
+// claude is never sandboxed (see buildAgentArgs / buildLocalSandboxPrefix —
+// it runs under --permission-mode=auto instead), so this function is only
+// called for claude to locate — and mkdir ahead of first run — the
+// per-worktree resume-history marker dir that hasClaudeConversationHistory
+// (session-manager.ts) checks.
 //
 // claude and omp key their per-worktree directory off an encoded path; the
 // encoders are imported from agent-state-paths.ts rather than reimplemented
@@ -255,102 +255,6 @@ function agentStateDir(
   }
   return join(homeDir, '.claude', 'projects', encodeClaudeSessionDirName(worktreePath))
 }
-
-// Claude Code itself (not pewpew) keeps adding new per-invocation scratch
-// state directly under ~/.claude, each keyed by a name that isn't known
-// ahead of spawn: `session-env/<uuid>/` at SessionStart, and — discovered via
-// `ENOENT: ... lstat '~/.claude/tasks/session-<id>/.lock'` on `/implement` —
-// `tasks/<session-id>/` for the Task tools' lockfile. Enumerating each one
-// individually (as an earlier version of this file did for session-env
-// alone) means every future addition is a fresh crash report before it gets
-// added here. Instead, the whole ~/.claude directory is the writable
-// exception for the claude tool, and CLAUDE_DIR_WRITE_DENYLIST below
-// re-closes the specific entries that would turn a compromised sandboxed
-// session into a persistence vector for every later session (sandboxed or
-// not) that loads them.
-//
-// Deliberately NOT extended to ~/.claude.json (sibling of this dir, not a
-// child — mixes benign per-project bookkeeping with global MCP server
-// config, so opening it would let a sandboxed write plant a global MCP
-// server entry that auto-runs in every future session). Left read-only and
-// untested-as-broken: this very repo's own Claude Code sessions run with it
-// read-only for their whole lifetime with no observed failure. Revisit only
-// if a future error names it specifically, the way the tasks ENOENT did for
-// this directory.
-function claudeDir(homeDir: string = homedir()): string {
-  return join(homeDir, '.claude')
-}
-
-// Entries under ~/.claude that stay read-only even though the directory
-// itself is granted writable (see claudeDir above) — each is either an
-// execution/instruction surface loaded into every future session or a
-// credential, confirmed by inspecting a real ~/.claude, not guessed:
-//   settings.json / settings.backup.json   hook + permission config
-//   CLAUDE.md                              global memory, loaded every session
-//   statusline.sh                          shell script executed every render
-//   commands/, output-styles/, skills/     custom prompt/instruction content
-//   agents/                                user-level custom subagent
-//                                           definitions, loaded the same way
-//                                           as commands/skills/ across every
-//                                           project — including a `hooks`
-//                                           block in their frontmatter, which
-//                                           runs without the workspace-trust
-//                                           dialog a project-level hook gets
-//   plugins/                               third-party hooks/commands/MCP config
-//   .credentials.json                      OAuth token
-//   backups/                               holds .claude.json.backup.* — same
-//                                           footgun as settings.json if a
-//                                           backup is ever auto-restored
-//   daemon/                                control.key, the background
-//                                           claude-daemon's auth secret
-//   shell-snapshots/                       Bash tool state snapshots, sourced
-//                                           (not just parsed) by later Bash
-//                                           calls — a stronger persistence
-//                                           vector than most entries above,
-//                                           since it runs as shell code
-//                                           rather than being read as config.
-//                                           Confirmed safe to close: this
-//                                           whole multi-hour session ran with
-//                                           it read-only under the pre-#261
-//                                           narrow allowlist (verified via
-//                                           /proc/self/mountinfo — no bind
-//                                           for shell-snapshots — and by diff
-//                                           against the allowlist this dir
-//                                           was never part of), with heavy
-//                                           Bash tool use throughout and no
-//                                           observed failure — same evidence
-//                                           class already accepted below for
-//                                           ~/.claude.json.
-//
-// buildSandboxArgs emits these as --ro-bind-try, which silently SKIPS a
-// source that doesn't exist — before this file granted the whole ~/.claude
-// dir writable, a missing entry here was simply unreachable, so that skip
-// was harmless. Now it isn't: a sandboxed session could *create* an absent
-// entry (e.g. a from-scratch settings.json with a malicious hooks block) and
-// have it run in every later session. The directory entries below are
-// mkdir'd ahead of the bind for exactly this reason (an empty read-only dir
-// is harmless either way). The file entries CANNOT be pre-created the same
-// way without pewpew writing placeholder content into the user's real global
-// config — deliberately not done here; see the callers of this list for the
-// residual gap that leaves on a machine where one of them doesn't exist yet.
-const CLAUDE_DIR_RO_DIRS = [
-  'commands',
-  'output-styles',
-  'skills',
-  'agents',
-  'plugins',
-  'backups',
-  'daemon',
-  'shell-snapshots',
-]
-const CLAUDE_DIR_RO_FILES = [
-  'settings.json',
-  'settings.backup.json',
-  'CLAUDE.md',
-  'statusline.sh',
-  '.credentials.json',
-]
-const CLAUDE_DIR_WRITE_DENYLIST = [...CLAUDE_DIR_RO_DIRS, ...CLAUDE_DIR_RO_FILES]
 
 // Resolves the real .git directory for a project root. A standard worktree
 // has `<project>/.git` as a directory, but a gitfile root (submodule or
@@ -392,28 +296,27 @@ async function resolveRemoteGitDir(host: Host, projectPath: string): Promise<str
   return `${projectPath}/.git`
 }
 
-// Computes the agent's writable state directories ON the remote host and
-// mkdir's them in the same SSH round trip. This must run on the remote, not via
-// the local agentStateDir()/claudeDir(): the local helpers use local
+// Computes the agent's writable state directory ON the remote host and
+// mkdir's it in the same SSH round trip. This must run on the remote, not via
+// the local agentStateDir(): the local helper uses local
 // realpathSync/homedir/tmpdir and platform-local path.join, all of which
 // compute the wrong path for a remote session (wrong symlinks, wrong $HOME,
-// wrong tmpdir, wrong omp encoding). The shell canonicalization mirrors the
-// remote history probes in session-manager.ts exactly so the bind-source and
-// the resume-probe check the same directory. The script bytes and the parse of
-// their output are the contract of ./remote-agent-state; this is only the IO
-// seam that runs one against the other and degrades to unsandboxed on any SSH
-// failure.
+// wrong tmpdir, wrong omp encoding). Codex and omp only — claude is never
+// sandboxed (see buildAgentArgs), so it never needs this. The script bytes
+// and the parse of their output are the contract of ./remote-agent-state;
+// this is only the IO seam that runs one against the other and degrades to
+// unsandboxed on any SSH failure.
 async function resolveRemoteAgentStateDir(
   host: Host,
-  tool: AgentTool | undefined,
+  tool: 'codex' | 'omp',
   worktreePath: string
 ): Promise<RemoteAgentState | undefined> {
-  const script = buildRemoteAgentStateScript(tool, CLAUDE_DIR_RO_DIRS)
+  const script = buildRemoteAgentStateScript(tool)
   try {
     const result = await execRemote(host, ['sh', '-c', script, '_', worktreePath], {
       timeoutMs: 8000,
     })
-    return parseRemoteAgentState(tool, result)
+    return parseRemoteAgentState(result)
   } catch {
     // fall through — unsandboxed is the safe fallback
     return undefined
@@ -443,6 +346,15 @@ function buildLocalSandboxPrefix(
 ): string[] {
   if (!projectPath) return []
   if (tool === 'codex') ensureCodexProjectConfigDir(projectPath)
+  // This directory doubles as session-manager.ts's resume-history marker
+  // (hasClaudeConversationHistory/hasOmpConversationHistory check it via
+  // existsSync) — created unconditionally, before the agent has ever run,
+  // regardless of whether this tool ends up sandboxed below.
+  const stateDir = agentStateDir(tool, cwd)
+  mkdirSync(stateDir, { recursive: true })
+  // claude relies on --permission-mode=auto (see buildAgentArgs) instead of
+  // pewpew's own bwrap boundary — no sandbox prefix for it.
+  if (tool !== 'codex' && tool !== 'omp') return []
   const sandboxConfig = getSandboxConfig()
   const sandboxAvailable = isSandboxAvailable()
   if (sandboxConfig.enabled && !sandboxAvailable) {
@@ -451,63 +363,20 @@ function buildLocalSandboxPrefix(
         'unable to create the required namespaces/mounts), spawning without sandbox containment'
     )
   }
-  // This directory doubles as session-manager.ts's resume-history marker
-  // (hasClaudeConversationHistory/hasOmpConversationHistory check it via
-  // existsSync) — creating it here, before the agent has ever run, is why
-  // those checks test directory *contents* rather than mere existence. Kept
-  // even for claude below (whose sandbox exception is the whole ~/.claude
-  // dir, which already covers this subdirectory) purely for that marker.
-  const stateDir = agentStateDir(tool, cwd)
-  mkdirSync(stateDir, { recursive: true })
   const userWritablePaths = sandboxConfig.extraWritablePaths.map(resolvePath)
-  const extraWritablePaths: string[] = []
-  const extraReadOnlyPaths: string[] = []
-  if (tool === 'codex' || tool === 'omp') {
-    extraWritablePaths.push(stateDir, ...userWritablePaths)
-  } else {
-    const claudeDirPath = claudeDir()
-    extraWritablePaths.push(claudeDirPath, ...userWritablePaths)
-    if (sandboxConfig.enabled && sandboxAvailable) {
-      // mkdir the directory-type denylist entries so --ro-bind-try below can
-      // never silently skip one for being absent (see CLAUDE_DIR_RO_DIRS'
-      // comment) — an empty read-only dir is a harmless outcome either way.
-      // Gated on the sandbox actually being used: buildSandboxArgs ignores
-      // extraWritablePaths/extraReadOnlyPaths entirely when disabled (it
-      // returns [] up front), so these are real writes against the user's
-      // global ~/.claude with no payoff on a host that isn't sandboxing this
-      // session — and if one of these names is ever occupied by something
-      // other than a directory (a stray file, a dangling symlink from a
-      // dotfiles manager), a pointless one too. Each mkdir is isolated in
-      // its own try/catch so one bad entry can't throw out of createPty and
-      // abort a whole batch (e.g. session-manager.ts's relocateProject loop,
-      // which has no per-iteration try/catch) — that entry just falls back
-      // to the --ro-bind-try fail-open-on-absent gap already documented
-      // above, rather than crashing the spawn.
-      for (const name of CLAUDE_DIR_RO_DIRS) {
-        try {
-          mkdirSync(join(claudeDirPath, name), { recursive: true })
-        } catch (err) {
-          console.warn(
-            `Session ${sessionId}: could not prepare ~/.claude/${name} as a read-only sandbox ` +
-              `entry (${err instanceof Error ? err.message : String(err)}); leaving it to ` +
-              "--ro-bind-try's existing fail-open-on-absent behavior"
-          )
-        }
-      }
-    }
-    extraReadOnlyPaths.push(...CLAUDE_DIR_WRITE_DENYLIST.map((name) => join(claudeDirPath, name)))
-  }
+  const extraWritablePaths = [stateDir, ...userWritablePaths]
   const gitDir = resolveGitDir(projectPath)
   return buildSandboxArgs(projectPath, cwd, {
     enabled: sandboxConfig.enabled && sandboxAvailable,
     extraWritablePaths,
-    extraReadOnlyPaths,
+    extraReadOnlyPaths: [],
     gitDir,
   })
 }
 
 // Returns whether this session's agent process is running inside the bwrap
-// sandbox — false when projectPath was omitted, sandboxing is disabled in
+// sandbox — false when the tool is claude (never sandboxed, see
+// buildAgentArgs), projectPath was omitted, sandboxing is disabled in
 // config, or bwrap isn't available. Callers persist this on the Session so
 // the UI can show an accurate per-session indicator; it reflects reality at
 // spawn time only (reattachPty reuses the existing process and doesn't call
@@ -589,51 +458,51 @@ export async function createRemotePty(
         options.projectPath
       )
     }
-    // Remote sandbox wiring mirrors createPty's local path: resolve the real
-    // .git dir (gitfile roots) and the agent state dir(s) ON the remote host
-    // (computing it locally would use the wrong $HOME, symlinks, and omp
-    // encoding). resolveRemoteAgentStateDir also mkdir's the dir(s) in the same
-    // SSH round trip so bwrap's bind-source exists before the tmux spawn.
-    //
-    // Both resolutions must succeed to enable sandboxing: a missing
-    // remoteState means the agent's first write hits EROFS under --ro-bind /
-    // /, and a missing gitDir means the .git bind points at a file (gitfile
-    // root) or wrong path. A transient SSH failure on either degrades to
-    // unsandboxed (safe fallback) rather than launching a known-broken bwrap
-    // prefix.
-    //
-    // resolveRemoteAgentStateDir is skipped outright (not just its result
-    // discarded) when the sandbox won't be used on this host: it's an SSH
-    // round trip that mkdir's real directories under the user's remote
-    // ~/.claude, with no payoff — buildSandboxArgs ignores its result
-    // entirely when `enabled` is false below — mirroring the local path's
-    // equivalent gate in buildLocalSandboxPrefix.
-    const sandboxEnabled = getSandboxConfig().enabled
-    const canSandboxHost = sandboxEnabled && options?.sandboxAvailable === true
-    const [gitDir, remoteState] = await Promise.all([
-      resolveRemoteGitDir(host, options.projectPath),
-      canSandboxHost
-        ? resolveRemoteAgentStateDir(host, options.tool, cwd)
-        : Promise.resolve(undefined),
-    ])
-    const canSandbox = canSandboxHost && !!remoteState
-    const remoteClaudeDir = remoteState?.claudeDir
-    sandboxPrefix = buildSandboxArgs(options.projectPath, cwd, {
-      enabled: canSandbox,
-      extraWritablePaths: remoteState?.writablePaths ?? [],
-      extraReadOnlyPaths: [
-        ...(options.remoteSocketPath ? [posix.dirname(options.remoteSocketPath)] : []),
-        ...(remoteClaudeDir
-          ? CLAUDE_DIR_WRITE_DENYLIST.map((name) => posix.join(remoteClaudeDir, name))
-          : []),
-      ],
-      gitDir,
-    })
-    if (sandboxEnabled && options?.sandboxAvailable === true && !remoteState) {
-      console.warn(
-        `Session ${sessionId}: bwrap is available on host ${host.alias} but the remote ` +
-          'agent state directory could not be resolved, spawning without sandbox containment'
-      )
+    // claude is never sandboxed (see buildAgentArgs — it runs under
+    // --permission-mode=auto instead), so only codex/omp reach the bwrap
+    // wiring below.
+    if (options.tool === 'codex' || options.tool === 'omp') {
+      const tool = options.tool
+      // Remote sandbox wiring mirrors createPty's local path: resolve the real
+      // .git dir (gitfile roots) and the agent state dir ON the remote host
+      // (computing it locally would use the wrong $HOME, symlinks, and omp
+      // encoding). resolveRemoteAgentStateDir also mkdir's the dir in the same
+      // SSH round trip so bwrap's bind-source exists before the tmux spawn.
+      //
+      // Both resolutions must succeed to enable sandboxing: a missing
+      // remoteState means the agent's first write hits EROFS under --ro-bind /
+      // /, and a missing gitDir means the .git bind points at a file (gitfile
+      // root) or wrong path. A transient SSH failure on either degrades to
+      // unsandboxed (safe fallback) rather than launching a known-broken bwrap
+      // prefix.
+      //
+      // resolveRemoteAgentStateDir is skipped outright (not just its result
+      // discarded) when the sandbox won't be used on this host: it's an SSH
+      // round trip that mkdir's a real directory under the user's remote
+      // home, with no payoff — buildSandboxArgs ignores its result entirely
+      // when `enabled` is false below — mirroring the local path's
+      // equivalent gate in buildLocalSandboxPrefix.
+      const sandboxEnabled = getSandboxConfig().enabled
+      const canSandboxHost = sandboxEnabled && options?.sandboxAvailable === true
+      const [gitDir, remoteState] = await Promise.all([
+        resolveRemoteGitDir(host, options.projectPath),
+        canSandboxHost ? resolveRemoteAgentStateDir(host, tool, cwd) : Promise.resolve(undefined),
+      ])
+      const canSandbox = canSandboxHost && !!remoteState
+      sandboxPrefix = buildSandboxArgs(options.projectPath, cwd, {
+        enabled: canSandbox,
+        extraWritablePaths: remoteState?.writablePaths ?? [],
+        extraReadOnlyPaths: options.remoteSocketPath
+          ? [posix.dirname(options.remoteSocketPath)]
+          : [],
+        gitDir,
+      })
+      if (sandboxEnabled && options?.sandboxAvailable === true && !remoteState) {
+        console.warn(
+          `Session ${sessionId}: bwrap is available on host ${host.alias} but the remote ` +
+            'agent state directory could not be resolved, spawning without sandbox containment'
+        )
+      }
     }
   }
   const agentArgs = [...sandboxPrefix, ...buildAgentArgs(options)]
