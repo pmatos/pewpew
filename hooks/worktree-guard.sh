@@ -2,13 +2,16 @@
 # pewpew worktree write guard — PreToolUse hook for Write/Edit/MultiEdit/NotebookEdit.
 #
 # Claude Code's own sandbox only isolates Bash subprocesses; the built-in file
-# tools go through the permission system instead, which --dangerously-skip-permissions
-# (pewpew always passes) disables entirely. This hook is the only thing left
-# that stops an agent from writing outside its session worktree via those
-# tools, for Claude Code sessions only — Codex and omp sessions have their own
-# separate hook mechanisms and are not wired to this guard (see
-# hook-installer.ts). It does not see Bash writes — that containment is a
-# separate layer.
+# tools go through the permission system instead. pewpew runs claude under
+# --permission-mode=auto (see buildAgentArgs in pty-manager.ts) rather than
+# --dangerously-skip-permissions, so that system's own classifier is in the
+# loop — but it's a probabilistic approval mode, not a hard boundary, and its
+# own docs note it can be bypassed on context compaction. This hook is the
+# backstop that unconditionally blocks writes outside the session worktree
+# via those tools, for Claude Code sessions only — Codex and omp sessions
+# have their own separate hook mechanisms and are not wired to this guard
+# (see hook-installer.ts). It does not see Bash writes — that containment is
+# a separate layer.
 #
 # This hook only validates the target and exits; the actual Write/Edit runs
 # afterward as a separate step, so a TOCTOU race between validation and write
@@ -70,22 +73,20 @@ fi
 # /tmp (e.g. macOS's /tmp -> /private/tmp) still matches.
 tmp_real=$(cd /tmp 2>/dev/null && pwd -P)
 
-# ~/.claude is exempt from the worktree boundary too, mirroring the bwrap
-# sandbox's own writable exception for the claude tool (claudeDir() in
-# pty-manager.ts): Claude Code keeps adding per-invocation scratch state
-# directly under ~/.claude (session-env/, tasks/, and its cross-project
-# auto-memory system under projects/<other-project>/memory/, keyed by the
-# MAIN repo's path — not this worktree's), so a write there is expected and
-# this hook would otherwise be the one thing left blocking it even though
-# the bwrap mount already permits it. CLAUDE_DIR_WRITE_DENYLIST below
-# re-closes the specific entries that would turn a compromised sandboxed
-# write into a persistence vector for every later session (sandboxed or
-# not) that loads them — hand-synced against the identically-named list in
-# pty-manager.ts; nothing enforces the two staying identical, so a change to
-# one must be mirrored in the other by hand. Canonicalized the same way as
-# root_real/tmp_real so a symlinked ~/.claude (e.g. a dotfiles-managed home)
-# still matches, and gated the same way below on being non-empty so a failed
-# `cd` can't collapse the case pattern into a match-everything wildcard.
+# ~/.claude is exempt from the worktree boundary too: Claude Code keeps
+# adding per-invocation scratch state directly under ~/.claude
+# (session-env/, tasks/, and its cross-project auto-memory system under
+# projects/<other-project>/memory/, keyed by the MAIN repo's path — not
+# this worktree's), so a write there is expected and this hook would
+# otherwise be the one thing left blocking it. claude sessions are never
+# bwrap-sandboxed (see buildAgentArgs in pty-manager.ts), so
+# CLAUDE_DIR_WRITE_DENYLIST below — this hook's own list, not shared with
+# any other file — is what re-closes the specific entries that would turn
+# a compromised write into a persistence vector for every later session
+# that loads them. Canonicalized the same way as root_real/tmp_real so a
+# symlinked ~/.claude (e.g. a dotfiles-managed home) still matches, and
+# gated the same way below on being non-empty so a failed `cd` can't
+# collapse the case pattern into a match-everything wildcard.
 #
 # Deliberately NOT extended to ~/.claude.json (sibling of this dir, not a
 # child — mixes benign per-project bookkeeping with global MCP server
