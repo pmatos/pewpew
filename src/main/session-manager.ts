@@ -72,6 +72,7 @@ import { resolveOriginDefaultBase, type GitRunner } from './origin-base'
 import { branchRefExists } from './branch-ref'
 import { classifyAutoReconnectResult } from './reconnect-outcome'
 import { deriveSessionFields } from './session-fields'
+import { buildSession } from './session-record'
 import {
   numbersInUse,
   selectNumbersToOpen,
@@ -475,13 +476,12 @@ async function adoptWorktree(
   const id = randomUUID().slice(0, 8)
   const projectName = basename(projectPath)
   const worktreeName = label || (await deriveLabel(worktreePath))
-  const tmuxSession = `pewpew-${id}`
   const branch = resolveBranchFromWorktree(worktreePath, worktreeName, projectName)
 
   await installAgentHooks(tool, worktreePath)
   const sandboxed = createPty(id, worktreePath, { tool, projectPath })
 
-  const session: Session = {
+  const session = buildSession({
     id,
     hostId: null,
     projectPath,
@@ -489,15 +489,11 @@ async function adoptWorktree(
     worktreeName,
     worktreePath: canonical,
     branch,
-    issueNumber: parseIssueNumber(worktreeName, branch),
-    pid: 0,
-    tmuxSession,
-    status: 'running',
-    lastActivity: Date.now(),
-    hookEvents: [],
     tool,
     sandboxed,
-  }
+    now: Date.now(),
+    issueNumber: parseIssueNumber(worktreeName, branch),
+  })
 
   registerSpawnedSession(session)
 
@@ -676,7 +672,6 @@ async function adoptRemoteWorktree(
   const remoteProject = getRemoteProject(hostId, projectPath)
   const worktreeName = label || posix.basename(worktreePath)
   const id = randomUUID().slice(0, 8)
-  const tmuxSession = `pewpew-${id}`
 
   const { branch, sandboxed } = await remoteHostRuntime.withPreparedHost(
     host,
@@ -726,7 +721,7 @@ async function adoptRemoteWorktree(
     }
   )
 
-  const session: Session = {
+  const session = buildSession({
     id,
     hostId,
     projectPath,
@@ -734,17 +729,12 @@ async function adoptRemoteWorktree(
     worktreeName,
     worktreePath,
     branch,
-    issueNumber: parseIssueNumber(worktreeName, branch),
-    pid: 0,
-    tmuxSession,
-    status: 'running',
-    connectionState: 'live',
-    lastActivity: Date.now(),
-    hookEvents: [],
     tool,
     sandboxed,
-    ...(remoteProject.repoFingerprint ? { repoFingerprint: remoteProject.repoFingerprint } : {}),
-  }
+    now: Date.now(),
+    issueNumber: parseIssueNumber(worktreeName, branch),
+    repoFingerprint: remoteProject.repoFingerprint,
+  })
 
   registerSpawnedSession(session)
   onSessionsChanged()
@@ -770,7 +760,6 @@ async function createRemoteSession(
   assertNoConflictingToolOnWorktree(allSessions(), hostId, worktreePath, effectiveTool)
 
   const id = randomUUID().slice(0, 8)
-  const tmuxSession = `pewpew-${id}`
   const branchName = worktreeBranchName(remoteProject.name, worktreeName)
   const baseRef = effectiveWorktreeBase(options)
 
@@ -874,7 +863,7 @@ async function createRemoteSession(
     }
   )
 
-  const session: Session = {
+  const session = buildSession({
     id,
     hostId,
     projectPath,
@@ -882,17 +871,12 @@ async function createRemoteSession(
     worktreeName,
     worktreePath,
     branch,
-    issueNumber: parseIssueNumber(worktreeName, branch),
-    pid: 0,
-    tmuxSession,
-    status: 'running',
-    connectionState: 'live',
-    lastActivity: Date.now(),
-    hookEvents: [],
     tool: effectiveTool,
     sandboxed,
-    ...(remoteProject.repoFingerprint ? { repoFingerprint: remoteProject.repoFingerprint } : {}),
-  }
+    now: Date.now(),
+    issueNumber: parseIssueNumber(worktreeName, branch),
+    repoFingerprint: remoteProject.repoFingerprint,
+  })
 
   registerSpawnedSession(session)
   onSessionsChanged()
@@ -972,7 +956,6 @@ async function createRemotePrSession(
       }
 
       const id = randomUUID().slice(0, 8)
-      const tmuxSession = `pewpew-${id}`
 
       // Fetch the PR head into the local branch we'll check out; planPrWorktree
       // picked the remote (origin, or the overridden repo's URL when a fork clone
@@ -1052,7 +1035,7 @@ async function createRemotePrSession(
         sandboxAvailable,
       })
 
-      const session: Session = {
+      const session = buildSession({
         id,
         hostId,
         projectPath,
@@ -1060,21 +1043,15 @@ async function createRemotePrSession(
         worktreeName,
         worktreePath,
         branch: resolvedBranch,
-        prNumber,
-        ...forkFields,
-        issueNumber: parseIssueNumber(worktreeName, resolvedBranch, prInfo.title),
-        pid: 0,
-        tmuxSession,
-        status: 'running',
-        connectionState: 'live',
-        lastActivity: Date.now(),
-        hookEvents: [],
         tool: effectiveTool,
         sandboxed,
-        ...(remoteProject.repoFingerprint
-          ? { repoFingerprint: remoteProject.repoFingerprint }
-          : {}),
-      }
+        now: Date.now(),
+        issueNumber: parseIssueNumber(worktreeName, resolvedBranch, prInfo.title),
+        prNumber,
+        prIsFork: forkFields.prIsFork,
+        prHeadRepo: forkFields.prHeadRepo,
+        repoFingerprint: remoteProject.repoFingerprint,
+      })
 
       registerSpawnedSession(session)
       onSessionsChanged()
@@ -2229,7 +2206,6 @@ async function createRemoteIssueSession(
       }
 
       const id = randomUUID().slice(0, 8)
-      const tmuxSession = `pewpew-${id}`
       let originRef: string
       try {
         originRef = await resolveOriginDefaultBase((argv) =>
@@ -2302,7 +2278,7 @@ async function createRemoteIssueSession(
         sandboxAvailable,
       })
 
-      const session: Session = {
+      const session = buildSession({
         id,
         hostId,
         projectPath,
@@ -2310,19 +2286,12 @@ async function createRemoteIssueSession(
         worktreeName,
         worktreePath,
         branch: resolvedBranch,
-        issueNumber,
-        pid: 0,
-        tmuxSession,
-        status: 'running',
-        connectionState: 'live',
-        lastActivity: Date.now(),
-        hookEvents: [],
         tool: effectiveTool,
         sandboxed,
-        ...(remoteProject.repoFingerprint
-          ? { repoFingerprint: remoteProject.repoFingerprint }
-          : {}),
-      }
+        now: Date.now(),
+        issueNumber,
+        repoFingerprint: remoteProject.repoFingerprint,
+      })
 
       registerSpawnedSession(session)
       onSessionsChanged()
