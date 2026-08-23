@@ -1,3 +1,10 @@
+## [0.10.5](https://github.com/pmatos/pewpew/compare/v0.10.4...v0.10.5) (2026-08-23)
+
+
+### Bug Fixes
+
+* **hooks:** exempt ~/.claude from the worktree write guard ([#285](https://github.com/pmatos/pewpew/issues/285)) ([a0f686c](https://github.com/pmatos/pewpew/commit/a0f686cb505811ce0c9a8f6025a5b057bb96aa70))
+
 ## [0.10.4](https://github.com/pmatos/pewpew/compare/v0.10.3...v0.10.4) (2026-08-02)
 
 
