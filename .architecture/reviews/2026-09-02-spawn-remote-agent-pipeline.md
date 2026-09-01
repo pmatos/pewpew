@@ -323,4 +323,40 @@ Two design constraints are fixed before the design pass, from reading all five r
 
 ## Design
 
-_Filled in step 4 (design-it-twice + adjudication), after this report and the backlog were first committed._
+Three interfaces were designed in parallel by independent sub-agents, then adjudicated by a fourth sub-agent that authored none of them, against the fixed criteria in order: depth, locality, seam placement, test surface, blast radius.
+
+**Winner — Design A (minimal interface surface).** One deep function plus the forced `installRemoteAgentHooks` re-export:
+
+```ts
+// src/main/remote-agent-spawn.ts
+export async function spawnRemoteAgent(args: {
+  id: string
+  host: Host
+  tool: AgentTool
+  worktreePath: string
+  projectPath: string
+  agentPath: string // resolved by the caller — the per-caller error mode stays there
+  branchFallback: string // 'HEAD' | branchName | branch
+  prepared: Omit<PreparedRemoteHost, 'agentPaths'>
+}): Promise<{ branch: string; sandboxed: boolean }>
+
+export async function installRemoteAgentHooks(
+  tool: AgentTool,
+  host: Host,
+  worktreePath: string,
+  notifyScriptPath: string,
+  guardScriptPath: string
+): Promise<void> // moved verbatim from session-manager.ts:593; still called by out-of-scope reviveSession
+```
+
+Each of the four callbacks becomes `async (prepared) => { const agentPath = prepared.agentPaths[tool]; if (!agentPath) <caller's own throw|return>; …provision worktree…; return spawnRemoteAgent({ id, host, tool, worktreePath, projectPath, agentPath, branchFallback, prepared }) }`. The primitive owns the `rev-parse --abbrev-ref HEAD` + `.trim() || fallback`, the hooks-before-pty ordering, and the `createRemotePty` options object including the `ompHookScriptPath → notifyHookPath` rename.
+
+**Runner-up design — Design B (optimise for the common caller).** Same one-function shape, but its result was typed `Pick<SessionRecordInput, 'branch' | 'sandboxed'>` to spread straight into `buildSession`. It lost on **locality**: dovetailing the return couples `remote-agent-spawn.ts` to `session-record.ts` for zero call-site benefit — TypeScript's structural typing already lets a neutral `{ branch, sandboxed }` spread into `buildSession({ ...result })`. Depth could not separate A from B (identical interface shape); locality was the first criterion that did, in A's favour.
+
+**Eliminated — Design C (ports-and-adapters).** A pure orchestrator `spawnRemoteAgent(spawner, branchFallback)` over an injected 3-method `RemoteAgentSpawner` (`readBranch`/`installHooks`/`spawnPty`) plus a `createRemoteAgentSpawner(ctx)` factory. It was eliminated first, on the two highest criteria: **depth** (the caller must learn two functions and a port type for identical hidden behaviour) and **seam placement** (the port is a _hypothetical_ seam — C itself concedes "no production polymorphism exists here", exactly one real adapter). Its one genuine edge, a `vi.mock`-free pure ordering test (criterion 4, test surface), does not outweigh two higher criteria — and it is narrower than claimed, since the `notifyHookPath` rename lives inside the concrete `spawnPty` and is invisible to a faked spawner, so C would still need the `vi.mock` path to guard the footgun.
+
+**Refinements absorbed into the winner** (none change A's one-function shape): keep the neutral `{ branch, sandboxed }` return (not B's `SessionRecordInput` dovetail); type `prepared` as `Omit<PreparedRemoteHost, 'agentPaths'>` (the natural rest-destructure type, and it makes the "caller keeps the agent-path error" contract legible); keep `installRemoteAgentHooks` exported (revive at `session-manager.ts:1579` imports it); and adopt B's strongest test as a regression guard — assert `createRemotePty` receives exactly the mapped options with `notifyHookPath === ompHookScriptPath`, not a weak `toHaveBeenCalled()`.
+
+**Verified before implementation**: the prepared-host callback type is `PreparedRemoteHost` (`remote-host-runtime.ts:19`, six fields); `createRemotePty(sessionId, cwd, host, options?): Promise<boolean>` (`pty-manager.ts:446`); the five codex/remote hook-installer functions are used in session-manager _only_ inside `installRemoteAgentHooks`, so they migrate cleanly; and none of `pty-manager`, `hook-installer`, `remote-command`, `host-connection` imports `session-manager`, so the new `session-manager → remote-agent-spawn` edge forms no cycle.
+
+_Designs produced in parallel by sub-agents; adjudicated by a separate sub-agent. Report and backlog were committed before this section was written._
