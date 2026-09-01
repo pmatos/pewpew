@@ -4,13 +4,13 @@ Persisted candidate memory for the `pm-deepen` routine. Reconciled against `gh` 
 
 ## spawn-remote-agent-pipeline
 
-- **Status**: proposed
+- **Status**: in-flight
 - **Score**: 23/25 (leverage 5, locality 4, blast radius 2, heat 5)
-- **Files**: ~3–4 estimated
+- **Files**: 3 (session-manager.ts + new remote-agent-spawn.ts + its test)
 - **Modules**: `src/main/session-manager.ts`, new `src/main/remote-agent-spawn.ts`
 - **Summary**: Extract the verbatim post-worktree remote spawn tail (resolve branch → install hooks → create pty) shared by the four remote create/adopt paths into one deep primitive; leave revive as-is.
 - **First seen**: 2026-09-02
-- **PR**: (to be set in-flight when the PR opens)
+- **PR**: #300
 
 ## remote-reconnect-coordinator
 
