@@ -12,6 +12,15 @@ Persisted candidate memory for the `pm-deepen` routine. Reconciled against `gh` 
 - **First seen**: 2026-09-02
 - **PR**: #300
 
+### Run 2026-09-02 — complete
+
+- **Outcome**: complete
+- **Stopped at**: step 6 — PR opened
+- **Branch**: `sym/pewpew/routine/refactor-audit/01M1FK9R13`, adopted (all four adoption conditions held; not renamed — the harness note about a `pm-deepen/<slug>` branch describes the create-branch path only)
+- **Committed**: report, backlog, `remote-agent-spawn.ts` + its test, `session-manager.ts` (4 commits)
+- **Evidence**: PR #300; gate green — tsc, eslint, vitest 866/866 (under `TMPDIR=/tmp`), build
+- **Next**: review/merge #300; next firing picks up `remote-reconnect-coordinator` (21/25)
+
 ## remote-reconnect-coordinator
 
 - **Status**: proposed

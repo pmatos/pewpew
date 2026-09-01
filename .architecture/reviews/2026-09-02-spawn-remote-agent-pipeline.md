@@ -3,6 +3,7 @@
 **Scope**: Hot-spot-weighted scan. `git log` over the last ~120 non-merge commits puts `src/main/session-manager.ts` (2541 lines, 35 touches) far ahead of everything else, with its remote-host neighbours (`pty-manager`, `host-bootstrap`, `remote-host-runtime`) next. Two exploration sub-agents walked (a) the main-process session/host modules and (b) the renderer, shared types, and support modules. No `CONTEXT.md` and no ADRs exist in this repo, so no recorded decision constrains the candidates.
 
 **Picked**: `spawn-remote-agent-pipeline` — see the PR and `.architecture/backlog.md`.
+**Branch**: `sym/pewpew/routine/refactor-audit/01M1FK9R13`, **adopted** (non-default, 0 unique commits, no upstream, unpublished — all four conditions held; kept the caller's name, not renamed to `pm-deepen/<slug>`).
 
 **Degradations**: none. `gh` authenticated; both exploration sub-agents ran; `codebase-design` vocabulary loaded.
 
