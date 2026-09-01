@@ -38,7 +38,7 @@ vi.mock('fs', async () => {
     readFileSync: (p: string, enc?: BufferEncoding) =>
       p.endsWith('sessions.json') && fsState.sessionsJson !== null
         ? fsState.sessionsJson
-        : actual.readFileSync(p, enc),
+        : actual.readFileSync(p, enc as BufferEncoding),
   }
 })
 
