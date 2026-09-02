@@ -644,6 +644,57 @@ describe('spawnRemoteSession — unified remote spawn seam', () => {
     expect(ranWorktreeAdd()).toBe(false)
   })
 
+  it('PR (same-repo, happy path): spawns through the seam and threads prNumber onto the session', async () => {
+    state.remoteProjects = [{ hostId: 'h1', path: projectPath, name: 'proj' }]
+    const worktreePath = '/remote/proj/.claude/worktrees/pr-42'
+    // gh pr view → an open, same-repo PR on branch feature/x.
+    state.execRemoteResults.set(
+      [
+        'sh',
+        '-c',
+        'cd "$1" && gh pr view "$2" --json headRefName,state,title,isCrossRepository,headRepositoryOwner,headRepository',
+        '_',
+        projectPath,
+        '42',
+        '',
+      ].join(' '),
+      {
+        stdout: JSON.stringify({ headRefName: 'feature/x', state: 'OPEN', title: 'Add feature x' }),
+        stderr: '',
+        code: 0,
+        timedOut: false,
+      }
+    )
+    // The seam's authoritative branch resolve after the worktree exists.
+    state.execRemoteResults.set(
+      ['git', '-C', worktreePath, 'rev-parse', '--abbrev-ref', 'HEAD'].join(' '),
+      { stdout: 'feature/x\n', stderr: '', code: 0, timedOut: false }
+    )
+    const sm = await loadSessionManager()
+
+    const result = await sm.createPrSession(projectPath, 42, 'h1', {})
+
+    expect(result).toMatchObject({
+      hostId: 'h1',
+      worktreeName: 'pr-42',
+      worktreePath,
+      branch: 'feature/x',
+      prNumber: 42,
+      tool: 'claude',
+      connectionState: 'live',
+    })
+    expect(state.createRemotePtyCalls).toEqual([
+      {
+        sessionId: (result as Session).id,
+        cwd: worktreePath,
+        hostId: 'h1',
+        tool: 'claude',
+        notifyHookPath: '/tmp/omp-notify-v1.ts',
+        remoteSocketPath: '/tmp/remote.sock',
+      },
+    ])
+  })
+
   it('PR: the missing-agent check precedes the gh probe (returns the agent message, not a gh error)', async () => {
     state.remoteProjects = [{ hostId: 'h1', path: projectPath, name: 'proj' }]
     state.agentPaths = { claude: '/r/bin/claude' } // codex not installed

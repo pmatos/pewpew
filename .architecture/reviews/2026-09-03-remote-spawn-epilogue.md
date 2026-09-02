@@ -370,5 +370,9 @@ get to decide. **Winner: A.**
    (the only FS mutation), and `createRemotePty` stays _inside_ the lease (it
    independently retains the connection at `pty-manager.ts:536`, so building the session
    after `release()` is safe).
-5. **Drop redundant `ctx` fields** — do not echo `projectPath`/`worktreeName`/
-   `worktreePath` both as top-level args and inside `ctx`.
+5. **`ctx` fields** — `worktreeName` was dropped from `ctx` (no producer needs it).
+   `projectPath` and `worktreePath` are kept in `ctx` **deliberately**: every
+   producer destructures them, and handing them through `ctx` (rather than relying
+   on the outer closure's variables) keeps each producer's git argv reading off one
+   object and avoids closure-capture ambiguity. The mild redundancy with
+   `spawnRemoteSession`'s own args is the accepted cost.
