@@ -64,7 +64,12 @@ import {
   planPrWorktree,
   type PrViewInfo,
 } from './pr-worktree-planner'
-import { exec as execRemote, runtimeStateFor, type HostConnectionState } from './host-connection'
+import {
+  exec as execRemote,
+  runtimeStateFor,
+  type ExecResult,
+  type HostConnectionState,
+} from './host-connection'
 import { remoteHostRuntime, type PreparedRemoteHostLease } from './remote-host-runtime'
 import { createPrLookup, parseOwnerFromRemoteUrl } from './github'
 import { parseIssueNumber, worktreeBranchName } from './branch-naming'
@@ -661,19 +666,58 @@ export async function createRemoteSessionForWorktree(
   }
 }
 
-async function adoptRemoteWorktree(
+// The git-capable handle a worktree producer receives. It exposes only the host
+// and two bound git runners (adapters over execRemote/expectRemoteOk) and
+// deliberately withholds the prepared-host secrets (hook script paths, socket,
+// agentPaths): a producer brings a worktree into being; it cannot touch hook
+// wiring. `projectPath`/`worktreePath` are echoed for convenience.
+interface RemoteWorktreeContext {
+  host: Host
+  projectPath: string
+  worktreePath: string
+  run(argv: string[], opts?: { timeoutMs?: number }): Promise<ExecResult>
+  runOk(argv: string[], message: string): Promise<string>
+}
+
+// The varying middle of a remote spawn, as a value. On success it supplies the
+// branch fallback for the seam's authoritative `rev-parse`, an optional PR title
+// hint fed to issueNumber derivation, and the literal extra buildSession fields.
+type ProducedWorktree = {
+  branch: string
+  issueTitleHint?: string
+  session?: { issueNumber?: number; prNumber?: number; prIsFork?: boolean; prHeadRepo?: string }
+}
+// A producer returns `{ error }` for a *user-facing* pre-worktree failure (gh
+// probe, PR lookup, plan, worktree add) — surfaced as `Session | string` — and
+// THROWS for an unexpected/precondition failure, which propagates as an Error
+// (releasing the prepared-host lease on the way out).
+type WorktreeOutcome = ProducedWorktree | { error: string }
+
+type ProduceWorktree = (ctx: RemoteWorktreeContext) => Promise<WorktreeOutcome>
+
+// The single deep seam for remote session birth. It owns the whole prologue
+// (prepared-host lease + the one missing-agent contract) and the whole epilogue
+// (resolve branch → install hooks → create pty → build/register/broadcast),
+// bracketing a caller-supplied `produce` step that brings the worktree into
+// being. The agent check runs before `produce` — the only filesystem mutation —
+// so a missing agent never leaves an orphan worktree. Returns a user-facing
+// string for any refusal: `Session | string` callers forward it, `Promise<Session>`
+// callers pass it through `orThrow`.
+async function spawnRemoteSession(
   hostId: string,
   projectPath: string,
+  worktreeName: string,
   worktreePath: string,
-  label: string | undefined,
-  tool: AgentTool
-): Promise<Session> {
+  tool: AgentTool,
+  produce: ProduceWorktree
+): Promise<Session | string> {
   const host = getRequiredHost(hostId)
   const remoteProject = getRemoteProject(hostId, projectPath)
-  const worktreeName = label || posix.basename(worktreePath)
   const id = randomUUID().slice(0, 8)
 
-  const { branch, sandboxed } = await remoteHostRuntime.withPreparedHost(
+  const outcome = await remoteHostRuntime.withPreparedHost<
+    { error: string } | { resolvedBranch: string; sandboxed: boolean; produced: ProducedWorktree }
+  >(
     host,
     async ({
       notifyScriptPath,
@@ -685,19 +729,17 @@ async function adoptRemoteWorktree(
     }) => {
       const agentPath = agentPaths[tool]
       if (!agentPath) {
-        throw new Error(`${tool} is not installed on host ${host.label || host.alias}`)
+        return { error: `${tool} is not installed on host ${host.label || host.alias}.` }
       }
 
-      const isWorktree = (
-        await expectRemoteOk(
-          host,
-          ['git', '-C', worktreePath, 'rev-parse', '--is-inside-work-tree'],
-          'Failed to validate remote worktree'
-        )
-      ).trim()
-      if (isWorktree !== 'true') {
-        throw new Error(`${worktreePath} is not a valid git worktree`)
-      }
+      const produced = await produce({
+        host,
+        projectPath,
+        worktreePath,
+        run: (argv, opts) => execRemote(host, argv, opts),
+        runOk: (argv, message) => expectRemoteOk(host, argv, message),
+      })
+      if ('error' in produced) return { error: produced.error }
 
       const resolvedBranch =
         (
@@ -706,10 +748,10 @@ async function adoptRemoteWorktree(
             ['git', '-C', worktreePath, 'rev-parse', '--abbrev-ref', 'HEAD'],
             'Failed to resolve remote branch'
           )
-        ).trim() || 'HEAD'
+        ).trim() || produced.branch
 
       await installRemoteAgentHooks(tool, host, worktreePath, notifyScriptPath, guardScriptPath)
-      const wasSandboxed = await createRemotePty(id, worktreePath, host, {
+      const sandboxed = await createRemotePty(id, worktreePath, host, {
         tool,
         agentPath,
         projectPath,
@@ -717,10 +759,13 @@ async function adoptRemoteWorktree(
         remoteSocketPath,
         sandboxAvailable,
       })
-      return { branch: resolvedBranch, sandboxed: wasSandboxed }
+      return { resolvedBranch, sandboxed, produced }
     }
   )
 
+  if ('error' in outcome) return outcome.error
+
+  const { produced } = outcome
   const session = buildSession({
     id,
     hostId,
@@ -728,17 +773,60 @@ async function adoptRemoteWorktree(
     projectName: remoteProject.name,
     worktreeName,
     worktreePath,
-    branch,
+    branch: outcome.resolvedBranch,
     tool,
-    sandboxed,
+    sandboxed: outcome.sandboxed,
     now: Date.now(),
-    issueNumber: parseIssueNumber(worktreeName, branch),
+    issueNumber:
+      produced.session?.issueNumber ??
+      parseIssueNumber(worktreeName, outcome.resolvedBranch, produced.issueTitleHint),
+    prNumber: produced.session?.prNumber,
+    prIsFork: produced.session?.prIsFork,
+    prHeadRepo: produced.session?.prHeadRepo,
     repoFingerprint: remoteProject.repoFingerprint,
   })
 
   registerSpawnedSession(session)
   onSessionsChanged()
   return session
+}
+
+// Adapt the seam's string-channel refusal to a thrown Error, for the two remote
+// entrypoints whose public contract is `Promise<Session>` (adopt, create).
+function orThrow(result: Session | string): Session {
+  if (typeof result === 'string') throw new Error(result)
+  return result
+}
+
+async function adoptRemoteWorktree(
+  hostId: string,
+  projectPath: string,
+  worktreePath: string,
+  label: string | undefined,
+  tool: AgentTool
+): Promise<Session> {
+  const worktreeName = label || posix.basename(worktreePath)
+  return orThrow(
+    await spawnRemoteSession(
+      hostId,
+      projectPath,
+      worktreeName,
+      worktreePath,
+      tool,
+      async ({ worktreePath, runOk }) => {
+        const isWorktree = (
+          await runOk(
+            ['git', '-C', worktreePath, 'rev-parse', '--is-inside-work-tree'],
+            'Failed to validate remote worktree'
+          )
+        ).trim()
+        if (isWorktree !== 'true') {
+          throw new Error(`${worktreePath} is not a valid git worktree`)
+        }
+        return { branch: 'HEAD' }
+      }
+    )
+  )
 }
 
 async function createRemoteSession(
@@ -748,7 +836,6 @@ async function createRemoteSession(
   options: CreateSessionOptions = {}
 ): Promise<Session> {
   const effectiveTool: AgentTool = options.tool ?? getConfig().defaultTool
-  const host = getRequiredHost(hostId)
   const remoteProject = getRemoteProject(hostId, projectPath)
   const worktreeName = name || `session-${randomUUID().slice(0, 8)}`
   const worktreePath = posix.join(projectPath, '.claude', 'worktrees', worktreeName)
@@ -759,128 +846,70 @@ async function createRemoteSession(
   // worktree, so a same-tool first record must not mask a mismatched later one.
   assertNoConflictingToolOnWorktree(allSessions(), hostId, worktreePath, effectiveTool)
 
-  const id = randomUUID().slice(0, 8)
   const branchName = worktreeBranchName(remoteProject.name, worktreeName)
   const baseRef = effectiveWorktreeBase(options)
 
-  const { branch, sandboxed } = await remoteHostRuntime.withPreparedHost(
-    host,
-    async ({
-      notifyScriptPath,
-      guardScriptPath,
-      ompHookScriptPath,
-      remoteSocketPath,
-      sandboxAvailable,
-      agentPaths,
-    }) => {
-      const agentPath = agentPaths[effectiveTool]
-      if (!agentPath) {
-        throw new Error(`${effectiveTool} is not installed on host ${host.label || host.alias}`)
-      }
-
-      if (baseRef === 'origin-default') {
-        const originRef = await resolveOriginDefaultBase((argv) =>
-          expectRemoteOk(host, ['git', '-C', projectPath, ...argv], 'git failed').then(
-            (stdout) => ({
-              stdout,
-            })
+  return orThrow(
+    await spawnRemoteSession(
+      hostId,
+      projectPath,
+      worktreeName,
+      worktreePath,
+      effectiveTool,
+      async ({ host, projectPath, worktreePath, run, runOk }) => {
+        if (baseRef === 'origin-default') {
+          const originRef = await resolveOriginDefaultBase((argv) =>
+            runOk(['git', '-C', projectPath, ...argv], 'git failed').then((stdout) => ({ stdout }))
           )
-        )
-        const adoption = await createOrAdoptWorktree({
-          addNewBranch: async () => {
-            await expectRemoteOk(
-              host,
-              [
-                'git',
-                '-C',
-                projectPath,
-                'worktree',
-                'add',
-                worktreePath,
-                '--no-track',
-                '-b',
-                branchName,
-                originRef,
-              ],
+          const adoption = await createOrAdoptWorktree({
+            addNewBranch: async () => {
+              await runOk(
+                [
+                  'git',
+                  '-C',
+                  projectPath,
+                  'worktree',
+                  'add',
+                  worktreePath,
+                  '--no-track',
+                  '-b',
+                  branchName,
+                  originRef,
+                ],
+                'Failed to create remote worktree'
+              )
+            },
+            branchExists: () => remoteBranchExists(host, projectPath, branchName),
+            adoptExistingBranch: async () => {
+              await runOk(
+                ['git', '-C', projectPath, 'worktree', 'add', worktreePath, branchName],
+                'Failed to create remote worktree'
+              )
+            },
+          })
+          if (!adoption.ok) throw adoption.cause
+        } else {
+          const addWithBranch = await run([
+            'git',
+            '-C',
+            projectPath,
+            'worktree',
+            'add',
+            worktreePath,
+            '-b',
+            branchName,
+          ])
+          if (addWithBranch.timedOut || addWithBranch.code !== 0) {
+            await runOk(
+              ['git', '-C', projectPath, 'worktree', 'add', worktreePath],
               'Failed to create remote worktree'
             )
-          },
-          branchExists: () => remoteBranchExists(host, projectPath, branchName),
-          adoptExistingBranch: async () => {
-            await expectRemoteOk(
-              host,
-              ['git', '-C', projectPath, 'worktree', 'add', worktreePath, branchName],
-              'Failed to create remote worktree'
-            )
-          },
-        })
-        if (!adoption.ok) throw adoption.cause
-      } else {
-        const addWithBranch = await execRemote(host, [
-          'git',
-          '-C',
-          projectPath,
-          'worktree',
-          'add',
-          worktreePath,
-          '-b',
-          branchName,
-        ])
-        if (addWithBranch.timedOut || addWithBranch.code !== 0) {
-          await expectRemoteOk(
-            host,
-            ['git', '-C', projectPath, 'worktree', 'add', worktreePath],
-            'Failed to create remote worktree'
-          )
+          }
         }
+        return { branch: branchName }
       }
-
-      const resolvedBranch =
-        (
-          await expectRemoteOk(
-            host,
-            ['git', '-C', worktreePath, 'rev-parse', '--abbrev-ref', 'HEAD'],
-            'Failed to resolve remote branch'
-          )
-        ).trim() || branchName
-
-      await installRemoteAgentHooks(
-        effectiveTool,
-        host,
-        worktreePath,
-        notifyScriptPath,
-        guardScriptPath
-      )
-      const wasSandboxed = await createRemotePty(id, worktreePath, host, {
-        tool: effectiveTool,
-        agentPath,
-        projectPath,
-        notifyHookPath: ompHookScriptPath,
-        remoteSocketPath,
-        sandboxAvailable,
-      })
-      return { branch: resolvedBranch, sandboxed: wasSandboxed }
-    }
+    )
   )
-
-  const session = buildSession({
-    id,
-    hostId,
-    projectPath,
-    projectName: remoteProject.name,
-    worktreeName,
-    worktreePath,
-    branch,
-    tool: effectiveTool,
-    sandboxed,
-    now: Date.now(),
-    issueNumber: parseIssueNumber(worktreeName, branch),
-    repoFingerprint: remoteProject.repoFingerprint,
-  })
-
-  registerSpawnedSession(session)
-  onSessionsChanged()
-  return session
 }
 
 // `gh pr view` args for a PR, targeting an explicit repo (a fork's upstream)
@@ -896,28 +925,24 @@ async function createRemotePrSession(
   prNumber: number,
   options: CreateSessionOptions = {}
 ): Promise<Session | string> {
-  const host = getRequiredHost(hostId)
-  const remoteProject = getRemoteProject(hostId, projectPath)
-
   const worktreeName = `pr-${prNumber}`
   const worktreePath = posix.join(projectPath, '.claude', 'worktrees', worktreeName)
 
   const existing = findSessionOnWorktree(allSessions(), hostId, worktreePath)
   if (existing) return existing
 
-  return remoteHostRuntime.withPreparedHost(
-    host,
-    async ({
-      notifyScriptPath,
-      guardScriptPath,
-      ompHookScriptPath,
-      remoteSocketPath,
-      sandboxAvailable,
-      agentPaths,
-    }) => {
+  const effectiveTool: AgentTool = options.tool ?? getConfig().defaultTool
+
+  return spawnRemoteSession(
+    hostId,
+    projectPath,
+    worktreeName,
+    worktreePath,
+    effectiveTool,
+    async ({ host, projectPath, worktreePath, run, runOk }) => {
       const ghProbe = await probeRemoteGh(host)
       if (!ghProbe.ok) {
-        return ghProbe.error
+        return { error: ghProbe.error }
       }
 
       // Target an explicit repo (a fork's upstream) when given so gh doesn't
@@ -925,7 +950,7 @@ async function createRemotePrSession(
       // when present.
       const externalRepo = options.repo || undefined
       let prInfo: PrViewInfo
-      const viewResult = await execRemote(host, [
+      const viewResult = await run([
         'sh',
         '-c',
         `cd "$1" && gh pr view "$2" --json ${PR_VIEW_FIELDS}${externalRepo ? ' --repo "$3"' : ''}`,
@@ -937,25 +962,17 @@ async function createRemotePrSession(
       if (viewResult.timedOut || viewResult.code !== 0) {
         const detail =
           viewResult.stderr.trim() || viewResult.stdout.trim() || `exit ${viewResult.code}`
-        return describePrLookupFailure(prNumber, detail)
+        return { error: describePrLookupFailure(prNumber, detail) }
       }
       try {
         prInfo = JSON.parse(viewResult.stdout)
       } catch {
-        return `Failed to parse PR metadata for #${prNumber}.`
+        return { error: `Failed to parse PR metadata for #${prNumber}.` }
       }
 
       const planResult = planPrWorktree(prNumber, prInfo, externalRepo)
-      if (!planResult.ok) return planResult.message
+      if (!planResult.ok) return { error: planResult.message }
       const { branch, localBranch, isFork, forkFields, fetchRemote, fetchRefspec } = planResult.plan
-
-      const effectiveTool: AgentTool = options.tool ?? getConfig().defaultTool
-      const agentPath = agentPaths[effectiveTool]
-      if (!agentPath) {
-        return `${effectiveTool} is not installed on host ${host.label || host.alias}.`
-      }
-
-      const id = randomUUID().slice(0, 8)
 
       // Fetch the PR head into the local branch we'll check out; planPrWorktree
       // picked the remote (origin, or the overridden repo's URL when a fork clone
@@ -964,7 +981,7 @@ async function createRemotePrSession(
       // same-repo head from origin/<branch>). A failure is tolerated — the branch
       // may already be present locally, and a head-elsewhere PR that genuinely
       // couldn't fetch is caught by the probe below.
-      const fetchResult = await execRemote(host, [
+      const fetchResult = await run([
         'git',
         '-C',
         projectPath,
@@ -989,7 +1006,7 @@ async function createRemotePrSession(
         // The pull-ref fetch should have created the pewpew/ branch; if it didn't
         // there's no valid origin fallback for a head-elsewhere PR (origin/<branch>
         // isn't the PR head).
-        return forkPullRefUnavailableMessage(branch, prNumber, fetchError)
+        return { error: forkPullRefUnavailableMessage(branch, prNumber, fetchError) }
       }
       const addArgv = branchExistsLocally
         ? ['git', '-C', projectPath, 'worktree', 'add', worktreePath, localBranch]
@@ -1005,57 +1022,18 @@ async function createRemotePrSession(
             `origin/${branch}`,
           ]
       try {
-        await expectRemoteOk(host, addArgv, 'Failed to create remote worktree')
+        await runOk(addArgv, 'Failed to create remote worktree')
       } catch (err) {
-        return `Failed to create worktree for branch "${branch}": ${(err as Error).message}`
+        return {
+          error: `Failed to create worktree for branch "${branch}": ${(err as Error).message}`,
+        }
       }
 
-      const resolvedBranch =
-        (
-          await expectRemoteOk(
-            host,
-            ['git', '-C', worktreePath, 'rev-parse', '--abbrev-ref', 'HEAD'],
-            'Failed to resolve remote branch'
-          )
-        ).trim() || branch
-
-      await installRemoteAgentHooks(
-        effectiveTool,
-        host,
-        worktreePath,
-        notifyScriptPath,
-        guardScriptPath
-      )
-      const sandboxed = await createRemotePty(id, worktreePath, host, {
-        tool: effectiveTool,
-        agentPath,
-        projectPath,
-        notifyHookPath: ompHookScriptPath,
-        remoteSocketPath,
-        sandboxAvailable,
-      })
-
-      const session = buildSession({
-        id,
-        hostId,
-        projectPath,
-        projectName: remoteProject.name,
-        worktreeName,
-        worktreePath,
-        branch: resolvedBranch,
-        tool: effectiveTool,
-        sandboxed,
-        now: Date.now(),
-        issueNumber: parseIssueNumber(worktreeName, resolvedBranch, prInfo.title),
-        prNumber,
-        prIsFork: forkFields.prIsFork,
-        prHeadRepo: forkFields.prHeadRepo,
-        repoFingerprint: remoteProject.repoFingerprint,
-      })
-
-      registerSpawnedSession(session)
-      onSessionsChanged()
-      return session
+      return {
+        branch,
+        issueTitleHint: prInfo.title,
+        session: { prNumber, prIsFork: forkFields.prIsFork, prHeadRepo: forkFields.prHeadRepo },
+      }
     }
   )
 }
@@ -2180,53 +2158,37 @@ async function createRemoteIssueSession(
   issueNumber: number,
   options: CreateSessionOptions = {}
 ): Promise<Session | string> {
-  const host = getRequiredHost(hostId)
-  const remoteProject = getRemoteProject(hostId, projectPath)
-
   const { worktreeName, branch } = planIssueWorktree(issueNumber)
   const worktreePath = posix.join(projectPath, '.claude', 'worktrees', worktreeName)
 
   const existing = findSessionOnWorktree(allSessions(), hostId, worktreePath)
   if (existing) return existing
 
-  return remoteHostRuntime.withPreparedHost(
-    host,
-    async ({
-      notifyScriptPath,
-      guardScriptPath,
-      ompHookScriptPath,
-      remoteSocketPath,
-      sandboxAvailable,
-      agentPaths,
-    }) => {
-      const effectiveTool: AgentTool = options.tool ?? getConfig().defaultTool
-      const agentPath = agentPaths[effectiveTool]
-      if (!agentPath) {
-        return `${effectiveTool} is not installed on host ${host.label || host.alias}.`
-      }
+  const effectiveTool: AgentTool = options.tool ?? getConfig().defaultTool
 
-      const id = randomUUID().slice(0, 8)
+  return spawnRemoteSession(
+    hostId,
+    projectPath,
+    worktreeName,
+    worktreePath,
+    effectiveTool,
+    async ({ host, projectPath, worktreePath, runOk }) => {
       let originRef: string
       try {
         originRef = await resolveOriginDefaultBase((argv) =>
-          expectRemoteOk(host, ['git', '-C', projectPath, ...argv], 'git failed').then(
-            (stdout) => ({
-              stdout,
-            })
-          )
+          runOk(['git', '-C', projectPath, ...argv], 'git failed').then((stdout) => ({ stdout }))
         )
       } catch (err) {
         const msg = (err as Error).message
-        if (msg === 'no-origin-remote') return 'This project has no origin remote.'
+        if (msg === 'no-origin-remote') return { error: 'This project has no origin remote.' }
         if (msg === 'no-origin-default-branch')
-          return "Could not determine origin's default branch."
-        return `Failed to resolve origin default: ${msg}`
+          return { error: "Could not determine origin's default branch." }
+        return { error: `Failed to resolve origin default: ${msg}` }
       }
 
       const adoption = await createOrAdoptWorktree({
         addNewBranch: async () => {
-          await expectRemoteOk(
-            host,
+          await runOk(
             [
               'git',
               '-C',
@@ -2244,58 +2206,15 @@ async function createRemoteIssueSession(
         },
         branchExists: () => remoteBranchExists(host, projectPath, branch),
         adoptExistingBranch: async () => {
-          await expectRemoteOk(
-            host,
+          await runOk(
             ['git', '-C', projectPath, 'worktree', 'add', worktreePath, branch],
             'Failed to create remote worktree'
           )
         },
       })
-      if (!adoption.ok) return worktreeCreationError(branch, adoption.cause)
+      if (!adoption.ok) return { error: worktreeCreationError(branch, adoption.cause) }
 
-      const resolvedBranch =
-        (
-          await expectRemoteOk(
-            host,
-            ['git', '-C', worktreePath, 'rev-parse', '--abbrev-ref', 'HEAD'],
-            'Failed to resolve remote branch'
-          )
-        ).trim() || branch
-
-      await installRemoteAgentHooks(
-        effectiveTool,
-        host,
-        worktreePath,
-        notifyScriptPath,
-        guardScriptPath
-      )
-      const sandboxed = await createRemotePty(id, worktreePath, host, {
-        tool: effectiveTool,
-        agentPath,
-        projectPath,
-        notifyHookPath: ompHookScriptPath,
-        remoteSocketPath,
-        sandboxAvailable,
-      })
-
-      const session = buildSession({
-        id,
-        hostId,
-        projectPath,
-        projectName: remoteProject.name,
-        worktreeName,
-        worktreePath,
-        branch: resolvedBranch,
-        tool: effectiveTool,
-        sandboxed,
-        now: Date.now(),
-        issueNumber,
-        repoFingerprint: remoteProject.repoFingerprint,
-      })
-
-      registerSpawnedSession(session)
-      onSessionsChanged()
-      return session
+      return { branch, session: { issueNumber } }
     }
   )
 }
