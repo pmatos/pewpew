@@ -278,4 +278,97 @@ of this pick, not a competitor — this run is its first, safest step.
 
 ## Design
 
-_Filled in step 4, after this report was first committed._
+Three interfaces were designed in parallel by sub-agents (design-it-twice), then a
+fourth sub-agent that authored none of them adjudicated against fixed criteria in
+priority order: **depth → locality → seam placement → test surface → blast radius**.
+
+### Variant A — bracket / template-method seam **(WINNER)**
+
+A single deep function `spawnRemoteSession(hostId, projectPath, worktreeName,
+worktreePath, tool, produce)` in `session-manager.ts` owns the _whole_ prologue and
+epilogue and calls a caller-supplied `produce(ctx)` closure — the varying middle as
+a value. `produce` receives a `ctx` exposing only `{ host, projectPath, worktreeName,
+worktreePath, run, runOk }` (git **adapters** over `execRemote`/`expectRemoteOk`, not
+the prepared-host secrets or `agentPaths`) and returns
+`{ branch, issueTitleHint?, session? } | { error: string }`. The seam owns the one
+missing-agent contract, the authoritative `rev-parse` + unified branch fallback,
+hooks, pty, `buildSession`, register, broadcast. An `orThrow` **adapter** converts the
+string channel to a throw at the two `Promise<Session>` boundaries; PR/issue return
+the string directly. Single file, est. net **≈ −270 LOC** (almost all deletion of the
+4× duplication). Weakness: inverts control (the linear sequence is delocalized) and
+splits failures across a throw-vs-`{error}` convention that is not type-enforced.
+
+### Variant B — delegate the epilogue to the existing `adoptRemoteWorktree` **(runner-up design)**
+
+Make the three create-functions mirror the _local_ trio (which already build a
+worktree then hand off to `createSessionForWorktree`→`adoptWorktree`): acquire a
+prepared-host **lease**, check the agent (fail-fast), create/fetch/checkout the
+worktree, then delegate to `adoptRemoteWorktree(..., prepared?)` — one new optional
+`prepared?: PreparedRemoteHost` param (the base interface, _not_ the `Lease`, so adopt
+structurally cannot `release()` a resource it does not own) — and set PR/issue extras
+**post-hoc** on the returned `Session`, exactly as the local code already does. Single
+file, `remote-host-runtime.ts`/`pty-manager.ts` untouched, est. net **≈ −60 LOC**.
+
+**Why it lost:** it deletes only the _epilogue_ duplication; the prologue+lease
+boilerplate (`acquirePreparedHost` → agent check → `finally release()`) stays
+hand-written in all three create-functions — about half the identified duplication
+remains, so its interface **leverage** (depth) is strictly lower than A's. B wins
+locality and blast radius, and its central claims verified true (local
+`createPrSession`/`createIssueSession` set `prNumber`/`issueNumber` post-hoc at
+:2093–2099/:2172; `adoptRemoteWorktree` is already a delegation target of
+`createRemoteSessionForWorktree` at :655 and mirror-all at :589) — but those criteria
+are subordinate to depth, which A wins categorically. **B is the natural next step if
+A proves too invasive to land**, and it is the shape the follow-on
+`local-vs-remote-parallel-create` convergence would use.
+
+### Variant C — data-driven plan + ports-and-adapters interpreter (rejected)
+
+A new `remote-spawn.ts` module: a pure `WorktreeSpec` discriminated union, a `Refusal`
+value type modelling `Session | string`, a `RemoteSpawnPort` **seam**, and a deep
+interpreter `runRemoteSpawn(plan, port, deps)`. Best test surface (a recording fake
+port drives the interpreter with no SSH). **Rejected on seam placement**: by the
+"one adapter is a hypothetical seam, two is a real one" rule, `RemoteSpawnPort` has
+exactly **one** real adapter (`makeRemoteSpawnPort`) plus a test fake — the author
+concedes the second real adapter (a local port) is out of scope, so the seam is
+justified only by the fake "earning its keep." It is also the only variant that _adds_
+net lines (new module ~200 + port ~45 + tests ~250), has the worst single-flow
+locality (most hops), and its port is partly shallow (`git`/`gitOk`/`agentPath` are
+near pass-throughs — the shallow-helper trap).
+
+### Adjudication ranking
+
+- **Depth (dominant): A > C > B.** A hides both prologue and epilogue behind one
+  function; B hides only the epilogue (prologue+lease stays in each caller); C hides
+  the middle too but dilutes its depth ratio with a 7-method port + 4-function `deps`.
+- **Locality: B > A > C.** B changes least and mirrors proven local code; A's inverted
+  control delocalizes the sequence; C spreads a flow across call-site → plan →
+  interpreter → port → adapter.
+- **Seam placement: B ≈ A (real) > C (weak).** A's `produce` seam has four real
+  implementations; B reuses an already load-bearing delegation seam; C's rests on a
+  test fake.
+- **Test surface: C ≥ A ≈ B.** All adequate through the interface; C's fake port is
+  strongest but is the very thing that makes its seam suspect.
+- **Blast radius: B > A > C.** B ~−60 LOC; A ~−270 (deletion); C adds net lines.
+
+Depth is criterion 1 and A wins it categorically, so the criteria where B leads never
+get to decide. **Winner: A.**
+
+### Landing risks for A (from the adjudicator), and how this run handles them
+
+1. **PR error-precedence reorder** — moving the agent check into the prologue makes a
+   missing agent surface _before_ a gh-probe failure in `createRemotePrSession`. No
+   current test pins the both-missing case. **Decision: accept it** as intended
+   fail-fast consistency (agent-first now matches adopt/new/issue) and add a test.
+2. **Unify the missing-agent message** — collapse adopt/create's period-less throw and
+   PR/issue's trailing-period string to one message routed through `orThrow`. Pick the
+   **trailing-period** form (it is the user-facing PR/issue text). Add coverage — the
+   suite does not currently pin this contract.
+3. **Encode the throw-vs-`{error}` convention** — document it on `spawnRemoteSession`
+   and test both channels: a producer that returns `{error}` (string must surface) and
+   one that throws (must propagate _and_ the lease must still `release()`).
+4. **Preserve fail-fast / no-orphan-worktree** — the agent check runs before `produce`
+   (the only FS mutation), and `createRemotePty` stays _inside_ the lease (it
+   independently retains the connection at `pty-manager.ts:536`, so building the session
+   after `release()` is safe).
+5. **Drop redundant `ctx` fields** — do not echo `projectPath`/`worktreeName`/
+   `worktreePath` both as top-level args and inside `ctx`.
