@@ -12,7 +12,7 @@ scored cards.
 - **Modules**: `src/main/session-manager.ts` (`adoptRemoteWorktree`, `createRemoteSession`, `createRemotePrSession`, `createRemoteIssueSession`)
 - **Summary**: Collapse the four hand-duplicated remote session-spawn prologue/epilogue copies (prepared-host + agent check → resolve-branch → hooks → pty → build → register → broadcast) into one deep seam, unifying the drifted missing-agent contract and branch-fallback.
 - **First seen**: 2026-09-03
-- **PR**: (set at step 6)
+- **PR**: #301
 
 ## local-vs-remote-parallel-create
 

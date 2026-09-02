@@ -7,7 +7,7 @@ Two parallel Explore sub-agents walked the code: one on the session-manager
 cluster, one across the rest of `src/main`, `src/shared`, `src/preload`, and
 `src/renderer/stores`.
 
-**Picked**: `remote-spawn-epilogue` — see the PR and `.architecture/backlog.md`.
+**Picked**: `remote-spawn-epilogue` — see [PR #301](https://github.com/pmatos/pewpew/pull/301) and `.architecture/backlog.md`.
 
 **Degradations**: none. `gh` is authenticated; sub-agents were available; all
 delegated skills present.
