@@ -16,6 +16,10 @@ const state = vi.hoisted(() => ({
   remoteProjects: [] as RemoteProject[],
   worktreeBase: 'local' as WorktreeBase,
   defaultTool: 'claude' as AgentTool,
+  // Remote agent resolution returned by the mocked bootstrapHost. Unset means
+  // "all three tools installed"; set it to a subset to exercise the
+  // missing-agent path (e.g. { claude } while requesting codex).
+  agentPaths: undefined as undefined | Partial<Record<AgentTool, string>>,
   runtimeStates: new Map<string, string>(),
   // Call logs for assertion.
   ensureHostConnectionCalls: [] as string[],
@@ -193,7 +197,11 @@ vi.mock('./host-bootstrap', () => ({
     ompHookScriptPath: '/tmp/omp-notify-v1.ts',
     guardScriptPath: '/tmp/worktree-guard-v1.sh',
     sandboxAvailable: true,
-    agentPaths: { claude: '/r/bin/claude', codex: '/r/bin/codex', omp: '/r/bin/omp' },
+    agentPaths: state.agentPaths ?? {
+      claude: '/r/bin/claude',
+      codex: '/r/bin/codex',
+      omp: '/r/bin/omp',
+    },
   })),
 }))
 
@@ -398,6 +406,7 @@ beforeEach(() => {
   state.remoteProjects = []
   state.worktreeBase = 'local'
   state.defaultTool = 'claude'
+  state.agentPaths = undefined
   state.runtimeStates = new Map()
   state.ensureHostConnectionCalls = []
   state.createRemotePtyCalls = []
@@ -600,6 +609,107 @@ describe('createRemoteSessionForWorktree (adopt remote worktree)', () => {
       sm.createRemoteSessionForWorktree('h1', projectPath, worktreePath, undefined, 'claude')
     ).rejects.toThrow()
     expect(state.createRemotePtyCalls).toEqual([])
+  })
+})
+
+describe('spawnRemoteSession — unified remote spawn seam', () => {
+  const projectPath = '/remote/proj'
+
+  function ranWorktreeAdd(): boolean {
+    return state.execRemoteCalls.some((c) => c.argv.includes('worktree') && c.argv.includes('add'))
+  }
+
+  it('adopt: throws one unified (trailing-period) message and creates nothing when the agent is missing', async () => {
+    state.remoteProjects = [{ hostId: 'h1', path: projectPath, name: 'proj' }]
+    state.agentPaths = { claude: '/r/bin/claude' } // codex not installed
+    const worktreePath = '/remote/proj/.claude/worktrees/existing'
+    const sm = await loadSessionManager()
+
+    await expect(
+      sm.createRemoteSessionForWorktree('h1', projectPath, worktreePath, undefined, 'codex')
+    ).rejects.toThrow('codex is not installed on host Dev.')
+    expect(state.createRemotePtyCalls).toEqual([])
+    expect(ranWorktreeAdd()).toBe(false)
+  })
+
+  it('create: fails fast on a missing agent — same unified message, before any worktree add', async () => {
+    state.remoteProjects = [{ hostId: 'h1', path: projectPath, name: 'proj' }]
+    state.agentPaths = { claude: '/r/bin/claude' } // codex not installed
+    const sm = await loadSessionManager()
+
+    await expect(sm.createSession(projectPath, 'feat', 'h1', { tool: 'codex' })).rejects.toThrow(
+      'codex is not installed on host Dev.'
+    )
+    expect(state.createRemotePtyCalls).toEqual([])
+    expect(ranWorktreeAdd()).toBe(false)
+  })
+
+  it('PR (same-repo, happy path): spawns through the seam and threads prNumber onto the session', async () => {
+    state.remoteProjects = [{ hostId: 'h1', path: projectPath, name: 'proj' }]
+    const worktreePath = '/remote/proj/.claude/worktrees/pr-42'
+    // gh pr view → an open, same-repo PR on branch feature/x.
+    state.execRemoteResults.set(
+      [
+        'sh',
+        '-c',
+        'cd "$1" && gh pr view "$2" --json headRefName,state,title,isCrossRepository,headRepositoryOwner,headRepository',
+        '_',
+        projectPath,
+        '42',
+        '',
+      ].join(' '),
+      {
+        stdout: JSON.stringify({ headRefName: 'feature/x', state: 'OPEN', title: 'Add feature x' }),
+        stderr: '',
+        code: 0,
+        timedOut: false,
+      }
+    )
+    // The seam's authoritative branch resolve after the worktree exists.
+    state.execRemoteResults.set(
+      ['git', '-C', worktreePath, 'rev-parse', '--abbrev-ref', 'HEAD'].join(' '),
+      { stdout: 'feature/x\n', stderr: '', code: 0, timedOut: false }
+    )
+    const sm = await loadSessionManager()
+
+    const result = await sm.createPrSession(projectPath, 42, 'h1', {})
+
+    expect(result).toMatchObject({
+      hostId: 'h1',
+      worktreeName: 'pr-42',
+      worktreePath,
+      branch: 'feature/x',
+      prNumber: 42,
+      tool: 'claude',
+      connectionState: 'live',
+    })
+    expect(state.createRemotePtyCalls).toEqual([
+      {
+        sessionId: (result as Session).id,
+        cwd: worktreePath,
+        hostId: 'h1',
+        tool: 'claude',
+        notifyHookPath: '/tmp/omp-notify-v1.ts',
+        remoteSocketPath: '/tmp/remote.sock',
+      },
+    ])
+  })
+
+  it('PR: the missing-agent check precedes the gh probe (returns the agent message, not a gh error)', async () => {
+    state.remoteProjects = [{ hostId: 'h1', path: projectPath, name: 'proj' }]
+    state.agentPaths = { claude: '/r/bin/claude' } // codex not installed
+    // gh probe would fail too — the agent message must win.
+    state.execRemoteResults.set('sh -c command -v gh >/dev/null 2>&1', {
+      stdout: '',
+      stderr: '',
+      code: 1,
+      timedOut: false,
+    })
+    const sm = await loadSessionManager()
+
+    const result = await sm.createPrSession(projectPath, 42, 'h1', { tool: 'codex' })
+    expect(result).toBe('codex is not installed on host Dev.')
+    expect(ranWorktreeAdd()).toBe(false)
   })
 })
 
