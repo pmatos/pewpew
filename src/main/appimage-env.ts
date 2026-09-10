@@ -33,9 +33,20 @@ function isAppImageEntry(entry: string, appDir: string | undefined): boolean {
 }
 
 export function sanitizeChildEnv(env: NodeJS.ProcessEnv = process.env): NodeJS.ProcessEnv {
-  if (env.APPIMAGE === undefined) return env
   const out: NodeJS.ProcessEnv = { ...env }
-  const appDir = env.APPDIR
+
+  // npm exports npm_config_*/npm_package_*/npm_execpath/npm_lifecycle_* as
+  // real env vars for the duration of an npm script (e.g. `npm run dev`) and
+  // all its descendants, so an agent pewpew spawns from a dev run inherits
+  // pewpew's own npm config (e.g. legacy-peer-deps) and silently applies it
+  // in unrelated repos. Unlike the AppImage vars below, this must run
+  // unconditionally — it's not gated on APPIMAGE being set.
+  for (const key of Object.keys(out)) {
+    if (key.startsWith('npm_')) delete out[key]
+  }
+
+  if (out.APPIMAGE === undefined) return out
+  const appDir = out.APPDIR
 
   for (const key of PATH_LIST_VARS_COLON) {
     const value = out[key]

@@ -139,7 +139,7 @@ describe('sanitizeChildEnv', () => {
     expect('LD_PRELOAD' in out).toBe(false)
   })
 
-  it('is a no-op when APPIMAGE is not set (dev runs, .deb installs)', () => {
+  it('leaves non-npm vars untouched when APPIMAGE is not set (dev runs, .deb installs)', () => {
     const env = {
       HOME: '/home/u',
       PATH: '/usr/local/bin:/usr/bin',
@@ -152,6 +152,24 @@ describe('sanitizeChildEnv', () => {
     const out = sanitizeChildEnv(env)
 
     expect(out).toEqual(env)
+  })
+
+  it('strips npm_config_*/npm_package_*/npm_execpath/npm_lifecycle_* even when APPIMAGE is not set', () => {
+    const env = {
+      HOME: '/home/u',
+      npm_config_legacy_peer_deps: 'true',
+      npm_config_local_prefix: '/home/u/dev/pewpew',
+      npm_package_name: 'pewpew',
+      npm_package_version: '0.10.5',
+      npm_execpath: '/usr/lib/node_modules/npm/bin/npm-cli.js',
+      npm_lifecycle_event: 'dev',
+      npm_lifecycle_script: 'electron-vite dev',
+      npm_command: 'run',
+    }
+
+    const out = sanitizeChildEnv(env)
+
+    expect(out).toEqual({ HOME: '/home/u' })
   })
 
   it('leaves user-provided path-list variables alone when they contain no AppImage entries', () => {
