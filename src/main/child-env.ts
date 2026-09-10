@@ -38,6 +38,15 @@ function deleteKeysWithPrefix(env: NodeJS.ProcessEnv, prefix: string): void {
   }
 }
 
+// Shared by every colon-separated list var this file filters (PATH and its
+// npm-launch node_modules/.bin entries, the AppImage PATH_LIST_VARS_COLON
+// vars): split, drop unwanted entries, and collapse back to a single string,
+// or undefined when nothing survives — the caller deletes the key in that case.
+function filterColonList(value: string, keep: (entry: string) => boolean): string | undefined {
+  const kept = value.split(':').filter(keep)
+  return kept.length > 0 ? kept.join(':') : undefined
+}
+
 export function sanitizeChildEnv(env: NodeJS.ProcessEnv = process.env): NodeJS.ProcessEnv {
   const out: NodeJS.ProcessEnv = { ...env }
 
@@ -58,15 +67,14 @@ export function sanitizeChildEnv(env: NodeJS.ProcessEnv = process.env): NodeJS.P
     delete out.NODE
     const path = out.PATH
     if (typeof path === 'string') {
-      const kept = path
-        .split(':')
-        .filter(
-          (entry) => !entry.endsWith('/node_modules/.bin') && !entry.endsWith('/node-gyp-bin')
-        )
-      if (kept.length === 0) {
+      const filtered = filterColonList(
+        path,
+        (entry) => !entry.endsWith('/node_modules/.bin') && !entry.endsWith('/node-gyp-bin')
+      )
+      if (filtered === undefined) {
         delete out.PATH
       } else {
-        out.PATH = kept.join(':')
+        out.PATH = filtered
       }
     }
   }
@@ -77,11 +85,11 @@ export function sanitizeChildEnv(env: NodeJS.ProcessEnv = process.env): NodeJS.P
   for (const key of PATH_LIST_VARS_COLON) {
     const value = out[key]
     if (typeof value !== 'string') continue
-    const kept = value.split(':').filter((entry) => !isAppImageEntry(entry, appDir))
-    if (kept.length === 0) {
+    const filtered = filterColonList(value, (entry) => !isAppImageEntry(entry, appDir))
+    if (filtered === undefined) {
       delete out[key]
     } else {
-      out[key] = kept.join(':')
+      out[key] = filtered
     }
   }
 

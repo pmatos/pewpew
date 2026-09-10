@@ -1,7 +1,7 @@
 import { describe, it, expect } from 'vitest'
 import { execFileSync } from 'child_process'
 import { existsSync } from 'fs'
-import { sanitizeChildEnv } from './appimage-env'
+import { sanitizeChildEnv } from './child-env'
 
 describe('sanitizeChildEnv', () => {
   it('drops APPIMAGE and APPDIR when both are set', () => {
