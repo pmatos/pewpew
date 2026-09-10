@@ -19,7 +19,7 @@ A desktop GUI for launching, monitoring, and visualizing Claude Code sessions wi
 
 ## Requirements
 
-- [Node.js](https://nodejs.org/) (v20+)
+- [Node.js](https://nodejs.org/) (v22.12+)
 - [tmux](https://github.com/tmux/tmux)
 - [Claude Code](https://docs.anthropic.com/en/docs/claude-code) (`claude` CLI)
 - Linux (X11 or Wayland)
