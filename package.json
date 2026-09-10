@@ -68,7 +68,7 @@
     "@types/react-dom": "^19.2.7",
     "@typescript/native": "npm:typescript@^7.0.2",
     "@vitejs/plugin-react": "^6.1.1",
-    "@vitest/coverage-v8": "^4.1.11",
+    "@vitest/coverage-v8": "^5.0.0",
     "electron": "^44.2.0",
     "electron-builder": "^26.15.3",
     "electron-devtools-installer": "^4.0.0",
