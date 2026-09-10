@@ -27,13 +27,23 @@ Persisted candidate memory for the `pm-deepen` routine. Reconciled against `gh` 
 
 ## remote-reconnect-coordinator
 
-- **Status**: proposed
+- **Status**: in-flight
 - **Score**: 21/25 (leverage 4, locality 5, blast radius 2, heat 4)
-- **Files**: ~3 estimated (session-manager.ts + new remote-reconnect.ts + its test)
-- **Modules**: `src/main/session-manager.ts` (1088-1435), new `src/main/remote-reconnect.ts`
+- **Files**: 3 (session-manager.ts + new remote-reconnect.ts + its test)
+- **Modules**: `src/main/session-manager.ts`, new `src/main/remote-reconnect.ts`
 - **Summary**: House reconnect/probe orchestration (two in-flight maps + prepared-host lease lifecycle) behind a coordinator with an injected SessionLookup seam.
 - **First seen**: 2026-09-02
+- **PR**: #312
 - **Reason (note)**: 2026-09-11 — picked this run (top surviving score, 21/25). Sequencing note honoured, not blocked: the coordinator defines its own minimal SessionLookup port; session-manager satisfies it via a thin Map adapter today, and session-store (next) will implement the same port.
+
+### Run 2026-09-11 — complete
+
+- **Outcome**: complete
+- **Stopped at**: step 6 — PR opened
+- **Branch**: `sym/pewpew/routine/refactor-audit/01M26RZFY4`, adopted (all four adoption conditions held: non-default, 0 commits ahead of origin/main, no upstream, unpublished on origin). Not renamed — an adopted branch keeps the caller's name so the harness can find the PR.
+- **Committed**: report, backlog, `remote-reconnect.ts` + its test, `session-manager.ts` delegation (4 commits)
+- **Evidence**: PR #312; gate green — tsc, eslint, vitest 879/879 (under `TMPDIR=/tmp`), build. session-manager.ts −298 net lines.
+- **Next**: review/merge #312; next firing picks up the two 20/25 runner-ups — `session-store` (which should implement the SessionLookup port) or `materialize-pr-worktree`.
 
 ## session-store
 
