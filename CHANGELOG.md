@@ -1,3 +1,10 @@
+## [0.10.6](https://github.com/pmatos/pewpew/compare/v0.10.5...v0.10.6) (2026-09-10)
+
+
+### Bug Fixes
+
+* **pty-manager:** strip npm_config_*/npm_package_* env vars from spawned agents ([#311](https://github.com/pmatos/pewpew/issues/311)) ([ec87c1b](https://github.com/pmatos/pewpew/commit/ec87c1b724e04a4bd0cc667aa6c1d644ab048cf3))
+
 ## [0.10.5](https://github.com/pmatos/pewpew/compare/v0.10.4...v0.10.5) (2026-08-23)
 
 
