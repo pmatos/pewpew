@@ -15,7 +15,7 @@ import {
 } from './host-connection'
 import { classifySshExit } from './ssh-exit-parser'
 import { captureRemotePaneTexts, type RemoteSessionEntry } from './remote-thumbnail'
-import { sanitizeChildEnv } from './appimage-env'
+import { sanitizeChildEnv } from './child-env'
 import { buildSandboxArgs } from './agent-sandbox'
 import {
   OMP_HOOK_SCRIPT,

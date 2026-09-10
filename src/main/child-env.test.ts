@@ -1,7 +1,7 @@
 import { describe, it, expect } from 'vitest'
 import { execFileSync } from 'child_process'
 import { existsSync } from 'fs'
-import { sanitizeChildEnv } from './appimage-env'
+import { sanitizeChildEnv } from './child-env'
 
 describe('sanitizeChildEnv', () => {
   it('drops APPIMAGE and APPDIR when both are set', () => {
@@ -139,7 +139,7 @@ describe('sanitizeChildEnv', () => {
     expect('LD_PRELOAD' in out).toBe(false)
   })
 
-  it('is a no-op when APPIMAGE is not set (dev runs, .deb installs)', () => {
+  it('leaves non-npm vars untouched when APPIMAGE is not set (dev runs, .deb installs)', () => {
     const env = {
       HOME: '/home/u',
       PATH: '/usr/local/bin:/usr/bin',
@@ -152,6 +152,81 @@ describe('sanitizeChildEnv', () => {
     const out = sanitizeChildEnv(env)
 
     expect(out).toEqual(env)
+  })
+
+  it('strips npm_config_*/npm_package_*/npm_execpath/npm_lifecycle_* even when APPIMAGE is not set', () => {
+    const env = {
+      HOME: '/home/u',
+      npm_config_legacy_peer_deps: 'true',
+      npm_config_local_prefix: '/home/u/dev/pewpew',
+      npm_package_name: 'pewpew',
+      npm_package_version: '0.10.5',
+      npm_execpath: '/usr/lib/node_modules/npm/bin/npm-cli.js',
+      npm_lifecycle_event: 'dev',
+      npm_lifecycle_script: 'electron-vite dev',
+      npm_command: 'run',
+    }
+
+    const out = sanitizeChildEnv(env)
+
+    expect(out).toEqual({ HOME: '/home/u' })
+  })
+
+  it('keeps a user-exported npm_config_* var when there is no npm_execpath marker (packaged/.deb launch, not an npm script)', () => {
+    const env = {
+      HOME: '/home/u',
+      npm_config_registry: 'https://npm.corp.example.com/',
+    }
+
+    const out = sanitizeChildEnv(env)
+
+    expect(out).toEqual(env)
+  })
+
+  it('strips INIT_CWD alongside npm_* vars when npm_execpath marks a real npm-mediated launch', () => {
+    const env = {
+      HOME: '/home/u',
+      npm_execpath: '/usr/lib/node_modules/npm/bin/npm-cli.js',
+      INIT_CWD: '/home/u/dev/pewpew',
+    }
+
+    const out = sanitizeChildEnv(env)
+
+    expect(out).toEqual({ HOME: '/home/u' })
+  })
+
+  it('strips NODE and node_modules/.bin (and node-gyp-bin) PATH entries when npm_execpath marks a real npm-mediated launch', () => {
+    const env = {
+      HOME: '/home/u',
+      npm_execpath: '/usr/lib/node_modules/npm/bin/npm-cli.js',
+      NODE: '/home/u/.nvm/versions/node/v26.5.0/bin/node',
+      PATH: '/home/u/dev/pewpew/node_modules/.bin:/usr/lib/node_modules/npm/node_modules/@npmcli/run-script/lib/node-gyp-bin:/usr/local/bin:/usr/bin',
+    }
+
+    const out = sanitizeChildEnv(env)
+
+    expect('NODE' in out).toBe(false)
+    expect(out.PATH).toBe('/usr/local/bin:/usr/bin')
+  })
+
+  it('strips npm_*/INIT_CWD/NODE even when APPIMAGE is also set, without disturbing the AppImage-specific scrub', () => {
+    const appDir = '/tmp/.mount_pewpewXYZ'
+    const env = {
+      APPIMAGE: '/path/to/pewpew.AppImage',
+      APPDIR: appDir,
+      HOME: '/home/u',
+      npm_execpath: '/usr/lib/node_modules/npm/bin/npm-cli.js',
+      npm_config_legacy_peer_deps: 'true',
+      INIT_CWD: '/home/u/dev/pewpew',
+      LD_LIBRARY_PATH: `${appDir}/usr/lib:/usr/lib/custom`,
+    }
+
+    const out = sanitizeChildEnv(env)
+
+    expect(out).toEqual({
+      HOME: '/home/u',
+      LD_LIBRARY_PATH: '/usr/lib/custom',
+    })
   })
 
   it('leaves user-provided path-list variables alone when they contain no AppImage entries', () => {
