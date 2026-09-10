@@ -160,4 +160,38 @@ None — no surviving candidate scored blast radius 5.
 
 ## Design
 
-_Written in step 4 (appended after this file's first commit)._
+Four interfaces were produced by parallel sub-agents (design-it-twice), then adjudicated by the advisor against, in order: **depth** (behaviour hidden per unit of interface), **locality** (where change/bugs/verification concentrate), **seam placement** (one adapter = hypothetical seam, two = real), **test surface** (exercisable through the interface without reaching past it), **blast radius** (smaller diff breaks ties).
+
+### Winner — Design B: ports-and-adapters closure factory
+
+`createRemoteReconnectCoordinator(deps)` in `src/main/remote-reconnect.ts`, owning the two in-flight Maps and the lease lifecycle behind three methods (`reconnectRemoteSession`, `attemptAutoReconnect`, `probePendingSessionsOnHost`). Dependencies cross the seam as injected ports:
+
+- `SessionLookup { get(id), values(), changed() }` — **the one real seam**: the backlog's next candidate, `session-store`, is its second implementation. `session-manager` satisfies it today with a thin adapter over the raw `sessions` Map (`get: (id) => sessions.get(id)?.session`, `values: allSessions`, `changed: onSessionsChanged`).
+- `RemoteHost { get, runtimeState, acquireLease }`, `RemoteTerminal { probe, reattach, hasPty }`, `UserFeedback { toast, promptCleanup }` — **test seams, not evolutionary ones**: each has exactly one production adapter, so by the vocabulary they are hypothetical seams. They are justified solely by criterion 4 (test surface): they let the coordinator be unit-tested with plain fakes, no `vi.mock`. Stated honestly rather than dressed up as future extension points.
+- The pure cores (`computeProbeTransition`, `applyProbeTransition`, `classifyAutoReconnectResult`) are imported directly, not injected — already pure and separately tested.
+- The `reconnect-scheduler` stays owned by `session-manager`: no coordinator method calls `schedule/cancel/shutdown`; the only edge points _inward_ (`attempt: attemptAutoReconnect`). A scheduler port would have zero call sites inside the coordinator — a dead port — so it is neither owned nor injected.
+
+`session-manager` constructs one coordinator at module scope and keeps the three existing exports as hoisted `export async function` delegators, so `index.ts:510`, the scheduler wiring, and all 44 existing tests are untouched.
+
+### Why B beat the runner-up design (A — minimal surface)
+
+Depth did not separate them (both expose 3 methods). B won on the next three criteria:
+
+- **Locality**: A's own trade-offs admit its new unit tests still `vi.mock` `pty-manager`/`host-connection`/`remote-host-runtime` by module path — verification stays split. B concentrates verification in one plain-fake test file.
+- **Seam placement**: A injects `sessions` as a raw `ReadonlyMap<string, {session}>`, leaking the entry shape; that is not what `session-store` would naturally implement. B names `SessionLookup` as the exact interface `session-store` will satisfy.
+- **Test surface**: the pick's leverage=4 was justified by "a test gains one constructed object instead of ~8 mocked modules." A drops to 3 mocks; only B drops to zero, delivering the leverage the score was predicated on.
+
+Blast radius (A smaller) was never reached — B had already won on higher-priority criteria.
+
+### Losing designs
+
+- **C (common-caller optimized)** — folds the scheduler into the coordinator and collapses the drop path to `onDrop(id)`. Loses on **depth** (6-method surface vs 3) and, decisively, it relocates the "connection lost, reconnecting…" toast into the coordinator — a behaviour change. The autonomy contract bars an unattended run from expanding beyond what the pick strictly requires, and this deepening does not require moving the drop policy.
+- **D (max-flexibility class)** — **folded into B, not a losing design**: its own author withdrew the `class` construct (the repo idiom is the closure factory `reconnect-scheduler.ts`; a class forces arrow-field methods to survive bare-callback passing, i.e. a closure factory wearing extra ceremony) and recommended B's shape, dropping the speculative `observer`/`AbortSignal`/per-host seams as YAGNI.
+
+### Mandatory test (from adjudication)
+
+`SessionLookup.get()`/`values()` must return the **live, mutable** `Session` objects — the coordinator re-reads `session.status` _after_ the reattach await to avoid clobbering a concurrent Keep (original `session-manager.ts:1215`, `:1411`). A copy-returning future `session-store` would silently break this. The type cannot pin it, so a test does: the `reattach` fake mutates the store's session to `completed` mid-await; assert the coordinator leaves it `completed`, not reverted to `idle`.
+
+### Adjudication note
+
+The advisor was available and adjudicated. Verification of five facts it flagged was completed before implementation: `allSessions` (`:146`) yields `Session`; `remoteHostRuntime.acquirePreparedHost` is an object method (wrapped in an arrow adapter); `emitToast` takes `Omit<ToastEvent,'id'> & { id?: string }`; `RemoteTmuxProbeResult` is already an `export type` (no fourth file); the coordinator is constructed at module scope so `vi.resetModules()` gives each test fresh in-flight maps.
