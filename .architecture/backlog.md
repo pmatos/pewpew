@@ -4,13 +4,17 @@ Persisted candidate memory for the `pm-deepen` routine. Reconciled against `gh` 
 
 ## spawn-remote-agent-pipeline
 
-- **Status**: in-flight
+- **Status**: landed
 - **Score**: 23/25 (leverage 5, locality 4, blast radius 2, heat 5)
 - **Files**: 3 (session-manager.ts + new remote-agent-spawn.ts + its test)
 - **Modules**: `src/main/session-manager.ts`, new `src/main/remote-agent-spawn.ts`
 - **Summary**: Extract the verbatim post-worktree remote spawn tail (resolve branch → install hooks → create pty) shared by the four remote create/adopt paths into one deep primitive; leave revive as-is.
 - **First seen**: 2026-09-02
 - **PR**: #300
+
+### Run 2026-09-11 — reconciled
+
+- PR #300 merged 2026-09-10 (also `fc9c9e4` on main) → status `in-flight` → `landed`. PR #301, a duplicate firing of this same candidate, was closed unmerged; no separate row.
 
 ### Run 2026-09-02 — complete
 
@@ -25,11 +29,11 @@ Persisted candidate memory for the `pm-deepen` routine. Reconciled against `gh` 
 
 - **Status**: proposed
 - **Score**: 21/25 (leverage 4, locality 5, blast radius 2, heat 4)
-- **Files**: ~3 estimated
-- **Modules**: `src/main/session-manager.ts` (1183-1529), new `src/main/remote-reconnect.ts`
+- **Files**: ~3 estimated (session-manager.ts + new remote-reconnect.ts + its test)
+- **Modules**: `src/main/session-manager.ts` (1088-1435), new `src/main/remote-reconnect.ts`
 - **Summary**: House reconnect/probe orchestration (two in-flight maps + prepared-host lease lifecycle) behind a coordinator with an injected SessionLookup seam.
 - **First seen**: 2026-09-02
-- **Reason (note)**: runner-up candidate; direction partly depends on the session-store SessionLookup seam, so best sequenced after it.
+- **Reason (note)**: 2026-09-11 — picked this run (top surviving score, 21/25). Sequencing note honoured, not blocked: the coordinator defines its own minimal SessionLookup port; session-manager satisfies it via a thin Map adapter today, and session-store (next) will implement the same port.
 
 ## session-store
 
