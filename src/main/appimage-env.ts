@@ -32,17 +32,43 @@ function isAppImageEntry(entry: string, appDir: string | undefined): boolean {
   return MOUNT_PREFIX_RE.test(entry)
 }
 
+function deleteKeysWithPrefix(env: NodeJS.ProcessEnv, prefix: string): void {
+  for (const key of Object.keys(env)) {
+    if (key.startsWith(prefix)) delete env[key]
+  }
+}
+
 export function sanitizeChildEnv(env: NodeJS.ProcessEnv = process.env): NodeJS.ProcessEnv {
   const out: NodeJS.ProcessEnv = { ...env }
 
-  // npm exports npm_config_*/npm_package_*/npm_execpath/npm_lifecycle_* as
-  // real env vars for the duration of an npm script (e.g. `npm run dev`) and
-  // all its descendants, so an agent pewpew spawns from a dev run inherits
-  // pewpew's own npm config (e.g. legacy-peer-deps) and silently applies it
-  // in unrelated repos. Unlike the AppImage vars below, this must run
-  // unconditionally — it's not gated on APPIMAGE being set.
-  for (const key of Object.keys(out)) {
-    if (key.startsWith('npm_')) delete out[key]
+  // npm exports npm_config_*/npm_package_*/npm_execpath/npm_lifecycle_*/INIT_CWD,
+  // prepends every ancestor directory's node_modules/.bin (and node-gyp-bin) to
+  // PATH, and points NODE at its own node binary — all for the life of any
+  // npm-mediated launch (run/exec/npx) and all descendants. Left unstripped, an
+  // agent pewpew spawns from `npm run dev` inherits pewpew's own npm config
+  // (e.g. legacy-peer-deps), and a bare `eslint`/`tsc`/`prettier` the agent runs
+  // in an unrelated repo silently resolves through pewpew's own node_modules/.bin
+  // ahead of that repo's. Gate on npm_execpath — only ever set by npm itself,
+  // never by a user — so a packaged/.deb launch where a user has deliberately
+  // exported e.g. npm_config_registry/npm_config_proxy for their own npm usage
+  // keeps it.
+  if (out.npm_execpath !== undefined) {
+    deleteKeysWithPrefix(out, 'npm_')
+    delete out.INIT_CWD
+    delete out.NODE
+    const path = out.PATH
+    if (typeof path === 'string') {
+      const kept = path
+        .split(':')
+        .filter(
+          (entry) => !entry.endsWith('/node_modules/.bin') && !entry.endsWith('/node-gyp-bin')
+        )
+      if (kept.length === 0) {
+        delete out.PATH
+      } else {
+        out.PATH = kept.join(':')
+      }
+    }
   }
 
   if (out.APPIMAGE === undefined) return out
@@ -73,8 +99,6 @@ export function sanitizeChildEnv(env: NodeJS.ProcessEnv = process.env): NodeJS.P
   }
 
   for (const key of SCALAR_VARS) delete out[key]
-  for (const key of Object.keys(out)) {
-    if (key.startsWith('APPIMAGE_')) delete out[key]
-  }
+  deleteKeysWithPrefix(out, 'APPIMAGE_')
   return out
 }
