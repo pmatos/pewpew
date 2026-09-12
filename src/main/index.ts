@@ -272,7 +272,14 @@ app.whenReady().then(async () => {
     const config = getConfig()
     const dirs = config.scanDirs.map(resolvePath)
     const pinned = (config.pinnedPaths || []).map(resolvePath)
-    const local = await scanProjects(dirs, pinned, config.followSymlinks, config.scanDepth)
+    const excluded = (config.excludedPaths || []).map(resolvePath)
+    const local = await scanProjects(
+      dirs,
+      pinned,
+      config.followSymlinks,
+      config.scanDepth,
+      excluded
+    )
     const remote = listRemoteProjects().map(remoteToProject)
     return [...local, ...remote].sort((a, b) => a.name.localeCompare(b.name))
   })
@@ -294,6 +301,18 @@ app.whenReady().then(async () => {
       config.pinnedPaths.push(resolved)
       saveConfig(config)
     }
+  })
+
+  ipcMain.handle('projects:remove-local', async (_event, path: string) => {
+    const config = getConfig()
+    const resolved = resolve(path)
+    if (!config.excludedPaths.includes(resolved)) {
+      config.excludedPaths.push(resolved)
+    }
+    config.pinnedPaths = config.pinnedPaths.filter((p) => p !== resolved)
+    delete config.clusterPositions[resolved]
+    config.gitignoreWarned = config.gitignoreWarned.filter((p) => p !== resolved)
+    saveConfig(config)
   })
 
   ipcMain.handle('projects:add-remote', async (_event, input: { hostId: string; path: string }) => {

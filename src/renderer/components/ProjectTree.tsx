@@ -122,6 +122,7 @@ export default function ProjectTree(props: TreeProps) {
 function useProjectTreeElement({ onOpenSession }: TreeProps) {
   const { projects, loading, scanProjects, filterReady } = useProjectsStore()
   const removeRemoteProject = useProjectsStore((s) => s.removeRemoteProject)
+  const removeLocalProject = useProjectsStore((s) => s.removeLocalProject)
   const remoteWorktreesCache = useProjectsStore((s) => s.remoteWorktrees)
   const remoteWorktreesStatus = useProjectsStore((s) => s.remoteWorktreesStatus)
   const fetchRemoteWorktrees = useProjectsStore((s) => s.fetchRemoteWorktrees)
@@ -680,6 +681,12 @@ function useProjectTreeElement({ onOpenSession }: TreeProps) {
         },
       })
     }
+
+    items.push({ label: '', separator: true, onClick: () => {} })
+    items.push({
+      label: 'Remove project',
+      onClick: () => void removeLocalProject(projectPath),
+    })
 
     items.push({ label: '', separator: true, onClick: () => {} })
 

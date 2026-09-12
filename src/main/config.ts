@@ -41,6 +41,7 @@ export interface SandboxConfig {
 export interface AppConfig {
   scanDirs: string[]
   pinnedPaths: string[]
+  excludedPaths: string[]
   followSymlinks: boolean
   scanDepth: number
   canvas: CanvasState
@@ -66,6 +67,7 @@ const CONFIG_PATH = join(CONFIG_DIR, 'config.json')
 const DEFAULT_CONFIG: AppConfig = {
   scanDirs: ['~/dev'],
   pinnedPaths: [],
+  excludedPaths: [],
   followSymlinks: true,
   scanDepth: 3,
   canvas: { zoom: 0.7, panX: 0, panY: 0 },

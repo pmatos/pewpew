@@ -130,6 +130,7 @@ contextBridge.exposeInMainWorld('api', {
   relocateProject: (oldPath: string, newPath: string) =>
     ipcRenderer.invoke('projects:relocate', oldPath, newPath),
   pinProjectPath: (path: string) => ipcRenderer.invoke('projects:pin-path', path),
+  removeLocalProject: (path: string) => ipcRenderer.invoke('projects:remove-local', path),
   ptyWrite: (sessionId: string, data: string) => ipcRenderer.invoke('pty:write', sessionId, data),
   ptyResize: (sessionId: string, cols: number, rows: number) =>
     ipcRenderer.invoke('pty:resize', sessionId, cols, rows),
