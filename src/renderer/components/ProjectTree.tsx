@@ -685,7 +685,10 @@ function useProjectTreeElement({ onOpenSession }: TreeProps) {
     items.push({ label: '', separator: true, onClick: () => {} })
     items.push({
       label: 'Remove project',
-      onClick: () => void removeLocalProject(projectPath),
+      onClick: async () => {
+        const ok = await removeLocalProject(projectPath)
+        if (!ok) showToast('Failed to remove project')
+      },
     })
 
     items.push({ label: '', separator: true, onClick: () => {} })

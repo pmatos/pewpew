@@ -27,7 +27,7 @@ interface ProjectsState {
   clearAddRemoteError: () => void
   addRemoteProject: (input: { hostId: string; path: string }) => Promise<void>
   removeRemoteProject: (hostId: string, path: string) => Promise<void>
-  removeLocalProject: (path: string) => Promise<void>
+  removeLocalProject: (path: string) => Promise<boolean>
 }
 
 function errorMessage(e: unknown): string {
@@ -101,8 +101,10 @@ export const useProjectsStore = create<ProjectsState>((set, get) => ({
     try {
       await window.api.removeLocalProject(path)
       await get().scanProjects()
+      return true
     } catch (e) {
       console.error('removeLocalProject failed:', e)
+      return false
     }
   },
 }))

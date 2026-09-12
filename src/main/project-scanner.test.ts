@@ -272,6 +272,15 @@ describe('discoverRepos', () => {
 
     expect(result).toEqual([])
   })
+
+  it('excludes a repo by its raw path when followSymlinks is false', () => {
+    makeRepo(join(root, 'alpha'))
+    makeRepo(join(root, 'beta'))
+
+    const result = discoverRepos([root], [], false, 1, [join(root, 'alpha')])
+
+    expect(result.map((r) => r.name)).toEqual(['beta'])
+  })
 })
 
 describe('detectSetupState', () => {

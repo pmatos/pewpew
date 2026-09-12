@@ -297,22 +297,44 @@ app.whenReady().then(async () => {
   ipcMain.handle('projects:pin-path', async (_event, path: string) => {
     const config = getConfig()
     const resolved = resolve(path)
+    let changed = false
     if (!config.pinnedPaths.includes(resolved)) {
-      config.pinnedPaths.push(resolved)
-      saveConfig(config)
+      config.pinnedPaths = [...config.pinnedPaths, resolved]
+      changed = true
     }
+    // Re-pinning a path must undo a prior "Remove project" — otherwise
+    // discoverRepos keeps dropping it (it checks excludedPaths for pinned
+    // paths too) and there would be no way back short of hand-editing
+    // config.json.
+    if (config.excludedPaths.includes(resolved)) {
+      config.excludedPaths = config.excludedPaths.filter((p) => p !== resolved)
+      changed = true
+    }
+    if (changed) saveConfig(config)
   })
 
   ipcMain.handle('projects:remove-local', async (_event, path: string) => {
+    if (!path) throw new Error('No project path given')
     const config = getConfig()
     const resolved = resolve(path)
+    let changed = false
     if (!config.excludedPaths.includes(resolved)) {
-      config.excludedPaths.push(resolved)
+      config.excludedPaths = [...config.excludedPaths, resolved]
+      changed = true
     }
-    config.pinnedPaths = config.pinnedPaths.filter((p) => p !== resolved)
-    delete config.clusterPositions[resolved]
-    config.gitignoreWarned = config.gitignoreWarned.filter((p) => p !== resolved)
-    saveConfig(config)
+    if (config.pinnedPaths.includes(resolved)) {
+      config.pinnedPaths = config.pinnedPaths.filter((p) => p !== resolved)
+      changed = true
+    }
+    if (config.clusterPositions[resolved]) {
+      delete config.clusterPositions[resolved]
+      changed = true
+    }
+    if (config.gitignoreWarned.includes(resolved)) {
+      config.gitignoreWarned = config.gitignoreWarned.filter((p) => p !== resolved)
+      changed = true
+    }
+    if (changed) saveConfig(config)
   })
 
   ipcMain.handle('projects:add-remote', async (_event, input: { hostId: string; path: string }) => {

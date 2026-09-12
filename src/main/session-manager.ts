@@ -2282,6 +2282,9 @@ export async function relocateProject(
   if (!config.pinnedPaths.includes(newProjectPath)) {
     config.pinnedPaths.push(newProjectPath)
   }
+  // Relocating into a previously-removed path must undo the exclusion too,
+  // or discoverRepos keeps dropping it even though it's now pinned.
+  config.excludedPaths = (config.excludedPaths || []).filter((p) => p !== newProjectPath)
   saveConfig(config)
 
   if (toolsInUse.has('claude') || toolsInUse.size === 0) {
