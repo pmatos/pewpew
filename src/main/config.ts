@@ -97,6 +97,21 @@ export function markGitignoreWarned(projectPath: string): void {
   saveConfig(config)
 }
 
+// Adds `value` to `arr` if absent, returning a new array and whether it
+// changed. Never mutates `arr` in place — a string[] field on an AppConfig
+// from getConfig() may still be the shared DEFAULT_CONFIG array reference
+// when config.json predates that field, so an in-place push/splice would
+// corrupt that singleton for the process's lifetime.
+export function withAdded(arr: string[], value: string): { arr: string[]; changed: boolean } {
+  if (arr.includes(value)) return { arr, changed: false }
+  return { arr: [...arr, value], changed: true }
+}
+
+export function withRemoved(arr: string[], value: string): { arr: string[]; changed: boolean } {
+  if (!arr.includes(value)) return { arr, changed: false }
+  return { arr: arr.filter((p) => p !== value), changed: true }
+}
+
 export function resolvePath(p: string): string {
   if (p.startsWith('~/')) {
     return join(homedir(), p.slice(2))

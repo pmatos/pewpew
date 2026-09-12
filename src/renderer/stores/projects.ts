@@ -100,7 +100,11 @@ export const useProjectsStore = create<ProjectsState>((set, get) => ({
   removeLocalProject: async (path) => {
     try {
       await window.api.removeLocalProject(path)
-      await get().scanProjects()
+      // The backend already guarantees `path` won't reappear in a future
+      // scan, so drop it from local state directly instead of paying for a
+      // full rescan (filesystem walk + two git subprocesses per remaining
+      // project) just to remove one entry.
+      set((state) => ({ projects: state.projects.filter((p) => p.path !== path) }))
       return true
     } catch (e) {
       console.error('removeLocalProject failed:', e)

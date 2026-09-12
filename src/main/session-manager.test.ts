@@ -95,6 +95,7 @@ vi.mock('./config', () => ({
   getConfig: () => ({
     scanDirs: [],
     pinnedPaths: [],
+    excludedPaths: [],
     followSymlinks: true,
     canvas: { zoom: 1, panX: 0, panY: 0 },
     clusterPositions: {},
@@ -108,6 +109,12 @@ vi.mock('./config', () => ({
   getReconnectConfig: () => state.reconnectConfig,
   getSandboxConfig: () => ({ enabled: true, extraWritablePaths: [] }),
   saveConfig: vi.fn(),
+  withAdded: (arr: string[], value: string) =>
+    arr.includes(value) ? { arr, changed: false } : { arr: [...arr, value], changed: true },
+  withRemoved: (arr: string[], value: string) =>
+    arr.includes(value)
+      ? { arr: arr.filter((p) => p !== value), changed: true }
+      : { arr, changed: false },
 }))
 
 vi.mock('./window-registry', () => ({

@@ -7,6 +7,8 @@ import {
   getConfig,
   saveConfig,
   resolvePath,
+  withAdded,
+  withRemoved,
   CONFIG_DIR,
   shouldWarnGitignore,
   markGitignoreWarned,
@@ -297,41 +299,30 @@ app.whenReady().then(async () => {
   ipcMain.handle('projects:pin-path', async (_event, path: string) => {
     const config = getConfig()
     const resolved = resolve(path)
-    let changed = false
-    if (!config.pinnedPaths.includes(resolved)) {
-      config.pinnedPaths = [...config.pinnedPaths, resolved]
-      changed = true
-    }
+    const pinned = withAdded(config.pinnedPaths, resolved)
     // Re-pinning a path must undo a prior "Remove project" — otherwise
     // discoverRepos keeps dropping it (it checks excludedPaths for pinned
     // paths too) and there would be no way back short of hand-editing
     // config.json.
-    if (config.excludedPaths.includes(resolved)) {
-      config.excludedPaths = config.excludedPaths.filter((p) => p !== resolved)
-      changed = true
-    }
-    if (changed) saveConfig(config)
+    const excluded = withRemoved(config.excludedPaths, resolved)
+    config.pinnedPaths = pinned.arr
+    config.excludedPaths = excluded.arr
+    if (pinned.changed || excluded.changed) saveConfig(config)
   })
 
   ipcMain.handle('projects:remove-local', async (_event, path: string) => {
     if (!path) throw new Error('No project path given')
     const config = getConfig()
     const resolved = resolve(path)
-    let changed = false
-    if (!config.excludedPaths.includes(resolved)) {
-      config.excludedPaths = [...config.excludedPaths, resolved]
-      changed = true
-    }
-    if (config.pinnedPaths.includes(resolved)) {
-      config.pinnedPaths = config.pinnedPaths.filter((p) => p !== resolved)
-      changed = true
-    }
+    const excluded = withAdded(config.excludedPaths, resolved)
+    const pinned = withRemoved(config.pinnedPaths, resolved)
+    const gitignoreWarned = withRemoved(config.gitignoreWarned, resolved)
+    config.excludedPaths = excluded.arr
+    config.pinnedPaths = pinned.arr
+    config.gitignoreWarned = gitignoreWarned.arr
+    let changed = excluded.changed || pinned.changed || gitignoreWarned.changed
     if (config.clusterPositions[resolved]) {
       delete config.clusterPositions[resolved]
-      changed = true
-    }
-    if (config.gitignoreWarned.includes(resolved)) {
-      config.gitignoreWarned = config.gitignoreWarned.filter((p) => p !== resolved)
       changed = true
     }
     if (changed) saveConfig(config)
