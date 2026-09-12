@@ -8,7 +8,14 @@ import { dialog, shell } from 'electron'
 import { canonicalPath } from './agent-state-paths'
 import { canResumeLocal, canResumeRemote } from './agent-resumability'
 import { broadcastToAll, getMainWindow } from './window-registry'
-import { CONFIG_DIR, getConfig, getReconnectConfig, saveConfig } from './config'
+import {
+  CONFIG_DIR,
+  getConfig,
+  getReconnectConfig,
+  saveConfig,
+  withAdded,
+  withRemoved,
+} from './config'
 import { updateTray } from './tray'
 import { notifyNeedsInput, emitToast } from './notifications'
 import { createReconnectScheduler, type AttemptOutcome } from './reconnect-scheduler'
@@ -2279,9 +2286,12 @@ export async function relocateProject(
     delete config.clusterPositions[oldProjectPath]
   }
 
-  if (!config.pinnedPaths.includes(newProjectPath)) {
-    config.pinnedPaths.push(newProjectPath)
-  }
+  const pinned = withAdded(config.pinnedPaths, newProjectPath)
+  // Relocating into a previously-removed path must undo the exclusion too,
+  // or discoverRepos keeps dropping it even though it's now pinned.
+  const excluded = withRemoved(config.excludedPaths, newProjectPath)
+  config.pinnedPaths = pinned.arr
+  config.excludedPaths = excluded.arr
   saveConfig(config)
 
   if (toolsInUse.has('claude') || toolsInUse.size === 0) {

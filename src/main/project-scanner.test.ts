@@ -254,6 +254,33 @@ describe('discoverRepos', () => {
     // Depth 6 means the walk visits depth 1..6; 'repo' at level 7 is out of reach.
     expect(result).toEqual([])
   })
+
+  it('excludes a repo under a scanDir whose path is in excludedPaths', () => {
+    makeRepo(join(root, 'alpha'))
+    makeRepo(join(root, 'beta'))
+
+    const result = discoverRepos([root], [], true, 1, [join(root, 'alpha')])
+
+    expect(result.map((r) => r.name)).toEqual(['beta'])
+  })
+
+  it('excludes a pinned path that is in excludedPaths', () => {
+    const pinned = join(root, 'pinned', 'repo')
+    makeRepo(pinned)
+
+    const result = discoverRepos([], [pinned], true, 1, [pinned])
+
+    expect(result).toEqual([])
+  })
+
+  it('excludes a repo by its raw path when followSymlinks is false', () => {
+    makeRepo(join(root, 'alpha'))
+    makeRepo(join(root, 'beta'))
+
+    const result = discoverRepos([root], [], false, 1, [join(root, 'alpha')])
+
+    expect(result.map((r) => r.name)).toEqual(['beta'])
+  })
 })
 
 describe('detectSetupState', () => {

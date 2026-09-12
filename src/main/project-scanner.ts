@@ -93,11 +93,14 @@ export function discoverRepos(
   scanDirs: string[],
   pinnedPaths: string[],
   followSymlinks: boolean,
-  maxDepth: number
+  maxDepth: number,
+  excludedPaths: string[] = []
 ): { name: string; path: string }[] {
   const depth = Math.max(1, Math.min(6, maxDepth))
   const repos: { name: string; path: string }[] = []
   const seen = new Set<string>()
+  const canonicalize = (p: string): string | null => (followSymlinks ? safeRealpath(p) : p)
+  const excluded = new Set(excludedPaths.map(canonicalize).filter((p): p is string => p !== null))
 
   function walk(dir: string, currentDepth: number): void {
     let entries: string[]
@@ -117,13 +120,15 @@ export function discoverRepos(
         continue
       }
 
-      const realPath = followSymlinks ? safeRealpath(entryPath) : entryPath
+      const realPath = canonicalize(entryPath)
       if (realPath === null) continue
       if (seen.has(realPath)) continue
       seen.add(realPath)
 
       if (existsSync(join(entryPath, '.git'))) {
-        repos.push({ name: entry, path: entryPath })
+        if (!excluded.has(realPath)) {
+          repos.push({ name: entry, path: entryPath })
+        }
         continue
       }
 
@@ -139,7 +144,7 @@ export function discoverRepos(
   }
 
   for (const pinned of pinnedPaths) {
-    const realPinned = followSymlinks ? safeRealpath(pinned) : pinned
+    const realPinned = canonicalize(pinned)
     if (realPinned === null) continue
     if (seen.has(realPinned)) continue
     try {
@@ -149,6 +154,7 @@ export function discoverRepos(
       continue
     }
     if (!existsSync(join(pinned, '.git'))) continue
+    if (excluded.has(realPinned)) continue
     repos.push({ name: basename(pinned), path: pinned })
     seen.add(realPinned)
   }
@@ -189,9 +195,16 @@ export async function scanProjects(
   scanDirs: string[],
   pinnedPaths?: string[],
   followSymlinks?: boolean,
-  scanDepth?: number
+  scanDepth?: number,
+  excludedPaths?: string[]
 ): Promise<Project[]> {
-  const repos = discoverRepos(scanDirs, pinnedPaths || [], followSymlinks ?? true, scanDepth ?? 3)
+  const repos = discoverRepos(
+    scanDirs,
+    pinnedPaths || [],
+    followSymlinks ?? true,
+    scanDepth ?? 3,
+    excludedPaths || []
+  )
   const projects: Project[] = []
 
   async function enrichBatch(start: number): Promise<void> {

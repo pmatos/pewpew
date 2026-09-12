@@ -7,6 +7,8 @@ import {
   getConfig,
   saveConfig,
   resolvePath,
+  withAdded,
+  withRemoved,
   CONFIG_DIR,
   shouldWarnGitignore,
   markGitignoreWarned,
@@ -272,7 +274,14 @@ app.whenReady().then(async () => {
     const config = getConfig()
     const dirs = config.scanDirs.map(resolvePath)
     const pinned = (config.pinnedPaths || []).map(resolvePath)
-    const local = await scanProjects(dirs, pinned, config.followSymlinks, config.scanDepth)
+    const excluded = (config.excludedPaths || []).map(resolvePath)
+    const local = await scanProjects(
+      dirs,
+      pinned,
+      config.followSymlinks,
+      config.scanDepth,
+      excluded
+    )
     const remote = listRemoteProjects().map(remoteToProject)
     return [...local, ...remote].sort((a, b) => a.name.localeCompare(b.name))
   })
@@ -290,10 +299,33 @@ app.whenReady().then(async () => {
   ipcMain.handle('projects:pin-path', async (_event, path: string) => {
     const config = getConfig()
     const resolved = resolve(path)
-    if (!config.pinnedPaths.includes(resolved)) {
-      config.pinnedPaths.push(resolved)
-      saveConfig(config)
+    const pinned = withAdded(config.pinnedPaths, resolved)
+    // Re-pinning a path must undo a prior "Remove project" — otherwise
+    // discoverRepos keeps dropping it (it checks excludedPaths for pinned
+    // paths too) and there would be no way back short of hand-editing
+    // config.json.
+    const excluded = withRemoved(config.excludedPaths, resolved)
+    config.pinnedPaths = pinned.arr
+    config.excludedPaths = excluded.arr
+    if (pinned.changed || excluded.changed) saveConfig(config)
+  })
+
+  ipcMain.handle('projects:remove-local', async (_event, path: string) => {
+    if (!path) throw new Error('No project path given')
+    const config = getConfig()
+    const resolved = resolve(path)
+    const excluded = withAdded(config.excludedPaths, resolved)
+    const pinned = withRemoved(config.pinnedPaths, resolved)
+    const gitignoreWarned = withRemoved(config.gitignoreWarned, resolved)
+    config.excludedPaths = excluded.arr
+    config.pinnedPaths = pinned.arr
+    config.gitignoreWarned = gitignoreWarned.arr
+    let changed = excluded.changed || pinned.changed || gitignoreWarned.changed
+    if (config.clusterPositions[resolved]) {
+      delete config.clusterPositions[resolved]
+      changed = true
     }
+    if (changed) saveConfig(config)
   })
 
   ipcMain.handle('projects:add-remote', async (_event, input: { hostId: string; path: string }) => {

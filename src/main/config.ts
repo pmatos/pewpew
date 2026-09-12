@@ -41,6 +41,7 @@ export interface SandboxConfig {
 export interface AppConfig {
   scanDirs: string[]
   pinnedPaths: string[]
+  excludedPaths: string[]
   followSymlinks: boolean
   scanDepth: number
   canvas: CanvasState
@@ -66,6 +67,7 @@ const CONFIG_PATH = join(CONFIG_DIR, 'config.json')
 const DEFAULT_CONFIG: AppConfig = {
   scanDirs: ['~/dev'],
   pinnedPaths: [],
+  excludedPaths: [],
   followSymlinks: true,
   scanDepth: 3,
   canvas: { zoom: 0.7, panX: 0, panY: 0 },
@@ -93,6 +95,21 @@ export function markGitignoreWarned(projectPath: string): void {
   if (config.gitignoreWarned.includes(projectPath)) return
   config.gitignoreWarned = [...config.gitignoreWarned, projectPath]
   saveConfig(config)
+}
+
+// Adds `value` to `arr` if absent, returning a new array and whether it
+// changed. Never mutates `arr` in place — a string[] field on an AppConfig
+// from getConfig() may still be the shared DEFAULT_CONFIG array reference
+// when config.json predates that field, so an in-place push/splice would
+// corrupt that singleton for the process's lifetime.
+export function withAdded(arr: string[], value: string): { arr: string[]; changed: boolean } {
+  if (arr.includes(value)) return { arr, changed: false }
+  return { arr: [...arr, value], changed: true }
+}
+
+export function withRemoved(arr: string[], value: string): { arr: string[]; changed: boolean } {
+  if (!arr.includes(value)) return { arr, changed: false }
+  return { arr: arr.filter((p) => p !== value), changed: true }
 }
 
 export function resolvePath(p: string): string {

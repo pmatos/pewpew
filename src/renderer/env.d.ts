@@ -114,6 +114,7 @@ declare global {
       pickDirectory: () => Promise<string | null>
       relocateProject: (oldPath: string, newPath: string) => Promise<{ migratedCount: number }>
       pinProjectPath: (path: string) => Promise<void>
+      removeLocalProject: (path: string) => Promise<void>
       ptyWrite: (sessionId: string, data: string) => Promise<void>
       ptyResize: (sessionId: string, cols: number, rows: number) => Promise<void>
       ptyDestroy: (sessionId: string) => Promise<void>

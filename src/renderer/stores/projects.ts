@@ -27,6 +27,7 @@ interface ProjectsState {
   clearAddRemoteError: () => void
   addRemoteProject: (input: { hostId: string; path: string }) => Promise<void>
   removeRemoteProject: (hostId: string, path: string) => Promise<void>
+  removeLocalProject: (path: string) => Promise<boolean>
 }
 
 function errorMessage(e: unknown): string {
@@ -94,6 +95,20 @@ export const useProjectsStore = create<ProjectsState>((set, get) => ({
       await get().scanProjects()
     } catch (e) {
       console.error('removeRemoteProject failed:', e)
+    }
+  },
+  removeLocalProject: async (path) => {
+    try {
+      await window.api.removeLocalProject(path)
+      // The backend already guarantees `path` won't reappear in a future
+      // scan, so drop it from local state directly instead of paying for a
+      // full rescan (filesystem walk + two git subprocesses per remaining
+      // project) just to remove one entry.
+      set((state) => ({ projects: state.projects.filter((p) => p.path !== path) }))
+      return true
+    } catch (e) {
+      console.error('removeLocalProject failed:', e)
+      return false
     }
   },
 }))
