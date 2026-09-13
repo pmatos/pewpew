@@ -1,3 +1,10 @@
+# [0.11.0](https://github.com/pmatos/pewpew/compare/v0.10.6...v0.11.0) (2026-09-13)
+
+
+### Features
+
+* **projects:** add "Remove project" for local projects ([#313](https://github.com/pmatos/pewpew/issues/313)) ([d8d0eae](https://github.com/pmatos/pewpew/commit/d8d0eae16b03ad58da497912baf7fe48c996e8d5))
+
 ## [0.10.6](https://github.com/pmatos/pewpew/compare/v0.10.5...v0.10.6) (2026-09-10)
 
 
