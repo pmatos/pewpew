@@ -4,13 +4,13 @@ Persisted candidate memory for the `pm-deepen` routine. Reconciled against `gh` 
 
 ## spawn-remote-agent-pipeline
 
-- **Status**: in-flight
+- **Status**: landed
 - **Score**: 23/25 (leverage 5, locality 4, blast radius 2, heat 5)
 - **Files**: 3 (session-manager.ts + new remote-agent-spawn.ts + its test)
 - **Modules**: `src/main/session-manager.ts`, new `src/main/remote-agent-spawn.ts`
 - **Summary**: Extract the verbatim post-worktree remote spawn tail (resolve branch → install hooks → create pty) shared by the four remote create/adopt paths into one deep primitive; leave revive as-is.
 - **First seen**: 2026-09-02
-- **PR**: #300
+- **PR**: #300 (merged 2026-09-10)
 
 ### Run 2026-09-02 — complete
 
@@ -23,13 +23,23 @@ Persisted candidate memory for the `pm-deepen` routine. Reconciled against `gh` 
 
 ## remote-reconnect-coordinator
 
-- **Status**: proposed
+- **Status**: in-flight
 - **Score**: 21/25 (leverage 4, locality 5, blast radius 2, heat 4)
 - **Files**: ~3 estimated
 - **Modules**: `src/main/session-manager.ts` (1183-1529), new `src/main/remote-reconnect.ts`
 - **Summary**: House reconnect/probe orchestration (two in-flight maps + prepared-host lease lifecycle) behind a coordinator with an injected SessionLookup seam.
 - **First seen**: 2026-09-02
+- **PR**: #312
 - **Reason (note)**: runner-up candidate; direction partly depends on the session-store SessionLookup seam, so best sequenced after it.
+
+### Run 2026-09-14 — bailed-preflight
+
+- **Outcome**: bailed-preflight
+- **Stopped at**: step 2 — reconciliation surfaced open PR #312; one architecture PR at a time. Explore pass skipped: nothing it produced could be acted on while a PR is in flight.
+- **Branch**: `sym/pewpew/routine/refactor-audit/01M2EG404A`, adopted (all four adoption conditions held; 0 behind base; not renamed — an adopted branch keeps the caller's name)
+- **Committed**: backlog reconciliation only — `spawn-remote-agent-pipeline` → `landed` (#300 merged 2026-09-10), this entry → `in-flight` (#312)
+- **Evidence**: the committed backlog read `proposed` for this entry, but `gh pr list` shows open PR #312 (`refactor(session-manager): extract remote reconnect/probe into a deep coordinator`, head `sym/pewpew/routine/refactor-audit/01M26RZFY4`); the previous run's `in-flight` + PR-number commit lives on #312's branch and only reaches `origin/main` when #312 merges, so any firing between PR-open and merge sees a stale `proposed` on origin/main. Reconciled against gh, not the stale field.
+- **Next**: review/merge #312; next firing re-reconciles and picks the top surviving `proposed` candidate (currently `session-store` / `materialize-pr-worktree` at 20/25).
 
 ## session-store
 
