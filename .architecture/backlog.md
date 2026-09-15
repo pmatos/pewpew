@@ -4,13 +4,13 @@ Persisted candidate memory for the `pm-deepen` routine. Reconciled against `gh` 
 
 ## spawn-remote-agent-pipeline
 
-- **Status**: in-flight
+- **Status**: landed
 - **Score**: 23/25 (leverage 5, locality 4, blast radius 2, heat 5)
 - **Files**: 3 (session-manager.ts + new remote-agent-spawn.ts + its test)
 - **Modules**: `src/main/session-manager.ts`, new `src/main/remote-agent-spawn.ts`
 - **Summary**: Extract the verbatim post-worktree remote spawn tail (resolve branch → install hooks → create pty) shared by the four remote create/adopt paths into one deep primitive; leave revive as-is.
 - **First seen**: 2026-09-02
-- **PR**: #300
+- **PR**: #300 (merged 2026-09-10)
 
 ### Run 2026-09-02 — complete
 
@@ -23,13 +23,23 @@ Persisted candidate memory for the `pm-deepen` routine. Reconciled against `gh` 
 
 ## remote-reconnect-coordinator
 
-- **Status**: proposed
+- **Status**: in-flight
 - **Score**: 21/25 (leverage 4, locality 5, blast radius 2, heat 4)
 - **Files**: ~3 estimated
 - **Modules**: `src/main/session-manager.ts` (1183-1529), new `src/main/remote-reconnect.ts`
 - **Summary**: House reconnect/probe orchestration (two in-flight maps + prepared-host lease lifecycle) behind a coordinator with an injected SessionLookup seam.
 - **First seen**: 2026-09-02
-- **Reason (note)**: runner-up candidate; direction partly depends on the session-store SessionLookup seam, so best sequenced after it.
+- **PR**: #312
+- **Reason (note)**: runner-up candidate; direction partly depends on the session-store SessionLookup seam, so best sequenced after it. Committed backlog on `main` still showed `proposed` because the opening firing's in-flight/PR update lives on the #312 branch, not `main` (SKILL.md step 6's second-push hazard); promoted to `in-flight` here by cross-referencing `gh pr list --state open`.
+
+### Run 2026-09-16 — bailed (open architecture PR)
+
+- **Outcome**: bailed-preflight
+- **Stopped at**: step 2 — the `in-flight` entry `remote-reconnect-coordinator` still has an open PR (#312); one architecture PR at a time, and this is a default (implementing) run.
+- **Branch**: `sym/pewpew/routine/refactor-audit/01M2KMTZ11`, adopted (all four adoption conditions held; not renamed — an adopted branch keeps the caller's name)
+- **Committed**: backlog reconciliation only — `spawn-remote-agent-pipeline` → `landed` (PR #300 merged 2026-09-10), `remote-reconnect-coordinator` → `in-flight` (PR #312), plus this exit report. No `reviews/` file: the run stopped at reconciliation, before scoring fresh candidates.
+- **Evidence**: `gh pr view 300` → MERGED 2026-09-10; `gh pr view 312` → OPEN, created 2026-09-10, head `sym/pewpew/routine/refactor-audit/01M26RZFY4`.
+- **Next**: review/merge or close #312. Once no architecture PR is open, the next firing picks `materialize-pr-worktree` (20/25) — it wins the tie over `session-store` (also 20/25) on lower blast radius (2 vs 4). The next firing re-scores from scratch regardless.
 
 ## session-store
 
