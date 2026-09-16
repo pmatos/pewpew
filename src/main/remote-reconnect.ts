@@ -3,7 +3,11 @@ import type { HostConnectionState } from './host-connection'
 import type { PreparedRemoteHostLease } from './remote-host-runtime'
 import type { RemoteTmuxProbeResult } from './pty-manager'
 import type { AttemptOutcome } from './reconnect-scheduler'
-import { applyProbeTransition, computeProbeTransition } from './probe-transition'
+import {
+  applyProbeTransition,
+  computeProbeTransition,
+  type ProbeTransition,
+} from './probe-transition'
 import { classifyAutoReconnectResult } from './reconnect-outcome'
 
 // Read/notify slice of the session registry. CONTRACT: `get`/`values` return the
@@ -49,21 +53,32 @@ export interface RemoteReconnectDeps {
   host: RemoteHost
   terminal: RemoteTerminal
   feedback: UserFeedback
-  // Ambient clock, injected so probe-transition timestamps are deterministic in
-  // tests. Defaults to Date.now.
-  now?: () => number
 }
 
-// A rejection from acquireLease/probe/reattach may carry the connection state
-// remote-host-runtime captured before stopHostConnection wiped the runtime entry.
-// The coordinator reads it to classify auth-failed vs unreachable without
-// re-parsing stderr.
+// A rejection from acquireLease (prepareHost's ensureHostConnection leg) may
+// carry the connection state remote-host-runtime captured before
+// stopHostConnection wiped the runtime entry; probe/reattach rejections are
+// never tagged — they only run after a successful lease, so the
+// `host.runtimeState(hostId)` fallback at the catch site is load-bearing for
+// every post-lease failure (bootstrap, PTY attach). The coordinator reads the
+// tag to classify auth-failed vs unreachable without re-parsing stderr.
 type HostConnectionTaggedError = { hostConnectionState?: HostConnectionState }
 
-interface ReconnectOutcome {
-  state: HostConnectionState | undefined
-  lease: PreparedRemoteHostLease
+// The single consumer-side spelling of the tagged-error channel: narrows an
+// unknown rejection to the state remote-host-runtime attached, so the property
+// name lives in exactly one place on this side of the port.
+function taggedConnectionState(err: unknown): HostConnectionState | undefined {
+  return (err as HostConnectionTaggedError | null)?.hostConnectionState
 }
+
+// 'completed'/'error' are terminal statuses: the user has made a cleanup
+// decision (or the session errored), so no probe/reattach path may touch them —
+// probing one would find its tmux gone and flip it to 'dead', silently reverting
+// a Keep. All three entry guards below (manual reconnect, auto attempt, batch
+// filter) share this predicate; computeProbeTransition independently returns
+// null for them as the last line of defense.
+const isTerminal = (status: Session['status']): boolean =>
+  status === 'completed' || status === 'error'
 
 export interface RemoteReconnectCoordinator {
   reconnectRemoteSession(id: string): Promise<void>
@@ -80,12 +95,11 @@ export function createRemoteReconnectCoordinator(
   deps: RemoteReconnectDeps
 ): RemoteReconnectCoordinator {
   const { sessions, host, terminal, feedback } = deps
-  const now = deps.now ?? Date.now
 
   // In-flight reconnect promises keyed by session id. Two concurrent clicks on
   // the same pending card (fast double-click, or a click that races the
   // auto-fired batch probe) coalesce into one SSH attempt.
-  const inflightReconnects = new Map<string, Promise<ReconnectOutcome>>()
+  const inflightReconnects = new Map<string, Promise<PreparedRemoteHostLease>>()
 
   // Eager batch probe for remaining `pending` sessions on a host that just
   // became live. Runs `tmux has-session` per sibling over the live ControlMaster
@@ -106,16 +120,13 @@ export function createRemoteReconnectCoordinator(
   // auth-failed vs. network-unreachable get distinct UI states without
   // re-parsing stderr.
   async function reconnectRemoteSession(id: string): Promise<void> {
-    // A terminal session is done — never re-probe/reconnect it. attemptAutoReconnect
-    // already bails on 'completed'/'error' before calling; guard the manual/IPC entry
-    // point too, so triggering Reconnect on a kept ('completed') or errored session
-    // can't probe-and-flip it back to 'dead', silently undoing the user's Keep.
-    // Defense-in-depth: deriveRestoredState now restores terminal remotes as 'live'
-    // (not 'pending'), so the UI no longer offers Reconnect for them — but this keeps
-    // any other caller that reaches here with a stale non-live terminal session a
-    // no-op. Mirrors the status guard in attemptAutoReconnect.
+    // A terminal session is done — never re-probe/reconnect it, so triggering
+    // Reconnect on a kept ('completed') or errored session can't probe-and-flip
+    // it back to 'dead', silently undoing the user's Keep. Defense-in-depth:
+    // deriveRestoredState already restores terminal remotes as 'live' (not
+    // 'pending'), so the UI no longer offers Reconnect for them.
     const current = sessions.get(id)
-    if (current && (current.status === 'completed' || current.status === 'error')) return
+    if (current && isTerminal(current.status)) return
 
     const existing = inflightReconnects.get(id)
     if (existing) {
@@ -126,22 +137,21 @@ export function createRemoteReconnectCoordinator(
     // Capture hostId BEFORE the await: if `removeSession(id)` runs while this
     // reconnect is in flight, `sessions.get(id)` would return undefined after
     // the await and we'd neither release the host retain nor run the sibling
-    // batch — leaking the ControlMaster for the lifetime of the app.
-    const initialHostId = sessions.get(id)?.hostId ?? null
+    // batch — leaking the ControlMaster for the lifetime of the app. No await
+    // has run since `current` was read, so this is the same entry.
+    const initialHostId = current?.hostId ?? null
 
     const promise = doReconnectRemoteSession(id)
     inflightReconnects.set(id, promise)
     let reconnectError: unknown = undefined
-    let outcome: ReconnectOutcome | undefined
+    let lease: PreparedRemoteHostLease | undefined
     try {
-      outcome = await promise
+      lease = await promise
     } catch (err) {
       reconnectError = err
     } finally {
       inflightReconnects.delete(id)
     }
-    const successState = outcome?.state
-    const leaseForBatch = outcome?.lease
     // Fire-and-forget the sibling batch probe — the caller should not block on
     // it. `probePendingSessionsOnHost` is idempotent so concurrent clicks on
     // multiple cards of the same host still collapse to a single batch.
@@ -155,8 +165,10 @@ export function createRemoteReconnectCoordinator(
     // Skip only when there's no host at all (orphaned hostId / missing registry
     // entry) or we couldn't determine any state — there's nothing to probe.
     const hostId = sessions.get(id)?.hostId ?? initialHostId
-    const tagged = (reconnectError as HostConnectionTaggedError | null)?.hostConnectionState
-    const stateHint = successState ?? tagged ?? (hostId ? host.runtimeState(hostId) : undefined)
+    // On success the runtime is live (the lease was just acquired over it), so
+    // a fresh oracle read serves where a failure instead falls back from the tag.
+    const stateHint =
+      taggedConnectionState(reconnectError) ?? (hostId ? host.runtimeState(hostId) : undefined)
     if (hostId && stateHint) {
       // Fire-and-forget: user's first click should not wait for sibling
       // reconciliation. The prepared-host lease is released after the batch,
@@ -167,16 +179,47 @@ export function createRemoteReconnectCoordinator(
         } catch (err) {
           console.error(`probePendingSessionsOnHost(${hostId}) failed:`, err)
         } finally {
-          await leaseForBatch?.release()
+          // The IIFE's promise is discarded, so a rejecting release() would
+          // escape as an unhandled rejection — the port permits it even though
+          // today's production release swallows errors.
+          await lease?.release().catch((err) => {
+            console.error(`releasing prepared-host lease for ${hostId} failed:`, err)
+          })
         }
       })()
     } else {
-      await leaseForBatch?.release()
+      await lease?.release()
     }
     if (reconnectError !== undefined) throw reconnectError
   }
 
-  async function doReconnectRemoteSession(id: string): Promise<ReconnectOutcome> {
+  // Probe one session over the live ControlMaster and compute its state
+  // transition, reattaching when the remote tmux is still present. Pure decision
+  // core in probe-transition.ts; callers own applying the delta and notifying.
+  // A `null` transition means the session resolved to a terminal state while the
+  // probe/reattach was in flight (e.g. a delayed session.end hook drove
+  // promptCleanup and the user chose Keep) — applying the delta would clobber
+  // that decision ('absent' → 'dead'), re-exposing cleanup and risking deletion
+  // of the kept worktree, so callers must leave the session untouched.
+  async function probeAndReattach(
+    session: Session,
+    h: Host
+  ): Promise<{ probe: RemoteTmuxProbeResult; transition: ProbeTransition | null }> {
+    const probe = await terminal.probe(session.id, h)
+    let transition = computeProbeTransition(session.status, probe, Date.now())
+    if (transition?.reattach) {
+      // Reattach before the caller applies the delta so a reattach failure
+      // leaves the session's fields untouched and propagates to its catch. The
+      // reattach await is a real window in which a concurrent session.end →
+      // Keep can drive status to terminal, so re-derive against the now-current
+      // status: a stale 'running → idle' delta must not revert a kept session.
+      await terminal.reattach(session.id, h)
+      transition = computeProbeTransition(session.status, probe, Date.now())
+    }
+    return { probe, transition }
+  }
+
+  async function doReconnectRemoteSession(id: string): Promise<PreparedRemoteHostLease> {
     const session = sessions.get(id)
     if (!session) throw new Error(`Session ${id} not found`)
     if (!session.hostId) {
@@ -195,34 +238,20 @@ export function createRemoteReconnectCoordinator(
     let lease: PreparedRemoteHostLease | null = null
     try {
       lease = await host.acquireLease(h)
-      const probe = await terminal.probe(id, h)
-      // Pure decision core in probe-transition.ts. `null` = the session resolved to
-      // a terminal state while this probe was in flight (e.g. a delayed session.end
-      // hook drove promptCleanup and the user chose Keep). Applying the probe result
-      // now would clobber that decision ('absent' → 'dead'), re-exposing cleanup and
-      // risking deletion of the kept worktree. Leave it untouched; the lease is still
-      // returned below so the caller reconciles/releases it.
-      let transition = computeProbeTransition(session.status, probe, now())
-      if (transition?.reattach) {
-        // Reattach before applying the delta so a reattach failure leaves the
-        // session's fields untouched and falls through to the catch below. The
-        // reattach await is a real window in which a concurrent session.end → Keep
-        // can drive status to terminal, so re-derive against the now-current status:
-        // a stale 'running → idle' delta must not revert a session the user kept.
-        await terminal.reattach(id, h)
-        transition = computeProbeTransition(session.status, probe, now())
-      }
+      // A null transition leaves the session untouched; the lease is still
+      // returned so the caller reconciles/releases it.
+      const { transition } = await probeAndReattach(session, h)
       if (transition) {
         applyProbeTransition(session, transition)
         sessions.changed()
       }
+      return lease
     } catch (err) {
       // Prefer the state captured by remote-host-runtime (attached to the error
       // before stopHostConnection wipes the runtime entry). Fall back to the
       // live runtime when the failure happened after the host was prepared
       // (e.g. bootstrap / PTY attach step).
-      const tagged = (err as HostConnectionTaggedError | null)?.hostConnectionState
-      const runtimeState = tagged ?? host.runtimeState(hostId)
+      const runtimeState = taggedConnectionState(err) ?? host.runtimeState(hostId)
       if (runtimeState === 'auth-failed') {
         session.connectionState = 'auth-failed'
       } else if (runtimeState === 'unreachable') {
@@ -234,9 +263,6 @@ export function createRemoteReconnectCoordinator(
       await lease?.release()
       throw err
     }
-    const finalState = host.runtimeState(hostId)
-    if (!lease) throw new Error(`Session ${id} did not acquire a remote host lease`)
-    return { state: finalState, lease }
   }
 
   // One auto-reconnect attempt for a remote session that dropped. Delegates to
@@ -249,14 +275,17 @@ export function createRemoteReconnectCoordinator(
     if (!session.hostId) return 'gave-up'
     // The session ended normally (completed/error) between scheduling and now —
     // don't probe/reattach, which would flip it to 'dead' with a bogus toast.
-    if (session.status === 'completed' || session.status === 'error') return 'gave-up'
-    const h = host.get(session.hostId)
-    const label = h?.label || h?.alias || session.hostId
+    if (isTerminal(session.status)) return 'gave-up'
 
     // A manual reconnect (or the user's Retry click) may have already reattached
     // between the drop and this tick. Detect a genuine live attach via the pty —
     // connectionState alone is stale ('live' is never reset on a bare drop).
     if (session.connectionState === 'live' && terminal.hasPty(id)) return 'recovered'
+
+    // Below the 'recovered' fast path: host.get re-reads and parses config.json
+    // synchronously, and the label is only used by the toast effects.
+    const h = host.get(session.hostId)
+    const label = h?.label || h?.alias || session.hostId
 
     try {
       await reconnectRemoteSession(id)
@@ -322,23 +351,19 @@ export function createRemoteReconnectCoordinator(
     hostId: string,
     stateHint?: HostConnectionState
   ): Promise<void> {
-    const h = host.get(hostId)
-    if (!h) return
-    const reconnectHost = h
+    const reconnectHost = host.get(hostId)
+    if (!reconnectHost) return
 
     const pending: Session[] = []
     for (const session of sessions.values()) {
-      // Skip terminal (completed/error) sessions from the pending pool: probing one
-      // would find its tmux gone and flip it to 'dead', silently reverting a session
-      // the user chose to keep. deriveRestoredState now restores terminal remotes as
-      // 'live' (not 'pending'), so they shouldn't reach here — this is defense-in-depth
-      // against any other path leaving a terminal session 'pending'. Mirrors the
-      // guards in attemptAutoReconnect and reconnectRemoteSession.
+      // Skip terminal sessions from the pending pool (see isTerminal).
+      // deriveRestoredState restores terminal remotes as 'live' (not 'pending'),
+      // so they shouldn't reach here — this is defense-in-depth against any
+      // other path leaving a terminal session 'pending'.
       if (
         session.hostId === hostId &&
         session.connectionState === 'pending' &&
-        session.status !== 'completed' &&
-        session.status !== 'error'
+        !isTerminal(session.status)
       ) {
         pending.push(session)
       }
@@ -357,58 +382,41 @@ export function createRemoteReconnectCoordinator(
       return
     }
 
-    async function reconnectNext(index: number): Promise<void> {
-      const s = pending[index]
-      if (!s) return
+    // Track mutations so a batch that skipped every sibling (removed mid-batch,
+    // concurrently advanced out of `pending`, or kept mid-probe) doesn't persist
+    // and broadcast an unchanged registry.
+    let dirty = false
+    for (const s of pending) {
       // The snapshot was taken once at batch entry; by the time we get here
       // another concurrent reconnect (e.g. user clicking a sibling card) may
       // have already advanced this session out of `pending`. Skip — otherwise
       // we'd duplicate the remote reattach and leak the earlier runtime retain.
-      if (s.connectionState !== 'pending') {
-        await reconnectNext(index + 1)
-        return
-      }
+      // Re-check registry membership too: removeSession/removeSessionsForHost
+      // delete the entry WITHOUT mutating this snapshot object, so a sibling
+      // removed mid-batch (e.g. hosts:delete) still reads 'pending' here and
+      // would be reattached as an ownerless PTY nothing can destroy.
+      const live = sessions.get(s.id)
+      if (!live || live.connectionState !== 'pending') continue
       try {
-        const probe = await terminal.probe(s.id, reconnectHost)
-        // Same pure decision core as doReconnectRemoteSession (probe-transition.ts).
-        // `null` = the session resolved to terminal (a concurrent session.end →
-        // promptCleanup → Keep) while this probe was in flight — the snapshot filter
-        // above only catches sessions already terminal at batch entry. Skip it and
-        // move on without clobbering that decision.
-        let transition = computeProbeTransition(s.status, probe, now())
-        if (transition === null) {
-          await reconnectNext(index + 1)
-          return
-        }
-        if (transition.reattach) {
-          // The reattach await is a real window in which a concurrent session.end →
-          // Keep can resolve this session to terminal; re-derive against the
-          // now-current status so a stale 'running → idle' delta can't revert it.
-          await terminal.reattach(s.id, reconnectHost)
-          transition = computeProbeTransition(s.status, probe, now())
-          if (transition === null) {
-            await reconnectNext(index + 1)
-            return
-          }
-        }
+        const { probe, transition } = await probeAndReattach(s, reconnectHost)
+        if (transition === null) continue
         applyProbeTransition(s, transition)
+        dirty = true
         // An SSH probe failure (unreachable — timeout / auth / network) means the
         // remote may still be running. The transition already marked it; bail so we
         // don't mis-classify the rest of the batch as dead on a transient failure.
-        if (probe === 'unreachable') return
+        if (probe === 'unreachable') break
       } catch (err) {
         // A mid-batch SSH failure means the host dropped. Mark this sibling
         // unreachable and stop — remaining siblings stay `pending` for a
         // later manual reconnect, avoiding a flood of follow-up SSH attempts.
         console.error(`probePendingSessionsOnHost(${hostId}) aborted on ${s.id}:`, err)
         s.connectionState = 'unreachable'
-        return
+        dirty = true
+        break
       }
-      await reconnectNext(index + 1)
     }
-
-    await reconnectNext(0)
-    sessions.changed()
+    if (dirty) sessions.changed()
   }
 
   return { reconnectRemoteSession, attemptAutoReconnect, probePendingSessionsOnHost }

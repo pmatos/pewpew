@@ -138,7 +138,7 @@ graph LR
 | ------------------------ | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | `config-ipc-passthrough` | Leverage 1 — fails the deletion test; moves IPC plumbing rather than concentrating behaviour, and touches the published IPC contract. Re-checked: filter still applies.                             |
 | `repo-ref-value-object`  | Published-interface change — rewrites exported `src/shared/types.ts` and the preload IPC surface; the autonomy contract bars expanding a published interface unattended. Re-checked: still applies. |
-| `gh-string-error-union`  | Pervasive-convention migration (`T                                                                                                                                                                  | string` → typed Result) across many files, not a single seam. Re-checked: still applies. |
+| `gh-string-error-union`  | Pervasive-convention migration (`T \| string` → typed Result) across many files, not a single seam. Re-checked: still applies.                                                                      |
 
 ## Too large to automate
 

@@ -112,7 +112,6 @@ function makeHarness(opts: HarnessOpts = {}): Harness {
         state.cleanupCalls.push(id)
       },
     },
-    now: () => 5000,
   }
 
   const coord = createRemoteReconnectCoordinator(deps)
@@ -253,6 +252,10 @@ describe('createRemoteReconnectCoordinator — probePendingSessionsOnHost', () =
   })
 
   it('a mid-batch SSH failure stops the cascade; later siblings stay pending', async () => {
+    // Production probeRemoteTmuxSession never rejects — SSH failures resolve as
+    // the 'unreachable' value (that bail path is covered in the session-manager
+    // suite). The realistic thrower inside the batch's try is reattach
+    // (pty.spawn), so inject the failure there to exercise this catch arm.
     const h = makeHarness({
       sessions: [
         remoteSession({ id: 'a', hostId: 'h1', status: 'idle', connectionState: 'pending' }),
@@ -260,9 +263,8 @@ describe('createRemoteReconnectCoordinator — probePendingSessionsOnHost', () =
         remoteSession({ id: 'c', hostId: 'h1', status: 'idle', connectionState: 'pending' }),
       ],
       runtimeState: () => 'live',
-      probe: async (id) => {
+      reattach: async (id) => {
         if (id === 'b') throw taggedError('unreachable')
-        return 'present'
       },
     })
 
@@ -271,5 +273,29 @@ describe('createRemoteReconnectCoordinator — probePendingSessionsOnHost', () =
     expect(h.get('a').connectionState).toBe('live')
     expect(h.get('b').connectionState).toBe('unreachable')
     expect(h.get('c').connectionState).toBe('pending')
+  })
+
+  it('skips a sibling removed from the registry mid-batch (no orphan reattach)', async () => {
+    // removeSession/removeSessionsForHost delete the registry entry without
+    // mutating the snapshot object — the batch must notice via sessions.get,
+    // not the stale object's connectionState, or it reattaches a PTY with no
+    // registry owner.
+    const h = makeHarness({
+      sessions: [
+        remoteSession({ id: 'a', hostId: 'h1', status: 'idle', connectionState: 'pending' }),
+        remoteSession({ id: 'b', hostId: 'h1', status: 'idle', connectionState: 'pending' }),
+      ],
+      runtimeState: () => 'live',
+      probe: async (id) => {
+        if (id === 'a') h.store.delete('b')
+        return 'present'
+      },
+    })
+
+    await h.coord.probePendingSessionsOnHost('h1')
+
+    expect(h.probeCalls).toEqual(['a'])
+    expect(h.reattachCalls).toEqual(['a'])
+    expect(h.get('a').connectionState).toBe('live')
   })
 })

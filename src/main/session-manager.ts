@@ -1088,8 +1088,11 @@ export async function killSession(id: string): Promise<void> {
 const reconnectCoordinator = createRemoteReconnectCoordinator({
   sessions: {
     get: (id) => sessions.get(id)?.session,
-    values: allSessions,
-    changed: onSessionsChanged,
+    // Resolve module-local captures at call time (matching the acquireLease
+    // adapter below) so construction never depends on declaration hoisting —
+    // promptCleanup is declared ~300 lines below this literal.
+    values: () => allSessions(),
+    changed: () => onSessionsChanged(),
   },
   host: {
     get: getHost,
@@ -1102,8 +1105,8 @@ const reconnectCoordinator = createRemoteReconnectCoordinator({
     hasPty,
   },
   feedback: {
-    toast: emitToast,
-    promptCleanup,
+    toast: (event) => emitToast(event),
+    promptCleanup: (id) => promptCleanup(id),
   },
 })
 
