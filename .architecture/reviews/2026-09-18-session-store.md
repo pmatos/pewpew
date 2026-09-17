@@ -544,4 +544,127 @@ Blast radius was the axis that moved the ranking. The 2026-09-02 firing scored i
 
 ## Design
 
-Written at step 4; see below.
+Three designs were produced in parallel by sub-agents, each briefed to a *radically different* optimisation target, and each given both invariants and the structural-only scope decision verbatim. All three independently converged on: the registry becomes `Map<string, Session>` (the `SessionEntry` wrapper dies), the store satisfies `remote-reconnect.ts`'s `SessionLookup` structurally so the 9-line adapter at `session-manager.ts:1095-1103` collapses to `sessions: store`, `remote-reconnect.ts` is **not edited**, and the work fits in 3 files. They disagree on how much policy the store should own, and on whether a `batch()` primitive should exist at all.
+
+### Design A — minimal surface
+
+**Thesis**: because the store must hand back live references (invariant 2), field mutators are unnecessary — callers already mutate through the reference they hold. The only things a store must own are **membership** and the **fan-out**. Everything else is composition.
+
+Five methods, three of which are `SessionLookup` verbatim:
+
+```ts
+export interface SessionStoreSinks {
+  persist(sessions: Session[]): void
+  broadcast(sessions: Session[]): void
+  tray(sessions: Session[]): void
+}
+
+export interface SessionStore {
+  get(id: string): Session | undefined
+  values(): Iterable<Session>
+  add(session: Session): void      // insert or replace by id; does NOT flush
+  remove(id: string): boolean      // returns whether present; does NOT flush
+  changed(): void                  // persist -> broadcast -> tray, one snapshot
+}
+
+export function createSessionStore(sinks: SessionStoreSinks): SessionStore
+```
+
+**There is deliberately no `update()` and no `batch()`.** Invariant 1 is satisfied *by construction rather than by care*: no operation on this store can flush, so no operation can flush spuriously, and the `try { fn() } finally { changed() }` failure mode is unrepresentable. `updateLastKnownStatesBatch` survives byte-for-byte; only three lines inside `applyLastKnownState` change (`entry.session` → `session`).
+
+**What it hides**: that three sinks exist at all; the persist → broadcast → tray order; that all three see one snapshot array (today each of `persistSessions`, `notifyRenderer` and `updateTray(getSessions())` independently rebuilds it — three allocations, three chances to diverge); that a `Map` exists; the `SessionEntry` wrapper.
+
+**Trade-offs it states against itself**: nothing enforces "mutate then flush" — every mutation site stays individually responsible for calling `changed()`. The `lastKnownState` throttle (the 10 s window, the 3 KiB cap, the text-equality no-op) stays *outside* the store, so `session-store.test.ts` cannot test it; those keep needing the `session-manager.test.ts` mega-harness. A sixth operation `noteLastKnownState(id, text, now): boolean` was considered and rejected because it would make the store know a field name.
+
+**Migration**: 45 field mutations change **0** (live references mean the mutation sites are exactly the ones that don't change); 25 `onSessionsChanged()` sites change 0 (kept as a hoisted wrapper); 30 direct registry accesses all change, mechanically. ~130-160 changed lines in one file, 3 files total.
+
+### Design B — optimised for the most common caller
+
+Began with a census of all 59 mutation and 38 notify sites, classified by statement shape. Result: **bucket A — "look up one session by id → write 1-4 fields → persist+broadcast+tray once" — is 23 of 38 notifies (61%) and 29 of 59 mutation lines**, in 21 statements. The runner-up shape (insert-then-flush) is 5 sites. So the interface is shaped around one call, `store.update(id, patch)`:
+
+```ts
+export type SessionPatch = Partial<Omit<Session, 'id'>>
+
+export interface SessionStore {
+  get(id: string): Session | undefined
+  values(): Iterable<Session>          // lazy
+  all(): Session[]                     // stable snapshot
+  update(id: string, patch: SessionPatch): boolean   // patches in place, then FLUSHES
+  insert(session: Session): void       // throws on duplicate; does not flush
+  remove(id: string): boolean          // does not flush
+  changed(): void
+  batch(fn: () => void): void          // depth counter + dirty flag
+}
+```
+
+`batch` is a depth/dirty counter, not `try/finally`: `depth++; try { fn() } finally { depth-- }; if (depth === 0 && dirty) flush()`. The `finally` restores depth only; the flush sits outside it and is gated on `dirty`, so a throw unwinds without broadcasting.
+
+**Census findings worth keeping regardless of which design wins:**
+- **Bucket C (9 of the 59 "mutation" lines) is not registry mutation at all** — `backfillDerivedFields` and the restore-loop writes happen on JSON-parsed objects *before* `sessions.set`. No store design can affect them.
+- **Line 1482 is a 60th mutation site** the review's list omits (`if (session.hostId) session.connectionState = 'live'`, immediately before `updateSession(id, 'completed')` at 1483).
+- **There are four hand-rolled dirty flags, not one**: `updateLastKnownStatesBatch`'s `any` (`:288`), `removeSessionsForHost`'s `removed` (`:1405`), `handleHookEvent`'s `mutated` (`:1062`), and `remote-reconnect.ts`'s `dirty` (`:394`). Invariant 1's shape appears four times in this codebase.
+- `handleHookEvent` has a **real** zero-notify case: `applyHookEvent`'s `session.end` branches return the *original* map, so every identity test fails and no flush happens.
+
+**Why it loses on scope**: two of its moves are behaviour changes, and this run's scope decision is structural only. Its `handleHookEvent` rewrite folds the reducer's fresh object onto the live one via `Object.assign` instead of swapping it — which *fixes* the stale-reference hazard rather than preserving it — and its `insert` throws on a duplicate id where today's `sessions.set` silently replaces. It also flags a third intentional change at `:504`. Each is individually defensible and arguably an improvement; together they turn a mechanical refactor into a behavioural one in the hottest file in the repo. Its `SessionPatch` also carries an unguarded hazard it documents but cannot type: with `exactOptionalPropertyTypes` off, `{ branch: undefined }` type-checks and would produce a `Session` violating its own type.
+
+### Design C — ports and adapters
+
+Opens by rejecting the hexagonal instinct toward a pure immutable core, in the codebase's own words: `remote-reconnect.ts:12-19` requires live references, so the boundary is drawn not around field mutation but around **membership**, **identity-preserving reads**, **the change edge**, and **the two write policies that already travel with the data**.
+
+```ts
+export interface SessionPersistence { save(sessions: readonly Session[]): void }
+export interface SessionBroadcast   { publish(sessions: readonly Session[]): void }
+export interface SessionTray        { update(sessions: readonly Session[]): void }
+export type Now = () => number
+
+export interface SessionStore {
+  get(id: string): Session | undefined
+  values(): Iterable<Session>
+  all(): Session[]
+  insert(session: Session): void
+  replace(id: string, next: Session): boolean
+  delete(id: string): boolean
+  setStatus(id: string, status: SessionStatus): boolean
+  recordLastKnownState(id: string, text: string): boolean
+  changed(): void
+  batch(body: () => boolean): boolean
+}
+```
+
+**`batch(body: () => boolean)` is the design's sharpest move.** The natural wrong implementation cannot be *expressed* through this signature — a caller who forgets to thread the dirty flag gets `error TS2345: Argument of type '() => void' is not assignable to parameter of type '() => boolean'` rather than a spurious broadcast. Invariant 1 becomes a compile-time property.
+
+**Mutators never notify**; every mutator returns whether it changed anything and fires no port. `changed()` is the only thing that reaches disk, renderer or tray.
+
+**It owns the most policy**: the whole `lastKnownState` write policy (the 10 s window, the per-session bookkeeping map, the 3 KiB tail cap, the idle-text-equality no-op — ~35 lines at `:251-284` collapse to one `recordLastKnownState` call), the status+`lastActivity` stamping, and the clock.
+
+**Port honesty**: the design audits its own ports against the "one adapter = hypothetical seam, two = real" rule and concludes **all four are hypothetical** — production plus a test double is one real adapter, not two. It declines to dress this up, and explicitly declines a `observers: SessionObserver[]` collapse that *would* have cleared the two-adapter bar, on the grounds that the shared signature is a coincidence rather than a category (persist must be durable-before-visible; broadcast structured-clones every field over IPC; tray reads a status aggregate). What the ports actually buy is **import-graph isolation**: `session-store.ts` imports exactly one thing, `type { Session, SessionStatus }` — no `fs`, no `./config`, no `electron`, no global `Date` — so its test needs zero `vi.mock` calls against `session-manager.test.ts`'s ~15.
+
+**Where it declines its own uniformity**: `handleHookEvent` deliberately keeps an explicit `if (mutated) store.changed()` rather than using `batch`, because the intents must be realized *between* the last mutation and the notification — which is exactly what `batch`'s shape forbids. The design keeps that visible rather than contorting the call site.
+
+**One load-bearing implementation detail it flags**: the clock adapter must be `now: () => Date.now()`, not `now: Date.now`. Vitest's fake timers install a new `Date` on `globalThis`, so a reference captured at module init keeps returning real time and silently breaks `session-manager.test.ts:1588-1598`.
+
+**One non-structural liberty it flags**: `delete(id)` also drops the session's `lastKnownStateWrites` entry, which `session-manager.ts` never does today — a small unbounded-growth leak. Unobservable (ids are `randomUUID`, never reused) and free once the store owns the map.
+
+**One pre-existing hazard it documents rather than fixes**: `session-manager.ts:1068` swaps the stored object because `applyHookEvent` is copy-on-write, so any reference captured before the swap goes stale. `remote-reconnect.ts`'s `SessionLookup` CONTRACT covers *deletion* mid-await but says nothing about *replacement*. Scope is structural only, so the design moves the behaviour behind `replace`, writes the hazard into that method's contract, and pins it with a test.
+
+**Migration**: 51 in-place field writes change **0**; 6 structural sites change; 2 of 38 notify sites change. 3 files. `remote-reconnect.ts` zero edits, `session-manager.test.ts` zero edits — and the design names that last one as the bail-out gate: *"if the implementer finds themselves changing an assertion in that 3,888-line suite, something has drifted and the run should bail rather than 'fix' the test."* It also sequences the work into four steps, each of which type-checks and leaves the suite green, so a bail at any point lands something coherent.
+
+### Adjudication
+
+Adjudicated against the fixed criteria, in order: **depth** (behaviour per unit of interface a caller must learn), **locality** (where change, bugs and verification concentrate afterwards), **seam placement** (is the seam where something actually varies — one adapter is hypothetical, two is real), **test surface** (can the behaviour be exercised through the interface without reaching past it), **blast radius** (of two otherwise-equal designs, the smaller diff wins). The advisor was consulted on the written designs above.
+
+**Winner: Design C (ports and adapters).**
+
+1. **Depth** — C is deepest by a clear margin. It absorbs the `lastKnownState` write policy (~35 lines of rate limit, cap and no-op suppression), the status+`lastActivity` stamping and the clock behind its interface; A owns only membership and fan-out and explicitly leaves the throttle outside; B sits between them, keeping the throttle guards in `session-manager.ts`. Behaviour-per-unit-of-interface is the axis this exercise exists to move, and it separates the three cleanly.
+2. **Locality** — C concentrates the most. After it, a change to the rate-limit window, the cap, the no-op rule or the fan-out order is a one-file edit with a test beside it. A's own trade-off section concedes the opposite: the throttle "keeps needing the `session-manager.test.ts` mega-harness."
+3. **Seam placement** — a wash on the letter of the rule, since every port in all three designs has exactly one production adapter. C is the only design that *audits itself against the rule and says so*, and the only one that declined an available collapse that would have cleared the bar artificially. Its `Now` port is the one seam with an independent justification — it removes fake-timer dependence from the store's tests, with a concrete failure mode demonstrating the binding matters.
+4. **Test surface** — decisive for C. It can assert the rate-limit boundary exactly (9,999 → false, 10,000 → true, where the existing test can only approach it with `+11_000`), the 3 KiB cap, the text no-op, persist-first fail-fast under a throwing sink, fan-out ordering, single-snapshot identity, the live-reference contract as executable spec, and the `replace` staleness hazard — all with zero `vi.mock` and no fake timers. A can reach ordering, snapshot identity and live references but not the throttle. This is "the interface is the test surface" applied literally.
+5. **Blast radius** — A and C are comparable (3 files; A ~130-160 changed lines, C similar with 6 structural sites and 2 notify sites changing), so this criterion does not separate them and the higher criteria stand.
+
+**Why A lost** (the runner-up **design**): it is the safest and the most elegant argument — invariant 1 satisfied by construction rather than by care is a genuinely better answer than either alternative's runtime mechanism, and it is right that live references make field mutators unnecessary. But it buys that safety by owning less. Its own report names the cost: the throttle stays outside, so the single largest block of testable policy in the area remains reachable only through the mega-harness, and "nothing enforces mutate-then-flush." A store that owns membership and a fan-out is a *shallower* module than one that also owns the write policies that travel with the data. On depth, locality and test surface — the first, second and fourth criteria — C wins, and blast radius does not rescue A.
+
+**Why B lost**: its census is the most valuable artefact any of the three produced and its findings are folded into this report regardless. But it is disqualified on scope before the criteria are reached: two of its moves (the identity-preserving `handleHookEvent` fold, and `insert` throwing on a duplicate) are behaviour changes, and a third is flagged at `:504`. This run settled on structural-only precisely so that a ~60-site mechanical diff in the hottest file in the repo stays reviewable. B's changes are defensible improvements — the `handleHookEvent` fold would close a real stale-reference hazard — but they belong in their own PR, proposed rather than smuggled.
+
+**Carried into implementation from the losing designs:**
+- From B: the census figures (bucket C's 9 lines are object construction, not registry mutation; the four hand-rolled dirty flags; the 60th mutation site at `:1482`).
+- From A: the `session-manager.test.ts`-needs-zero-edits bail-out gate, which C independently reached and states more sharply.
