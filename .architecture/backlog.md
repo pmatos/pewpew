@@ -51,7 +51,7 @@ Persisted candidate memory for the `pm-deepen` routine. Reconciled against `gh` 
 
 ## session-store
 
-- **Status**: proposed
+- **Status**: in-flight
 - **Score**: 24/25 (leverage 5, locality 5, blast radius 2, heat 5)
 - **Files**: ~5 estimated (new `session-store.ts` + its test, `session-manager.ts`, `remote-reconnect.ts`, `session-manager.test.ts`)
 - **Modules**: `src/main/session-manager.ts`, `src/main/remote-reconnect.ts`, new `src/main/session-store.ts`
@@ -63,6 +63,9 @@ Persisted candidate memory for the `pm-deepen` routine. Reconciled against `gh` 
   1. `batch()` must permit **zero** notifies — `updateLastKnownStatesBatch` (`session-manager.ts:286-299`) ORs per-update dirty flags and may fire nothing at all; `session-manager.test.ts:1537-1601` asserts that case. A `try { fn() } finally { changed() }` batch breaks it.
   2. The store must hand back **live references, not copies** — `remote-reconnect.ts:18-19` says a store returning copies would silently break its re-read. Disqualifies an immutable-snapshot design.
 - **Bug-scope decision**: structural only. Existing call sites keep their current notify placement; the two deferred-notify bugs (`relocateProject:1973`, `restoreSessions:2132`) are documented, not fixed, in this PR.
+- **PR**: #320
+- **Landed shape**: ports-and-adapters design (3 ports: persist/broadcast/tray), `batch(body: () => boolean)` making the try/finally shape unrepresentable, caller-supplied `now` so the store has no clock dependency. 3 files, `session-manager.ts` -86 net lines, `session-manager.test.ts` and `remote-reconnect.ts` both untouched. Gate green: tsc, eslint, vitest 912/912, build.
+- **Follow-ups this PR deliberately left**: the two deferred-notify bugs above (now one-line fixes in the store's vocabulary); `lastKnownStateWrites` is not pruned on `delete` (slow leak, unobservable because ids are `randomUUID`); the `?? 0` "never written" sentinel in the rate limiter is carried over and pinned by a test rather than replaced with an absence check.
 
 ## materialize-pr-worktree
 
@@ -295,7 +298,7 @@ Persisted candidate memory for the `pm-deepen` routine. Reconciled against `gh` 
 - **Stopped at**: step 6 — PR opened
 - **Branch**: `sym/pewpew/routine/refactor-audit/01M2RSMHCX`, **adopted** (all four conditions held: non-default; 0 commits ahead of `origin/main`; no upstream; unpublished on origin). Not renamed — an adopted branch keeps the caller's name so the harness can find the PR. Slug for this run: `session-store`.
 - **Committed**: report, reconciled backlog, `session-store.ts` + its test, `session-manager.ts` / `remote-reconnect.ts` delegation
-- **Evidence**: see the PR number recorded on the `session-store` entry above; quality gate run as separate commands (tsc, eslint, vitest under `TMPDIR=/tmp`, build)
+- **Evidence**: PR #320; gate green as separate commands — tsc, eslint, vitest 912/912 (under `TMPDIR=/tmp`, up from 883), build. 3 files against a 5-file estimate; `session-manager.test.ts` needed zero edits, which was the agreed bail-out gate.
 - **Next**: review/merge the `session-store` PR. Next firing's top surviving candidate is `pty-entry-registration` (22/25) — a different file from the last three firings' target, so it does not queue behind this one. `remote-hook-merge-executor` (21/25) carries a verified user-facing bug and has a red test available today; a human may want to schedule it ahead of the ranking.
 
 ### Standing observation — the pure-module cluster
