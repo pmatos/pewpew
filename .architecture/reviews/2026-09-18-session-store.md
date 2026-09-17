@@ -668,3 +668,27 @@ Adjudicated against the fixed criteria, in order: **depth** (behaviour per unit 
 **Carried into implementation from the losing designs:**
 - From B: the census figures (bucket C's 9 lines are object construction, not registry mutation; the four hand-rolled dirty flags; the 60th mutation site at `:1482`).
 - From A: the `session-manager.test.ts`-needs-zero-edits bail-out gate, which C independently reached and states more sharply.
+
+### Correction applied before implementation
+
+Review of the adjudication caught that **Design C as proposed was not structural-only**, which is the rule Design B was disqualified under. Two deviations:
+
+1. **The clock port relocated a clock read.** C's `recordLastKnownState(id, text)` reads its own `Now` port *per record* — C's own port comment concedes "a batch of N records performs N clock reads" — where the pre-store `updateLastKnownStatesBatch` reads `Date.now()` once at `:287` and passes that single `now` into every `applyLastKnownState` call. In production the difference is sub-millisecond; it is still a different computation, and it sits in the exact path the two load-bearing invariant tests exercise.
+2. **The `delete`-side cleanup of `lastKnownStateWrites`** was flagged by C itself as "one non-structural liberty".
+
+Rather than switch to Design A, both deviations were removed — the winner survives on depth, locality and test surface with its scope breach closed:
+
+- **The clock port is dropped entirely.** `setStatus(id, status, now)` and `recordLastKnownState(id, text, now)` take `now` from the caller, exactly as `applyLastKnownState(id, text, now)` does today. One batch therefore shares one timestamp, byte-for-byte as before; `updateSession` passes `Date.now()` inline as it always did. This is strictly better than C's proposal on its own terms: the store now has *no* clock dependency at all, its tests need no fake timers and no injected clock, and the `now: () => Date.now()` late-binding trap C had to warn about cannot arise.
+- **`delete` does not touch the rate-limit bookkeeping**, matching today's behaviour. The resulting slow growth of that map is recorded as a follow-up rather than fixed in a refactor PR.
+
+Net: the implemented design has **zero behaviour deviations**. Ports reduce from four to three (persist, broadcast, tray).
+
+### One finding from writing the tests
+
+The rate limiter's "never written" sentinel is `lastKnownStateWrites.get(id) ?? 0`, so a first write is accepted only because `Date.now()` dwarfs the 10 s window. A `now` smaller than `LAST_KNOWN_STATE_MIN_INTERVAL_MS` reads as "written at time 0, inside the window" and is suppressed. Unreachable from production callers, which all pass `Date.now()`. The sentinel was **carried over unchanged** (changing it would be a behaviour change) and is now **pinned by an explicit test**, so anyone who later swaps it for an absence check sees the assertion move. This is the kind of edge that only surfaces when a policy becomes reachable through an interface that accepts an arbitrary clock — which is the deepening paying for itself.
+
+### Outcome
+
+Quality gate green, each step a separate command: `npx tsc --noEmit`, `npx eslint .`, `TMPDIR=/tmp npx vitest run` (**912 passed / 912**, up from 883 — 29 new store tests), `npm run build`.
+
+Diff: **3 files** against a 5-file estimate — `session-store.ts` (new, 212 lines), `session-store.test.ts` (new, 339 lines), `session-manager.ts` (−86 net). `session-manager.test.ts` needed **zero edits**, which was the agreed bail-out gate, and `remote-reconnect.ts` was not touched, which was the interface-fidelity check both A and C named.
