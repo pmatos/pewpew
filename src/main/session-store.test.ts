@@ -35,9 +35,9 @@ function session(overrides: Partial<Session> = {}): Session {
 
 interface Harness {
   store: SessionStore
-  saved: readonly Session[][]
-  published: readonly Session[][]
-  trayed: readonly Session[][]
+  saved: Session[][]
+  published: Session[][]
+  trayed: Session[][]
   order: string[]
   persistThrows: { on: boolean }
 }
@@ -46,9 +46,9 @@ interface Harness {
 // but the Session types, so there is no fs, no electron and no clock to stub.
 function harness(...seed: Session[]): Harness {
   const h = {
-    saved: [] as readonly Session[][],
-    published: [] as readonly Session[][],
-    trayed: [] as readonly Session[][],
+    saved: [] as Session[][],
+    published: [] as Session[][],
+    trayed: [] as Session[][],
     order: [] as string[],
     persistThrows: { on: false },
   }
