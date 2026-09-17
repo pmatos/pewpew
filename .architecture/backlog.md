@@ -297,9 +297,9 @@ Persisted candidate memory for the `pm-deepen` routine. Reconciled against `gh` 
 - **Outcome**: complete
 - **Stopped at**: step 6 — PR opened
 - **Branch**: `sym/pewpew/routine/refactor-audit/01M2RSMHCX`, **adopted** (all four conditions held: non-default; 0 commits ahead of `origin/main`; no upstream; unpublished on origin). Not renamed — an adopted branch keeps the caller's name so the harness can find the PR. Slug for this run: `session-store`.
-- **Committed**: report, reconciled backlog, `session-store.ts` + its test, `session-manager.ts` / `remote-reconnect.ts` delegation
+- **Committed**: report, reconciled backlog, `session-store.ts` + its test, `session-manager.ts` delegation. `remote-reconnect.ts` was **not** edited — the store satisfies its `SessionLookup` port structurally, which was the interface-fidelity check both surviving designs named.
 - **Evidence**: PR #320; gate green as separate commands — tsc, eslint, vitest 912/912 (under `TMPDIR=/tmp`, up from 883), build. 3 files against a 5-file estimate; `session-manager.test.ts` needed zero edits, which was the agreed bail-out gate.
-- **Next**: review/merge the `session-store` PR. Next firing's top surviving candidate is `pty-entry-registration` (22/25) — a different file from the last three firings' target, so it does not queue behind this one. `remote-hook-merge-executor` (21/25) carries a verified user-facing bug and has a red test available today; a human may want to schedule it ahead of the ranking.
+- **Next**: review/merge PR #320. Next firing's top surviving candidate is `pty-entry-registration` (22/25) — a different file from the last three firings' target, so it does not queue behind this one. `remote-hook-merge-executor` (21/25) carries a verified user-facing bug and has a red test available today; a human may want to schedule it ahead of the ranking.
 
 ### Standing observation — the pure-module cluster
 
