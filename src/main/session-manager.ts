@@ -56,6 +56,7 @@ import {
 } from './github-items'
 import { applyHookEvent, type SideEffectIntent } from './session-state-machine'
 import { deriveRestoredState } from './restore-planner'
+import { createSessionStore } from './session-store'
 import { createRemoteReconnectCoordinator } from './remote-reconnect'
 import { planIssueWorktree } from './worktree-plan'
 import { createOrAdoptWorktree, worktreeCreationError } from './worktree-adoption'
@@ -142,15 +143,18 @@ function getOriginOwner(projectPath: string): string | undefined {
   }
 }
 
-interface SessionEntry {
-  session: Session
-}
-
-const sessions = new Map<string, SessionEntry>()
+// Composition root for the session registry. Every seam it crosses — the
+// sessions.json write, the renderer push, the tray badge — is bound here and
+// nowhere else.
+const store = createSessionStore({
+  persist: { save: (data) => writeFileSync(SESSIONS_PATH, JSON.stringify(data, null, 2)) },
+  broadcast: { publish: (data) => broadcastToAll('sessions:updated', data) },
+  tray: { update: (data) => updateTray(data) },
+})
 
 // Live view of the session set for the pure lookups in session-queries.
-function* allSessions(): Iterable<Session> {
-  for (const entry of sessions.values()) yield entry.session
+function allSessions(): Iterable<Session> {
+  return store.values()
 }
 
 function getRemoteProject(hostId: string, projectPath: string): RemoteProject {
@@ -210,92 +214,48 @@ const prLookup = createPrLookup({
 })
 
 function resolvePrNumberAsync(sessionId: string): void {
-  const entry = sessions.get(sessionId)
-  if (!entry || entry.session.prNumber !== undefined) return
-  if (entry.session.hostId) return
-  const { projectPath, branch } = entry.session
+  const session = store.get(sessionId)
+  if (!session || session.prNumber !== undefined) return
+  if (session.hostId) return
+  const { projectPath, branch } = session
   if (!branch) return
   prLookup.lookup(projectPath, branch).then((num) => {
     if (num === undefined) return
-    const current = sessions.get(sessionId)
-    if (!current || current.session.prNumber !== undefined) return
-    current.session.prNumber = num
+    const current = store.get(sessionId)
+    if (!current || current.prNumber !== undefined) return
+    current.prNumber = num
     onSessionsChanged()
   })
 }
 
-function persistSessions(): void {
-  const data = Array.from(sessions.values()).map((e) => e.session)
-  writeFileSync(SESSIONS_PATH, JSON.stringify(data, null, 2))
-}
-
-function notifyRenderer(): void {
-  const data = Array.from(sessions.values()).map((e) => e.session)
-  broadcastToAll('sessions:updated', data)
-}
-
 function onSessionsChanged(): void {
-  persistSessions()
-  notifyRenderer()
-  updateTray(getSessions())
+  store.changed()
 }
 
 function updateSession(id: string, status: SessionStatus): void {
-  const entry = sessions.get(id)
-  if (!entry) return
-  entry.session.status = status
-  entry.session.lastActivity = Date.now()
-  onSessionsChanged()
-}
-
-// Rate-limit `lastKnownState` writes per session to once every 10s so the
-// 3s thumbnail tick doesn't churn `sessions.json` on disk.
-const LAST_KNOWN_STATE_MIN_INTERVAL_MS = 10_000
-const LAST_KNOWN_STATE_MAX_BYTES = 3 * 1024
-const lastKnownStateWrites = new Map<string, number>()
-
-// Mutate a single session's `lastKnownState` in memory, respecting the 10s
-// per-session rate limit and 3 KiB cap. Returns `true` when the entry was
-// actually mutated so the caller can decide whether to flush; callers that
-// update many sessions in one tick should prefer `updateLastKnownStatesBatch`
-// to collapse the disk write + broadcast into one call (avoids an O(N) write
-// storm from a tight timer loop).
-function applyLastKnownState(id: string, text: string, now: number): boolean {
-  const entry = sessions.get(id)
-  if (!entry) return false
-  const last = lastKnownStateWrites.get(id) ?? 0
-  if (now - last < LAST_KNOWN_STATE_MIN_INTERVAL_MS) return false
-  const trimmed =
-    text.length > LAST_KNOWN_STATE_MAX_BYTES ? text.slice(-LAST_KNOWN_STATE_MAX_BYTES) : text
-  // Idle sessions emit identical thumbnail text every tick; without this
-  // no-op the 10s window would still trigger a sessions.json write +
-  // broadcast for every live session indefinitely.
-  if (entry.session.lastKnownState?.text === trimmed) return false
-  entry.session.lastKnownState = { text: trimmed, timestamp: now }
-  lastKnownStateWrites.set(id, now)
-  return true
+  if (store.setStatus(id, status, Date.now())) onSessionsChanged()
 }
 
 export function updateLastKnownState(id: string, text: string): void {
-  const now = Date.now()
-  if (applyLastKnownState(id, text, now)) {
-    onSessionsChanged()
-  }
+  if (store.recordLastKnownState(id, text, Date.now())) onSessionsChanged()
 }
 
 // Batch variant for the periodic thumbnail tick: collects all (id, text)
 // pairs for one tick and emits a single persist + broadcast when at least
 // one session was updated. Prevents an O(N) burst of JSON writes when many
-// session snapshots unlock the 10s window simultaneously.
+// session snapshots unlock the 10s window simultaneously. One `now` for the
+// whole tick, so every session recorded in it shares a timestamp.
 export function updateLastKnownStatesBatch(
   updates: ReadonlyArray<{ id: string; text: string }>
 ): void {
   const now = Date.now()
-  let any = false
-  for (const { id, text } of updates) {
-    if (applyLastKnownState(id, text, now)) any = true
-  }
-  if (any) onSessionsChanged()
+  store.batch(() => {
+    let any = false
+    for (const { id, text } of updates) {
+      if (store.recordLastKnownState(id, text, now)) any = true
+    }
+    return any
+  })
 }
 
 // Re-probe PR numbers for sessions that don't have one yet, so a PR opened
@@ -309,11 +269,11 @@ const PR_REFRESH_INTERVAL_MS = 5 * 60 * 1000
 const pendingUnexpectedExits = new Set<string>()
 
 function handleUnexpectedPtyExit(sessionId: string): boolean {
-  const entry = sessions.get(sessionId)
-  if (!entry) return false
-  if (entry.session.status === 'dead') return true
+  const session = store.get(sessionId)
+  if (!session) return false
+  if (session.status === 'dead') return true
 
-  if (!entry.session.hostId) {
+  if (!session.hostId) {
     updateSession(sessionId, 'dead')
     return true
   }
@@ -324,25 +284,25 @@ function handleUnexpectedPtyExit(sessionId: string): boolean {
   // toast and could clobber a user-chosen 'completed'. Terminal statuses and
   // an in-flight cleanup both mark a genuine end — a network drop delivers no
   // session.end hook, so it never trips these.
-  if (entry.session.status === 'completed' || entry.session.status === 'error') return true
+  if (session.status === 'completed' || session.status === 'error') return true
   if (cleanupInProgress.has(sessionId)) return true
 
-  const host = getHost(entry.session.hostId)
-  const label = host?.label || host?.alias || entry.session.hostId
+  const host = getHost(session.hostId)
+  const label = host?.label || host?.alias || session.hostId
   if (getReconnectConfig().enabled) {
     emitToast({ severity: 'warning', title: `Connection to ${label} lost — reconnecting…` })
-    entry.session.connectionState = 'connecting'
+    session.connectionState = 'connecting'
     onSessionsChanged()
     reconnectScheduler.schedule(sessionId)
   } else {
-    entry.session.connectionState = 'offline'
+    session.connectionState = 'offline'
     onSessionsChanged()
   }
   return true
 }
 
 function registerSpawnedSession(session: Session): void {
-  sessions.set(session.id, { session })
+  store.insert(session)
   if (pendingUnexpectedExits.delete(session.id)) {
     handleUnexpectedPtyExit(session.id)
   }
@@ -350,8 +310,8 @@ function registerSpawnedSession(session: Session): void {
 
 export function initSessionManager(): void {
   setInterval(() => {
-    for (const entry of sessions.values()) {
-      if (entry.session.prNumber === undefined) resolvePrNumberAsync(entry.session.id)
+    for (const session of store.values()) {
+      if (session.prNumber === undefined) resolvePrNumberAsync(session.id)
     }
   }, PR_REFRESH_INTERVAL_MS).unref()
 
@@ -1035,8 +995,8 @@ export async function createSession(
 function realizeIntent(intent: SideEffectIntent): void {
   switch (intent.kind) {
     case 'notifyNeedsInput': {
-      const e = sessions.get(intent.sessionId)
-      if (e) notifyNeedsInput(e.session)
+      const session = store.get(intent.sessionId)
+      if (session) notifyNeedsInput(session)
       return
     }
     case 'promptCleanup':
@@ -1055,18 +1015,14 @@ export function handleHookEvent(
   originHostId: string | null = null
 ): boolean {
   const currentState = new Map<string, Session>()
-  for (const e of sessions.values()) currentState.set(e.session.id, e.session)
+  for (const session of store.values()) currentState.set(session.id, session)
 
   const result = applyHookEvent(currentState, { method, params, originHostId }, Date.now())
   if (!result.matched) return false
 
   let mutated = false
   for (const [id, nextSession] of result.state) {
-    const entry = sessions.get(id)
-    if (entry && entry.session !== nextSession) {
-      entry.session = nextSession
-      mutated = true
-    }
+    if (store.replace(id, nextSession)) mutated = true
   }
   for (const intent of result.intents) realizeIntent(intent)
 
@@ -1075,26 +1031,26 @@ export function handleHookEvent(
 }
 
 export async function killSession(id: string): Promise<void> {
-  const entry = sessions.get(id)
-  if (!entry) return
+  const session = store.get(id)
+  if (!session) return
   reconnectScheduler.cancel(id)
-  if (entry.session.hostId) {
-    const host = getRequiredHost(entry.session.hostId)
+  if (session.hostId) {
+    const host = getRequiredHost(session.hostId)
     await destroyRemotePty(id, host)
-    entry.session.connectionState = 'offline'
+    session.connectionState = 'offline'
     updateSession(id, 'dead')
     return
   }
   detachPty(id)
   // Clear any lazy-restore `pending` flag so the renderer mount effects
   // don't fire attachSession against a dead entry once kill broadcasts.
-  entry.session.connectionState = undefined
+  session.connectionState = undefined
   updateSession(id, 'dead')
 }
 
 const reconnectCoordinator = createRemoteReconnectCoordinator({
   sessions: {
-    get: (id) => sessions.get(id)?.session,
+    get: (id) => store.get(id),
     // Resolve module-local captures at call time (matching the acquireLease
     // adapter below) so construction never depends on declaration hoisting —
     // promptCleanup is declared ~300 lines below this literal.
@@ -1147,11 +1103,10 @@ export function stopSessionManager(): void {
 }
 
 export async function reviveSession(id: string): Promise<void> {
-  const entry = sessions.get(id)
-  if (!entry) throw new Error(`Session ${id} not found`)
+  const session = store.get(id)
+  if (!session) throw new Error(`Session ${id} not found`)
   reconnectScheduler.cancel(id)
 
-  const session = entry.session
   if (session.status !== 'dead')
     throw new Error(`Session ${id} is not dead (status: ${session.status})`)
 
@@ -1263,9 +1218,8 @@ export async function reviveSession(id: string): Promise<void> {
 // it's a no-op. Renderer calls this when the user opens a pending card so
 // startup doesn't fan out N concurrent agent processes.
 export async function attachLocalSession(id: string): Promise<void> {
-  const entry = sessions.get(id)
-  if (!entry) return
-  const session = entry.session
+  const session = store.get(id)
+  if (!session) return
   if (session.hostId) return
   if (session.connectionState !== 'pending') return
 
@@ -1325,19 +1279,19 @@ export async function attachPendingLocalSessions(ids: string[]): Promise<void> {
 }
 
 export async function removeWorktree(id: string): Promise<void> {
-  const entry = sessions.get(id)
-  if (!entry) return
+  const session = store.get(id)
+  if (!session) return
 
-  if (entry.session.hostId) {
-    const host = getRequiredHost(entry.session.hostId)
+  if (session.hostId) {
+    const host = getRequiredHost(session.hostId)
     try {
       await execRemote(host, [
         'git',
         '-C',
-        entry.session.projectPath,
+        session.projectPath,
         'worktree',
         'remove',
-        entry.session.worktreePath,
+        session.worktreePath,
         '--force',
       ])
     } catch {
@@ -1349,10 +1303,10 @@ export async function removeWorktree(id: string): Promise<void> {
   try {
     await execFileAsync('git', [
       '-C',
-      entry.session.projectPath,
+      session.projectPath,
       'worktree',
       'remove',
-      entry.session.worktreePath,
+      session.worktreePath,
       '--force',
     ])
   } catch {
@@ -1361,7 +1315,7 @@ export async function removeWorktree(id: string): Promise<void> {
 }
 
 export async function removeSession(id: string): Promise<void> {
-  const entry = sessions.get(id)
+  const session = store.get(id)
   reconnectScheduler.cancel(id)
   // Suppress a racing session.end → promptCleanup dialog: destroyPty/
   // destroyRemotePty below deliver a real kill signal to the agent process
@@ -1381,14 +1335,14 @@ export async function removeSession(id: string): Promise<void> {
   // Set doesn't grow by one entry for every session ever removed.
   cleanupInProgress.add(id)
   try {
-    if (entry?.session.hostId) {
-      const host = getRequiredHost(entry.session.hostId)
+    if (session?.hostId) {
+      const host = getRequiredHost(session.hostId)
       await destroyRemotePty(id, host)
     } else {
       destroyPty(id)
     }
     await removeWorktree(id)
-    sessions.delete(id)
+    store.delete(id)
     cleanupInProgress.delete(id)
     onSessionsChanged()
   } catch (err) {
@@ -1405,12 +1359,13 @@ export async function removeSession(id: string): Promise<void> {
 // v1 host-delete contract (issue #14).
 export function removeSessionsForHost(hostId: string): void {
   let removed = false
-  for (const [id, entry] of sessions) {
-    if (entry.session.hostId !== hostId) continue
-    reconnectScheduler.cancel(id)
-    detachPty(id)
-    sessions.delete(id)
-    removed = true
+  // Deleting the current entry mid-iteration is safe and skips nothing else —
+  // see the values() contract on SessionStore.
+  for (const session of store.values()) {
+    if (session.hostId !== hostId) continue
+    reconnectScheduler.cancel(session.id)
+    detachPty(session.id)
+    if (store.delete(session.id)) removed = true
   }
   if (removed) onSessionsChanged()
 }
@@ -1425,10 +1380,8 @@ async function promptCleanup(id: string): Promise<void> {
   // exit scheduled so it can't flip the session to 'dead' mid-cleanup.
   reconnectScheduler.cancel(id)
   try {
-    const entry = sessions.get(id)
-    if (!entry) return
-
-    const session = entry.session
+    const session = store.get(id)
+    if (!session) return
 
     // A terminal cleanup decision was already made for this session, so bail
     // rather than prompt again. The Keep branches below are the only producer
@@ -1538,7 +1491,7 @@ async function createSessionsForNumbers(
   // which ids exist before the batch runs (so a reused session — one createSession
   // hands back when its branch is already checked out — is told apart from a
   // freshly-created one).
-  const currentSessions = Array.from(sessions.values(), (e) => e.session)
+  const currentSessions = store.all()
   const existing = numbersInUse(currentSessions, projectPath, hostId, field)
   const preexistingIds = new Set(currentSessions.map((s) => s.id))
 
@@ -1925,11 +1878,11 @@ export async function openSessionsForOpenIssues(
 }
 
 export function getSession(id: string): Session | undefined {
-  return sessions.get(id)?.session
+  return store.get(id)
 }
 
 export function getSessions(): Session[] {
-  return Array.from(sessions.values()).map((e) => e.session)
+  return store.all()
 }
 
 export async function relocateProject(
@@ -1944,18 +1897,14 @@ export async function relocateProject(
   // too before prefix-matching (oldProjectPath may be a symlink form). The pure
   // path/name policy — which sessions move and where — lives in `planRelocation`.
   const oldManagedRoot = canonicalPath(join(oldProjectPath, '.claude', 'worktrees')) + sep
-  const plan = planRelocation(
-    Array.from(sessions.values(), (entry) => entry.session),
-    { oldProjectPath, newProjectPath, oldManagedRoot }
-  )
+  const plan = planRelocation(store.all(), { oldProjectPath, newProjectPath, oldManagedRoot })
 
   const fingerprint = await getRepoFingerprint(newProjectPath)
 
   const toolsInUse = new Set<AgentTool>()
   for (const remap of plan) {
-    const entry = sessions.get(remap.id)
-    if (!entry) continue
-    const s = entry.session
+    const s = store.get(remap.id)
+    if (!s) continue
     toolsInUse.add(s.tool)
     s.projectPath = remap.projectPath
     s.projectName = remap.projectName
@@ -2084,7 +2033,7 @@ export function restoreSessions(): void {
 
       if (session.hostId) {
         backfillDerivedFields(session)
-        sessions.set(session.id, { session })
+        store.insert(session)
         continue
       }
 
@@ -2094,7 +2043,7 @@ export function restoreSessions(): void {
       if (session.status !== 'dead') {
         session.lastActivity = Date.now()
       }
-      sessions.set(session.id, { session })
+      store.insert(session)
     }
 
     if (skippedForNoTmux > 0) {
