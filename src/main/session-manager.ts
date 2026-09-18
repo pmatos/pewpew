@@ -103,7 +103,7 @@ import type {
   Worktree,
   WorktreeBase,
 } from '../shared/types'
-import { isRestartable } from '../shared/types'
+import { isRestartable } from '../shared/session-status'
 
 const execFileAsync = promisify(execFile)
 const SESSIONS_PATH = join(CONFIG_DIR, 'sessions.json')
@@ -1447,14 +1447,6 @@ async function promptCleanup(id: string): Promise<void> {
     // Mirrors the terminal-state guards in the unexpected-exit listener and
     // attemptAutoReconnect.
     if (session.status === 'completed' || session.status === 'error') return
-
-    // A local session already flipped to 'dead' by its pty exit means the agent
-    // was cut down from outside (tmux server killed, OOM): the dying agent's
-    // SessionEnd hook only lands after that exit, whereas a normal exit delivers
-    // it first. Prompting would let Keep relabel an interrupted session
-    // 'completed'; leave it 'dead' so it stays restartable. Remote sessions reach
-    // here already 'dead' via the reconnect probe, so they still prompt.
-    if (!session.hostId && session.status === 'dead') return
 
     const parentWindow = getMainWindow()
 

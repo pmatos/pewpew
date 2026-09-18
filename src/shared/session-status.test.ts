@@ -1,8 +1,28 @@
 import { describe, it, expect } from 'vitest'
-import { isRestartable, type SessionStatus } from './types'
+import { isRestartable, isRestartableFinished, isTerminalStatus } from './session-status'
+import type { SessionStatus } from './types'
 
 const local = (status: SessionStatus) => ({ status, hostId: null })
 const remote = (status: SessionStatus) => ({ status, hostId: 'h1' })
+
+describe('isTerminalStatus', () => {
+  it('is true only for completed and error', () => {
+    expect(isTerminalStatus('completed')).toBe(true)
+    expect(isTerminalStatus('error')).toBe(true)
+    for (const status of ['running', 'idle', 'needs_input', 'dead'] as const) {
+      expect(isTerminalStatus(status)).toBe(false)
+    }
+  })
+})
+
+describe('isRestartableFinished', () => {
+  it('covers local completed/error only', () => {
+    expect(isRestartableFinished(local('completed'))).toBe(true)
+    expect(isRestartableFinished(local('error'))).toBe(true)
+    expect(isRestartableFinished(remote('completed'))).toBe(false)
+    expect(isRestartableFinished(local('dead'))).toBe(false)
+  })
+})
 
 describe('isRestartable', () => {
   it('restarts dead sessions, local or remote', () => {

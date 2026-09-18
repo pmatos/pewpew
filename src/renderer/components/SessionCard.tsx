@@ -1,5 +1,6 @@
 import { useState, useEffect } from 'react'
-import { isRestartable, type AgentTool, type Session } from '../../shared/types'
+import type { AgentTool, Session } from '../../shared/types'
+import { isRestartable, isRestartableFinished } from '../../shared/session-status'
 import { useProjectsStore } from '../stores/projects'
 import { useSessionsStore } from '../stores/sessions'
 import { useHostsStore } from '../stores/hosts'
@@ -137,7 +138,7 @@ export default function SessionCard({ session, thumbnail, style, onOpenSession, 
         label: session.status === 'dead' ? 'Restart terminal' : 'Open terminal',
         onClick: () => onOpenSession?.(session.id, sessionName),
       },
-      ...(session.status !== 'dead' && isRestartable(session)
+      ...(isRestartableFinished(session)
         ? [
             {
               label: 'Restart session',

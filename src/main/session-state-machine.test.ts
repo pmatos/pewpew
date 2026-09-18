@@ -180,6 +180,28 @@ describe('applyHookEvent — session.end', () => {
     }
   )
 
+  it('does not prompt for a local session already dead (pty exited first: killed from outside)', () => {
+    const session = makeSession({ id: 's1', status: 'dead' })
+    const result = applyHookEvent(
+      stateOf(session),
+      { method: 'session.end', params: { cwd: '/p/w', reason: 'other' }, originHostId: null },
+      1
+    )
+    expect(result.matched).toBe(true)
+    expect(result.intents).toEqual([])
+    expect(result.state.get('s1')?.status).toBe('dead')
+  })
+
+  it('still prompts for a remote session that is dead (reconnect probe path)', () => {
+    const session = makeSession({ id: 's1', hostId: 'h1', status: 'dead' })
+    const result = applyHookEvent(
+      stateOf(session),
+      { method: 'session.end', params: { cwd: '/p/w', reason: 'other' }, originHostId: 'h1' },
+      1
+    )
+    expect(result.intents).toContainEqual({ kind: 'promptCleanup', sessionId: 's1' })
+  })
+
   it('emits promptCleanup when reason is absent (treat as a real end)', () => {
     const session = makeSession({ id: 's1', status: 'running' })
     const result = applyHookEvent(

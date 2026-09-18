@@ -3,7 +3,7 @@ import Terminal from './Terminal'
 import ReviewOverlay from './ReviewOverlay'
 import { useSessionsStore } from '../stores/sessions'
 import { useHostsStore } from '../stores/hosts'
-import { isRestartable } from '../../shared/types'
+import { isRestartableFinished } from '../../shared/session-status'
 
 interface Props {
   sessionId: string
@@ -16,7 +16,7 @@ export default function DetailPane({ sessionId, sessionName, onClose }: Props) {
   const hosts = useHostsStore((s) => s.hosts)
   const host = session?.hostId ? hosts.find((h) => h.hostId === session.hostId) : null
   const isDead = session?.status === 'dead'
-  const canRestart = !!session && !isDead && isRestartable(session)
+  const canRestart = !!session && isRestartableFinished(session)
   const connectionState = session?.connectionState
   const isRemote = !!session?.hostId
   const isPending = isRemote && connectionState === 'pending'

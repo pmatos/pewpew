@@ -147,13 +147,15 @@ function appendToBuffer(entry: PtyEntry, data: string): void {
 // every pewpew session down with it. Remote hosts still use their default server.
 export const TMUX_SOCKET = 'pewpew'
 
-// null is the default server: sessions started before the dedicated socket
-// existed still live there, and re-spawning them on the new server would run a
-// second agent in the same worktree.
-type TmuxSocket = typeof TMUX_SOCKET | null
+// 'default' is the user's default server: sessions started before the dedicated
+// socket existed still live there, and re-spawning them on the new server would
+// run a second agent in the same worktree.
+type TmuxSocket = typeof TMUX_SOCKET | 'default'
+
+const LOCAL_SOCKETS: readonly TmuxSocket[] = [TMUX_SOCKET, 'default']
 
 const tmuxArgs = (socket: TmuxSocket, args: string[]): string[] =>
-  socket ? ['-L', socket, ...args] : args
+  socket === 'default' ? args : ['-L', socket, ...args]
 
 function runTmux(socket: TmuxSocket, args: string[], timeout?: number): string {
   return execFileSync('tmux', tmuxArgs(socket, args), {
@@ -173,16 +175,21 @@ function hasSessionOn(socket: TmuxSocket, tmuxSession: string): boolean {
   }
 }
 
-const localSockets = (): TmuxSocket[] => [TMUX_SOCKET, null]
+const findLiveSocket = (tmuxSession: string): TmuxSocket | undefined =>
+  LOCAL_SOCKETS.find((socket) => hasSessionOn(socket, tmuxSession))
 
-// `null` is a real value (default server), so `??` would wrongly replace it.
-const localSocket = (entry: PtyEntry): TmuxSocket =>
-  entry.tmuxSocket === undefined ? TMUX_SOCKET : entry.tmuxSocket
+// A registered entry knows its server; without one, try every candidate.
+const socketsFor = (entry?: PtyEntry): readonly TmuxSocket[] =>
+  entry?.tmuxSocket ? [entry.tmuxSocket] : LOCAL_SOCKETS
 
-function findLiveSocket(tmuxSession: string): TmuxSocket | undefined {
-  if (hasSessionOn(TMUX_SOCKET, tmuxSession)) return TMUX_SOCKET
-  if (hasSessionOn(null, tmuxSession)) return null
-  return undefined
+function spawnLocalAttach(socket: TmuxSocket, tmuxSession: string, cwd?: string): IPty {
+  return pty.spawn('tmux', tmuxArgs(socket, ['attach-session', '-t', tmuxSession]), {
+    name: 'xterm-256color',
+    cols: 120,
+    rows: 30,
+    cwd,
+    env: sanitizeChildEnv() as Record<string, string>,
+  })
 }
 
 // tmux exports TMUX/TMUX_PANE into every pane, and a bare `tmux` follows $TMUX to
@@ -464,17 +471,7 @@ export function createPty(sessionId: string, cwd: string, options?: SpawnOptions
   ])
 
   // Attach to it via node-pty
-  const ptyProcess = pty.spawn(
-    'tmux',
-    tmuxArgs(TMUX_SOCKET, ['attach-session', '-t', tmuxSession]),
-    {
-      name: 'xterm-256color',
-      cols: 120,
-      rows: 30,
-      cwd,
-      env: sanitizeChildEnv() as Record<string, string>,
-    }
-  )
+  const ptyProcess = spawnLocalAttach(TMUX_SOCKET, tmuxSession, cwd)
 
   const entry: PtyEntry = {
     pty: ptyProcess,
@@ -663,10 +660,8 @@ export function destroyPty(sessionId: string): void {
   }
 
   // Always attempt to kill the tmux session — the pty onExit handler may have
-  // already removed the map entry, but the tmux session can still be alive. With
-  // no entry the owning server is unknown, so try both rather than gating the
-  // kill on a has-session probe that reads any failure as "absent".
-  for (const socket of entry ? [localSocket(entry)] : localSockets()) {
+  // already removed the map entry, but the tmux session can still be alive.
+  for (const socket of socketsFor(entry)) {
     try {
       runTmux(socket, ['kill-session', '-t', tmuxSession])
     } catch {
@@ -742,7 +737,7 @@ export async function captureThumbnails(opts?: {
     }
     try {
       const text = runTmux(
-        localSocket(entry),
+        entry.tmuxSocket ?? TMUX_SOCKET,
         ['capture-pane', '-t', entry.tmuxSession, '-p'],
         3000
       )
@@ -818,7 +813,7 @@ export async function getScrollback(sessionId: string): Promise<string> {
   }
 
   const tmuxSession = `pewpew-${sessionId}`
-  for (const socket of entry ? [localSocket(entry)] : localSockets()) {
+  for (const socket of socketsFor(entry)) {
     try {
       return runTmux(socket, ['capture-pane', '-t', tmuxSession, '-p', '-e', '-S', '-5000'], 5000)
     } catch {
@@ -830,7 +825,7 @@ export async function getScrollback(sessionId: string): Promise<string> {
 
 export function discoverTmuxSessions(): string[] {
   const sessions = new Set<string>()
-  for (const socket of localSockets()) {
+  for (const socket of LOCAL_SOCKETS) {
     try {
       const output = runTmux(socket, ['list-sessions', '-F', '#{session_name}'], 5000)
       for (const name of output.split('\n')) {
@@ -845,20 +840,10 @@ export function discoverTmuxSessions(): string[] {
 
 export function reattachPty(sessionId: string): void {
   const tmuxSession = `pewpew-${sessionId}`
-  const liveSocket = findLiveSocket(tmuxSession)
-  const tmuxSocket = liveSocket === undefined ? TMUX_SOCKET : liveSocket
+  const tmuxSocket = findLiveSocket(tmuxSession) ?? TMUX_SOCKET
 
   // Attach to existing tmux session via node-pty
-  const ptyProcess = pty.spawn(
-    'tmux',
-    tmuxArgs(tmuxSocket, ['attach-session', '-t', tmuxSession]),
-    {
-      name: 'xterm-256color',
-      cols: 120,
-      rows: 30,
-      env: sanitizeChildEnv() as Record<string, string>,
-    }
-  )
+  const ptyProcess = spawnLocalAttach(tmuxSocket, tmuxSession)
 
   const entry: PtyEntry = {
     pty: ptyProcess,

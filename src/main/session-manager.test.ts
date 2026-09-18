@@ -1347,7 +1347,7 @@ describe('promptCleanup — local session killed from outside', () => {
     expect(sm.getSessions()[0].status).toBe('dead')
   })
 
-  it('still prompts and honours Keep when the hook lands before the pty exit (normal exit)', async () => {
+  it('still prompts and honours Keep on a normal exit, and the kept session can be restarted', async () => {
     const local = baseLocalSession({ id: 'l1', status: 'idle' })
     mkdirSync(local.worktreePath, { recursive: true })
     state.liveTmuxIds = ['l1']
@@ -1367,6 +1367,12 @@ describe('promptCleanup — local session killed from outside', () => {
 
     expect(showMessageBoxMock).toHaveBeenCalledTimes(1)
     expect(sm.getSessions()[0].status).toBe('completed')
+    state.createPtyCalls = []
+
+    await sm.reviveSession('l1')
+
+    expect(sm.getSessions()[0].status).toBe('idle')
+    expect(state.createPtyCalls.map((c) => c.sessionId)).toEqual(['l1'])
   })
 })
 
@@ -1957,27 +1963,6 @@ describe('reviveSession — completed/error sessions', () => {
     sm.restoreSessions()
     sm.initSessionManager()
     expect(sm.getSessions()[0].status).toBe('dead')
-    state.createPtyCalls = []
-
-    await sm.reviveSession('l1')
-
-    expect(sm.getSessions()[0].status).toBe('idle')
-    expect(state.createPtyCalls.map((c) => c.sessionId)).toEqual(['l1'])
-  })
-
-  it('restarts a completed session flipped in-run (Keep after the pty died) without a restart of pewpew', async () => {
-    const local = baseLocalSession({ id: 'l1', status: 'idle' })
-    mkdirSync(local.worktreePath, { recursive: true })
-    state.liveTmuxIds = ['l1']
-    state.dialogResponse = 1
-    writeSessionsJson([local])
-    const sm = await loadSessionManager()
-    sm.restoreSessions()
-    sm.initSessionManager()
-    sm.handleHookEvent('session.end', { cwd: local.worktreePath, reason: 'other' }, null)
-    state.unexpectedExitListener?.('l1')
-    await new Promise((resolve) => setTimeout(resolve, 0))
-    expect(sm.getSessions()[0].status).toBe('completed')
     state.createPtyCalls = []
 
     await sm.reviveSession('l1')

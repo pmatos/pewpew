@@ -9,7 +9,6 @@ vi.mock('electron', () => ({
 const state = {
   tmuxAvailable: true,
   bwrapAvailable: true,
-  tmuxArgvCalls: [] as string[][],
   tmuxCalls: [] as string[][],
   // Which tmux servers (by -L name, or 'default') answer has-session.
   liveTmuxServers: new Set<string>(['pewpew']),
@@ -51,7 +50,6 @@ vi.mock('child_process', () => ({
     }
     if (file === 'tmux') {
       state.tmuxCalls.push(args)
-      if (args.includes('new-session')) state.tmuxArgvCalls.push(args)
       const server = args[0] === '-L' ? args[1] : 'default'
       if (args.includes('has-session') && !state.liveTmuxServers.has(server)) {
         throw new Error('no server running')
@@ -121,6 +119,7 @@ import {
   discoverTmuxSessions,
   hasTmuxSession,
   reattachPty,
+  TMUX_SOCKET,
   __resetSandboxProbeCacheForTesting,
 } from './pty-manager'
 import { buildSandboxArgs } from './agent-sandbox'
@@ -136,6 +135,8 @@ const WORKTREE = '/home/dev/project/.claude/worktrees/wt1'
 // ['-L', 'pewpew', 'new-session', '-d', '-s', tmuxSession, '-c', cwd, '-x', '120', '-y', '30',
 //  'env', '-u', 'TMUX', '-u', 'TMUX_PANE', ...agentArgs]
 const AGENT_ENV_SCRUB = ['env', '-u', 'TMUX', '-u', 'TMUX_PANE']
+const newSessionCall = (): string[] =>
+  state.tmuxCalls.find((argv) => argv.includes('new-session')) ?? []
 const LOCAL_TMUX_PREFIX_LEN = 12
 const agentArgsFromCall = (argv: string[]): string[] =>
   argv.slice(LOCAL_TMUX_PREFIX_LEN + AGENT_ENV_SCRUB.length)
@@ -245,7 +246,6 @@ describe('createPty', () => {
   beforeEach(() => {
     state.tmuxAvailable = true
     state.bwrapAvailable = true
-    state.tmuxArgvCalls = []
     state.tmuxCalls = []
     state.liveTmuxServers = new Set(['pewpew'])
     state.tmuxListOutput = {}
@@ -264,7 +264,7 @@ describe('createPty', () => {
     destroyPty('s1')
     expect(state.tmuxCalls.length).toBeGreaterThan(0)
     for (const argv of state.tmuxCalls) {
-      expect(argv.slice(0, 2)).toEqual(['-L', 'pewpew'])
+      expect(argv.slice(0, 2)).toEqual(['-L', TMUX_SOCKET])
     }
   })
 
@@ -312,15 +312,12 @@ describe('createPty', () => {
 
   it('unsets TMUX/TMUX_PANE for the agent so its own bare tmux calls miss pewpew’s server', () => {
     createPty('s1', WORKTREE, { tool: 'claude' })
-    const argv = state.tmuxArgvCalls[0]
-    expect(
-      argv.slice(LOCAL_TMUX_PREFIX_LEN, LOCAL_TMUX_PREFIX_LEN + AGENT_ENV_SCRUB.length)
-    ).toEqual(AGENT_ENV_SCRUB)
+    expect(newSessionCall().join(' ')).toContain(AGENT_ENV_SCRUB.join(' '))
   })
 
   it('never sandboxes claude, even when bwrap is available, and never probes or warns about it', () => {
     createPty('s1', WORKTREE, { tool: 'claude', projectPath: PROJECT })
-    const argv = agentArgsFromCall(state.tmuxArgvCalls[0])
+    const argv = agentArgsFromCall(newSessionCall())
     expect(argv).toEqual(buildAgentArgs({ tool: 'claude' }))
     expect(argv).not.toContain('bwrap')
     expect(warnSpy).not.toHaveBeenCalled()
@@ -351,7 +348,7 @@ describe('createPty', () => {
     expect(state.mkdirCalls).not.toContain(join(homedir(), '.omp'))
     // omp doesn't touch ~/.claude at all — that's claude-specific bookkeeping.
     expect(state.mkdirCalls).not.toContain(join(homedir(), '.claude'))
-    const argv = agentArgsFromCall(state.tmuxArgvCalls[0])
+    const argv = agentArgsFromCall(newSessionCall())
     // The extra writable path is bound after the project's own `.git`/`.git/hooks`
     // binds, so search for '--bind-try' starting past the last fixed occurrence.
     // Extra paths use --bind-try so a missing source can't crash bwrap's spawn.
@@ -362,7 +359,7 @@ describe('createPty', () => {
   it('omits the sandbox prefix and warns when bwrap is unavailable (omp)', () => {
     state.bwrapAvailable = false
     createPty('s1', WORKTREE, { tool: 'omp', projectPath: PROJECT })
-    const argv = agentArgsFromCall(state.tmuxArgvCalls[0])
+    const argv = agentArgsFromCall(newSessionCall())
     expect(argv).toEqual(buildAgentArgs({ tool: 'omp' }))
     expect(argv).not.toContain('bwrap')
     expect(warnSpy).toHaveBeenCalledWith(
@@ -372,7 +369,7 @@ describe('createPty', () => {
 
   it('skips sandboxing entirely (and never creates a state dir) when no projectPath is given', () => {
     createPty('s1', WORKTREE, { tool: 'claude' })
-    const argv = agentArgsFromCall(state.tmuxArgvCalls[0])
+    const argv = agentArgsFromCall(newSessionCall())
     expect(argv).toEqual(buildAgentArgs({ tool: 'claude' }))
     expect(state.mkdirCalls).toEqual([])
     expect(warnSpy).not.toHaveBeenCalled()
