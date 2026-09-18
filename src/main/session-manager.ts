@@ -103,6 +103,7 @@ import type {
   Worktree,
   WorktreeBase,
 } from '../shared/types'
+import { isRestartable } from '../shared/types'
 
 const execFileAsync = promisify(execFile)
 const SESSIONS_PATH = join(CONFIG_DIR, 'sessions.json')
@@ -1152,8 +1153,8 @@ export async function reviveSession(id: string): Promise<void> {
   reconnectScheduler.cancel(id)
 
   const session = entry.session
-  if (session.status !== 'dead')
-    throw new Error(`Session ${id} is not dead (status: ${session.status})`)
+  if (!isRestartable(session))
+    throw new Error(`Session ${id} is not restartable (status: ${session.status})`)
 
   if (session.hostId) {
     const host = getRequiredHost(session.hostId)
@@ -1230,6 +1231,12 @@ export async function reviveSession(id: string): Promise<void> {
   // and fire attachLocalSession, whose reattachPty would replace the
   // just-created node-pty and leak the original exit handler.
   session.connectionState = undefined
+  if (hasPty(id)) {
+    // A kept session whose tmux survived is still attached; a second attach
+    // would replace the live node-pty and leak its exit handler.
+    updateSession(id, 'idle')
+    return
+  }
   if (hasTmuxSession(id)) {
     reattachPty(id)
   } else {
@@ -1440,6 +1447,14 @@ async function promptCleanup(id: string): Promise<void> {
     // Mirrors the terminal-state guards in the unexpected-exit listener and
     // attemptAutoReconnect.
     if (session.status === 'completed' || session.status === 'error') return
+
+    // A local session already flipped to 'dead' by its pty exit means the agent
+    // was cut down from outside (tmux server killed, OOM): the dying agent's
+    // SessionEnd hook only lands after that exit, whereas a normal exit delivers
+    // it first. Prompting would let Keep relabel an interrupted session
+    // 'completed'; leave it 'dead' so it stays restartable. Remote sessions reach
+    // here already 'dead' via the reconnect probe, so they still prompt.
+    if (!session.hostId && session.status === 'dead') return
 
     const parentWindow = getMainWindow()
 

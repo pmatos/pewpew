@@ -3,6 +3,7 @@ import Terminal from './Terminal'
 import ReviewOverlay from './ReviewOverlay'
 import { useSessionsStore } from '../stores/sessions'
 import { useHostsStore } from '../stores/hosts'
+import { isRestartable } from '../../shared/types'
 
 interface Props {
   sessionId: string
@@ -15,6 +16,7 @@ export default function DetailPane({ sessionId, sessionName, onClose }: Props) {
   const hosts = useHostsStore((s) => s.hosts)
   const host = session?.hostId ? hosts.find((h) => h.hostId === session.hostId) : null
   const isDead = session?.status === 'dead'
+  const canRestart = !!session && !isDead && isRestartable(session)
   const connectionState = session?.connectionState
   const isRemote = !!session?.hostId
   const isPending = isRemote && connectionState === 'pending'
@@ -107,6 +109,8 @@ export default function DetailPane({ sessionId, sessionName, onClose }: Props) {
     try {
       await window.api.reviveSession(sessionId)
     } catch {
+      // Main logs the failure; re-enable the button below.
+    } finally {
       setReviving(false)
     }
   }
@@ -135,6 +139,16 @@ export default function DetailPane({ sessionId, sessionName, onClose }: Props) {
           ←
         </button>
         <span className="detail-pane-title">{sessionName}</span>
+        {canRestart && (
+          <button
+            className="detail-pane-restart"
+            onClick={handleRevive}
+            disabled={reviving}
+            title="Resume this session in its worktree"
+          >
+            {reviving ? 'Restarting…' : 'Restart session'}
+          </button>
+        )}
         {host && (
           <span className="detail-pane-host">
             {host.label} - {session?.connectionState ?? 'offline'}

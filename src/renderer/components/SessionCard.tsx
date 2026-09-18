@@ -1,5 +1,5 @@
 import { useState, useEffect } from 'react'
-import type { AgentTool, Session } from '../../shared/types'
+import { isRestartable, type AgentTool, type Session } from '../../shared/types'
 import { useProjectsStore } from '../stores/projects'
 import { useSessionsStore } from '../stores/sessions'
 import { useHostsStore } from '../stores/hosts'
@@ -88,7 +88,7 @@ export default function SessionCard({ session, thumbnail, style, onOpenSession, 
       const sessions = useSessionsStore.getState().sessions
       const deadCount = ids.filter((id) => {
         const s = sessions.find((sess) => sess.id === id)
-        return s?.status === 'dead' || s?.status === 'error'
+        return !!s && isRestartable(s)
       }).length
       return [
         {
@@ -137,6 +137,16 @@ export default function SessionCard({ session, thumbnail, style, onOpenSession, 
         label: session.status === 'dead' ? 'Restart terminal' : 'Open terminal',
         onClick: () => onOpenSession?.(session.id, sessionName),
       },
+      ...(session.status !== 'dead' && isRestartable(session)
+        ? [
+            {
+              label: 'Restart session',
+              onClick: () => {
+                void window.api.reviveSession(session.id).catch(() => undefined)
+              },
+            },
+          ]
+        : []),
       ...(isRemoteNonLive && session.status !== 'dead'
         ? [
             {

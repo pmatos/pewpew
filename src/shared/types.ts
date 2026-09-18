@@ -61,6 +61,15 @@ export interface Session {
   sandboxed?: boolean
 }
 
+// Sessions the user can bring back with "Restart". Local completed/error
+// sessions qualify too: a tmux server kill or a Keep on the cleanup dialog must
+// not strand a resumable conversation. Remote completed/error stay excluded —
+// they're pinned to a terminal 'live' state on purpose, with no reconnect path.
+export function isRestartable(session: Pick<Session, 'status' | 'hostId'>): boolean {
+  if (session.status === 'dead') return true
+  return !session.hostId && (session.status === 'completed' || session.status === 'error')
+}
+
 export interface OpenSessionsSummary {
   created: Session[]
   reused: Session[]
