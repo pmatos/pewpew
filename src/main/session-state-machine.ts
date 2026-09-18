@@ -83,7 +83,13 @@ export function applyHookEvent(
       const safeReason = reason === undefined ? '<absent>' : JSON.stringify(reason).slice(0, 64)
       console.info(`[session.end] sessionId=${target.id} reason=${safeReason}`)
       const sessionStillAlive = reason === 'clear' || reason === 'resume'
-      if (sessionStillAlive) {
+      // A local session already 'dead' had its pty exit first — the agent was cut
+      // down from outside (tmux server killed, OOM); a normal exit delivers this
+      // hook first. Keep would relabel it 'completed' and strand a restartable
+      // session, so don't prompt. Remote sessions arrive 'dead' via the reconnect
+      // probe, which prompts on its own path.
+      const interruptedLocally = !target.hostId && target.status === 'dead'
+      if (sessionStillAlive || interruptedLocally) {
         return { state, intents: [], matched: true }
       }
       return {

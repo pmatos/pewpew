@@ -9,7 +9,10 @@ vi.mock('electron', () => ({
 const state = {
   tmuxAvailable: true,
   bwrapAvailable: true,
-  tmuxArgvCalls: [] as string[][],
+  tmuxCalls: [] as string[][],
+  // Which tmux servers (by -L name, or 'default') answer has-session.
+  liveTmuxServers: new Set<string>(['pewpew']),
+  tmuxListOutput: {} as Record<string, string>,
   remoteArgvCalls: [] as string[][],
   mkdirCalls: [] as string[],
   // Controls what resolveRemoteGitDir returns (empty → fallback to
@@ -45,8 +48,13 @@ vi.mock('child_process', () => ({
       if (!state.bwrapAvailable) throw new Error('not found')
       return ''
     }
-    if (file === 'tmux' && args[0] === 'new-session') {
-      state.tmuxArgvCalls.push(args)
+    if (file === 'tmux') {
+      state.tmuxCalls.push(args)
+      const server = args[0] === '-L' ? args[1] : 'default'
+      if (args.includes('has-session') && !state.liveTmuxServers.has(server)) {
+        throw new Error('no server running')
+      }
+      if (args.includes('list-sessions')) return state.tmuxListOutput[server] ?? ''
       return ''
     }
     return ''
@@ -105,7 +113,13 @@ import { join } from 'path'
 import {
   buildAgentArgs,
   createPty,
+  captureThumbnails,
   createRemotePty,
+  destroyPty,
+  discoverTmuxSessions,
+  hasTmuxSession,
+  reattachPty,
+  TMUX_SOCKET,
   __resetSandboxProbeCacheForTesting,
 } from './pty-manager'
 import { buildSandboxArgs } from './agent-sandbox'
@@ -118,8 +132,14 @@ const WORKTREE = '/home/dev/project/.claude/worktrees/wt1'
 
 // Fixed prefix before `...agentArgs` in the composed `tmux new-session` argv
 // passed to execFileSync('tmux', [...]):
-// ['new-session', '-d', '-s', tmuxSession, '-c', cwd, '-x', '120', '-y', '30', ...agentArgs]
-const agentArgsFromCall = (argv: string[]): string[] => argv.slice(10)
+// ['-L', 'pewpew', 'new-session', '-d', '-s', tmuxSession, '-c', cwd, '-x', '120', '-y', '30',
+//  'env', '-u', 'TMUX', '-u', 'TMUX_PANE', ...agentArgs]
+const AGENT_ENV_SCRUB = ['env', '-u', 'TMUX', '-u', 'TMUX_PANE']
+const newSessionCall = (): string[] =>
+  state.tmuxCalls.find((argv) => argv.includes('new-session')) ?? []
+const LOCAL_TMUX_PREFIX_LEN = 12
+const agentArgsFromCall = (argv: string[]): string[] =>
+  argv.slice(LOCAL_TMUX_PREFIX_LEN + AGENT_ENV_SCRUB.length)
 
 // Same, but for the remote argv passed to execRemote(host, [...]), which
 // includes the leading 'tmux' element itself (one more than the local case).
@@ -226,7 +246,9 @@ describe('createPty', () => {
   beforeEach(() => {
     state.tmuxAvailable = true
     state.bwrapAvailable = true
-    state.tmuxArgvCalls = []
+    state.tmuxCalls = []
+    state.liveTmuxServers = new Set(['pewpew'])
+    state.tmuxListOutput = {}
     state.mkdirCalls = []
     // isSandboxAvailable() memoizes a successful real-bwrap probe; without
     // resetting it here, the first test to see bwrapAvailable=true would
@@ -235,9 +257,67 @@ describe('createPty', () => {
     warnSpy.mockClear()
   })
 
+  it('runs local tmux calls on the dedicated pewpew socket', () => {
+    createPty('s1', WORKTREE, { tool: 'claude' })
+    reattachPty('s1')
+    expect(hasTmuxSession('s1')).toBe(true)
+    destroyPty('s1')
+    expect(state.tmuxCalls.length).toBeGreaterThan(0)
+    for (const argv of state.tmuxCalls) {
+      expect(argv.slice(0, 2)).toEqual(['-L', TMUX_SOCKET])
+    }
+  })
+
+  it('keeps managing a session still alive on the default server (pre-dedicated-socket upgrade)', async () => {
+    state.liveTmuxServers = new Set(['default'])
+    expect(hasTmuxSession('legacy')).toBe(true)
+    state.tmuxCalls = []
+
+    reattachPty('legacy')
+    await captureThumbnails()
+    destroyPty('legacy')
+
+    const attachAndKill = state.tmuxCalls.filter(
+      (argv) => argv.includes('capture-pane') || argv.includes('kill-session')
+    )
+    expect(attachAndKill.length).toBe(3)
+    for (const argv of attachAndKill) {
+      expect(argv[0]).not.toBe('-L')
+    }
+  })
+
+  it('kills on both servers, without probing first, when no pty entry is registered', () => {
+    state.liveTmuxServers = new Set()
+    state.tmuxCalls = []
+
+    destroyPty('orphan')
+
+    expect(state.tmuxCalls.some((argv) => argv.includes('has-session'))).toBe(false)
+    const kills = state.tmuxCalls.filter((argv) => argv.includes('kill-session'))
+    expect(kills.map((argv) => argv[0])).toEqual(['-L', 'kill-session'])
+  })
+
+  it('reports no tmux session when neither server has it', () => {
+    state.liveTmuxServers = new Set()
+    expect(hasTmuxSession('gone')).toBe(false)
+  })
+
+  it('discovers pewpew sessions from both the dedicated and the default server', () => {
+    state.tmuxListOutput = {
+      pewpew: 'pewpew-a1\nnotes\n',
+      default: 'pewpew-b2\npewpew-a1\nwork\n',
+    }
+    expect(discoverTmuxSessions().sort()).toEqual(['a1', 'b2'])
+  })
+
+  it('unsets TMUX/TMUX_PANE for the agent so its own bare tmux calls miss pewpew’s server', () => {
+    createPty('s1', WORKTREE, { tool: 'claude' })
+    expect(newSessionCall().join(' ')).toContain(AGENT_ENV_SCRUB.join(' '))
+  })
+
   it('never sandboxes claude, even when bwrap is available, and never probes or warns about it', () => {
     createPty('s1', WORKTREE, { tool: 'claude', projectPath: PROJECT })
-    const argv = agentArgsFromCall(state.tmuxArgvCalls[0])
+    const argv = agentArgsFromCall(newSessionCall())
     expect(argv).toEqual(buildAgentArgs({ tool: 'claude' }))
     expect(argv).not.toContain('bwrap')
     expect(warnSpy).not.toHaveBeenCalled()
@@ -268,7 +348,7 @@ describe('createPty', () => {
     expect(state.mkdirCalls).not.toContain(join(homedir(), '.omp'))
     // omp doesn't touch ~/.claude at all — that's claude-specific bookkeeping.
     expect(state.mkdirCalls).not.toContain(join(homedir(), '.claude'))
-    const argv = agentArgsFromCall(state.tmuxArgvCalls[0])
+    const argv = agentArgsFromCall(newSessionCall())
     // The extra writable path is bound after the project's own `.git`/`.git/hooks`
     // binds, so search for '--bind-try' starting past the last fixed occurrence.
     // Extra paths use --bind-try so a missing source can't crash bwrap's spawn.
@@ -279,7 +359,7 @@ describe('createPty', () => {
   it('omits the sandbox prefix and warns when bwrap is unavailable (omp)', () => {
     state.bwrapAvailable = false
     createPty('s1', WORKTREE, { tool: 'omp', projectPath: PROJECT })
-    const argv = agentArgsFromCall(state.tmuxArgvCalls[0])
+    const argv = agentArgsFromCall(newSessionCall())
     expect(argv).toEqual(buildAgentArgs({ tool: 'omp' }))
     expect(argv).not.toContain('bwrap')
     expect(warnSpy).toHaveBeenCalledWith(
@@ -289,7 +369,7 @@ describe('createPty', () => {
 
   it('skips sandboxing entirely (and never creates a state dir) when no projectPath is given', () => {
     createPty('s1', WORKTREE, { tool: 'claude' })
-    const argv = agentArgsFromCall(state.tmuxArgvCalls[0])
+    const argv = agentArgsFromCall(newSessionCall())
     expect(argv).toEqual(buildAgentArgs({ tool: 'claude' }))
     expect(state.mkdirCalls).toEqual([])
     expect(warnSpy).not.toHaveBeenCalled()

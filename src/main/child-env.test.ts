@@ -154,6 +154,16 @@ describe('sanitizeChildEnv', () => {
     expect(out).toEqual(env)
   })
 
+  it('strips TMUX and TMUX_PANE inherited from a launching tmux pane', () => {
+    const env = {
+      HOME: '/home/u',
+      TMUX: '/tmp/tmux-1000/default,1234,0',
+      TMUX_PANE: '%3',
+    }
+
+    expect(sanitizeChildEnv(env)).toEqual({ HOME: '/home/u' })
+  })
+
   it('strips npm_config_*/npm_package_*/npm_execpath/npm_lifecycle_* even when APPIMAGE is not set', () => {
     const env = {
       HOME: '/home/u',
