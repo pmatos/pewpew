@@ -286,6 +286,17 @@ describe('createPty', () => {
     }
   })
 
+  it('kills on both servers, without probing first, when no pty entry is registered', () => {
+    state.liveTmuxServers = new Set()
+    state.tmuxCalls = []
+
+    destroyPty('orphan')
+
+    expect(state.tmuxCalls.some((argv) => argv.includes('has-session'))).toBe(false)
+    const kills = state.tmuxCalls.filter((argv) => argv.includes('kill-session'))
+    expect(kills.map((argv) => argv[0])).toEqual(['-L', 'kill-session'])
+  })
+
   it('reports no tmux session when neither server has it', () => {
     state.liveTmuxServers = new Set()
     expect(hasTmuxSession('gone')).toBe(false)

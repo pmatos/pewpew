@@ -112,7 +112,7 @@ export default function SessionCard({ session, thumbnail, style, onOpenSession, 
         ...(deadCount > 0
           ? [
               {
-                label: `Restart ${deadCount} dead session${deadCount > 1 ? 's' : ''}`,
+                label: `Restart ${deadCount} stopped session${deadCount > 1 ? 's' : ''}`,
                 onClick: async () => {
                   await window.api.reviveSessionBatch(ids)
                   clearSelection()

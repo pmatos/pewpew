@@ -29,6 +29,9 @@ export default function DetailPane({ sessionId, sessionName, onClose }: Props) {
   const isOffline = isRemote && connectionState === 'offline'
   const showReconnectOverlay = !isDead && (isPending || isAuthFailed || isUnreachable || isOffline)
   const [reviving, setReviving] = useState(false)
+  // Bumped after a restart so a still-mounted Terminal remounts, re-fits, and
+  // pushes its size to the freshly spawned pty (which starts at 120x30).
+  const [terminalGeneration, setTerminalGeneration] = useState(0)
   const [reconnecting, setReconnecting] = useState(false)
   // Monotonic flip count — each toggle increments by 1, rotating +180deg.
   // Using a counter (instead of a boolean) keeps the rotation going in the
@@ -108,6 +111,7 @@ export default function DetailPane({ sessionId, sessionName, onClose }: Props) {
     setReviving(true)
     try {
       await window.api.reviveSession(sessionId)
+      setTerminalGeneration((g) => g + 1)
     } catch {
       // Main logs the failure; re-enable the button below.
     } finally {
@@ -228,7 +232,7 @@ export default function DetailPane({ sessionId, sessionName, onClose }: Props) {
           <div className="flip-container">
             <div className="flip-inner" style={{ transform: `rotateY(${flipCount * 180}deg)` }}>
               <div className="flip-front">
-                <Terminal sessionId={sessionId} />
+                <Terminal key={terminalGeneration} sessionId={sessionId} />
               </div>
               <div className="flip-back">
                 {reviewOpen && reviewEnabled && (

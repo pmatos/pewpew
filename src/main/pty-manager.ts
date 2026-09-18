@@ -155,18 +155,25 @@ type TmuxSocket = typeof TMUX_SOCKET | null
 const tmuxArgs = (socket: TmuxSocket, args: string[]): string[] =>
   socket ? ['-L', socket, ...args] : args
 
+function runTmux(socket: TmuxSocket, args: string[], timeout?: number): string {
+  return execFileSync('tmux', tmuxArgs(socket, args), {
+    encoding: 'utf-8',
+    stdio: 'pipe',
+    env: sanitizeChildEnv() as NodeJS.ProcessEnv,
+    timeout,
+  })
+}
+
 function hasSessionOn(socket: TmuxSocket, tmuxSession: string): boolean {
   try {
-    execFileSync('tmux', tmuxArgs(socket, ['has-session', '-t', tmuxSession]), {
-      timeout: 3000,
-      stdio: 'pipe',
-      env: sanitizeChildEnv() as NodeJS.ProcessEnv,
-    })
+    runTmux(socket, ['has-session', '-t', tmuxSession], 3000)
     return true
   } catch {
     return false
   }
 }
+
+const localSockets = (): TmuxSocket[] => [TMUX_SOCKET, null]
 
 // `null` is a real value (default server), so `??` would wrongly replace it.
 const localSocket = (entry: PtyEntry): TmuxSocket =>
@@ -442,23 +449,19 @@ export function createPty(sessionId: string, cwd: string, options?: SpawnOptions
 
   // Create a detached tmux session that directly runs the agent CLI.
   // Using tmux's shell command avoids issues with interactive shell init (omz, etc.)
-  execFileSync(
-    'tmux',
-    tmuxArgs(TMUX_SOCKET, [
-      'new-session',
-      '-d',
-      '-s',
-      tmuxSession,
-      '-c',
-      cwd,
-      '-x',
-      '120',
-      '-y',
-      '30',
-      ...agentArgs,
-    ]),
-    { stdio: 'pipe', env: sanitizeChildEnv() as NodeJS.ProcessEnv }
-  )
+  runTmux(TMUX_SOCKET, [
+    'new-session',
+    '-d',
+    '-s',
+    tmuxSession,
+    '-c',
+    cwd,
+    '-x',
+    '120',
+    '-y',
+    '30',
+    ...agentArgs,
+  ])
 
   // Attach to it via node-pty
   const ptyProcess = pty.spawn(
@@ -660,16 +663,15 @@ export function destroyPty(sessionId: string): void {
   }
 
   // Always attempt to kill the tmux session — the pty onExit handler may have
-  // already removed the map entry, but the tmux session can still be alive.
-  const socket = entry ? localSocket(entry) : findLiveSocket(tmuxSession)
-  if (socket === undefined) return
-  try {
-    execFileSync('tmux', tmuxArgs(socket, ['kill-session', '-t', tmuxSession]), {
-      stdio: 'pipe',
-      env: sanitizeChildEnv() as NodeJS.ProcessEnv,
-    })
-  } catch {
-    // Session may already be dead
+  // already removed the map entry, but the tmux session can still be alive. With
+  // no entry the owning server is unknown, so try both rather than gating the
+  // kill on a has-session probe that reads any failure as "absent".
+  for (const socket of entry ? [localSocket(entry)] : localSockets()) {
+    try {
+      runTmux(socket, ['kill-session', '-t', tmuxSession])
+    } catch {
+      // Session may already be dead
+    }
   }
 }
 
@@ -739,15 +741,10 @@ export async function captureThumbnails(opts?: {
       continue
     }
     try {
-      const text = execFileSync(
-        'tmux',
-        tmuxArgs(localSocket(entry), ['capture-pane', '-t', entry.tmuxSession, '-p']),
-        {
-          encoding: 'utf-8',
-          timeout: 3000,
-          stdio: 'pipe',
-          env: sanitizeChildEnv() as NodeJS.ProcessEnv,
-        }
+      const text = runTmux(
+        localSocket(entry),
+        ['capture-pane', '-t', entry.tmuxSession, '-p'],
+        3000
       )
       result[sessionId] = text
       opts?.onCapture?.(sessionId, text)
@@ -821,38 +818,21 @@ export async function getScrollback(sessionId: string): Promise<string> {
   }
 
   const tmuxSession = `pewpew-${sessionId}`
-  const socket = entry ? localSocket(entry) : findLiveSocket(tmuxSession)
-  if (socket === undefined) return ''
-  try {
-    return execFileSync(
-      'tmux',
-      tmuxArgs(socket, ['capture-pane', '-t', tmuxSession, '-p', '-e', '-S', '-5000']),
-      {
-        encoding: 'utf-8',
-        timeout: 5000,
-        stdio: 'pipe',
-        env: sanitizeChildEnv() as NodeJS.ProcessEnv,
-      }
-    )
-  } catch {
-    return ''
+  for (const socket of entry ? [localSocket(entry)] : localSockets()) {
+    try {
+      return runTmux(socket, ['capture-pane', '-t', tmuxSession, '-p', '-e', '-S', '-5000'], 5000)
+    } catch {
+      // Not on this server; try the next
+    }
   }
+  return ''
 }
 
 export function discoverTmuxSessions(): string[] {
   const sessions = new Set<string>()
-  for (const socket of [TMUX_SOCKET, null] as const) {
+  for (const socket of localSockets()) {
     try {
-      const output = execFileSync(
-        'tmux',
-        tmuxArgs(socket, ['list-sessions', '-F', '#{session_name}']),
-        {
-          encoding: 'utf-8',
-          timeout: 5000,
-          stdio: 'pipe',
-          env: sanitizeChildEnv() as NodeJS.ProcessEnv,
-        }
-      )
+      const output = runTmux(socket, ['list-sessions', '-F', '#{session_name}'], 5000)
       for (const name of output.split('\n')) {
         if (name.startsWith('pewpew-')) sessions.add(name.replace('pewpew-', ''))
       }
@@ -899,15 +879,10 @@ export function reattachPty(sessionId: string): void {
 
   // Replay scrollback history
   try {
-    const scrollback = execFileSync(
-      'tmux',
-      tmuxArgs(tmuxSocket, ['capture-pane', '-t', tmuxSession, '-p', '-e', '-S', '-5000']),
-      {
-        encoding: 'utf-8',
-        timeout: 5000,
-        stdio: 'pipe',
-        env: sanitizeChildEnv() as NodeJS.ProcessEnv,
-      }
+    const scrollback = runTmux(
+      tmuxSocket,
+      ['capture-pane', '-t', tmuxSession, '-p', '-e', '-S', '-5000'],
+      5000
     )
     if (scrollback) {
       appendToBuffer(entry, scrollback)
