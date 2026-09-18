@@ -10,6 +10,10 @@ const state = {
   tmuxAvailable: true,
   bwrapAvailable: true,
   tmuxArgvCalls: [] as string[][],
+  tmuxCalls: [] as string[][],
+  // Which tmux servers (by -L name, or 'default') answer has-session.
+  liveTmuxServers: new Set<string>(['pewpew']),
+  tmuxListOutput: {} as Record<string, string>,
   remoteArgvCalls: [] as string[][],
   mkdirCalls: [] as string[],
   // Controls what resolveRemoteGitDir returns (empty → fallback to
@@ -45,8 +49,14 @@ vi.mock('child_process', () => ({
       if (!state.bwrapAvailable) throw new Error('not found')
       return ''
     }
-    if (file === 'tmux' && args[0] === 'new-session') {
-      state.tmuxArgvCalls.push(args)
+    if (file === 'tmux') {
+      state.tmuxCalls.push(args)
+      if (args.includes('new-session')) state.tmuxArgvCalls.push(args)
+      const server = args[0] === '-L' ? args[1] : 'default'
+      if (args.includes('has-session') && !state.liveTmuxServers.has(server)) {
+        throw new Error('no server running')
+      }
+      if (args.includes('list-sessions')) return state.tmuxListOutput[server] ?? ''
       return ''
     }
     return ''
@@ -105,7 +115,12 @@ import { join } from 'path'
 import {
   buildAgentArgs,
   createPty,
+  captureThumbnails,
   createRemotePty,
+  destroyPty,
+  discoverTmuxSessions,
+  hasTmuxSession,
+  reattachPty,
   __resetSandboxProbeCacheForTesting,
 } from './pty-manager'
 import { buildSandboxArgs } from './agent-sandbox'
@@ -118,8 +133,12 @@ const WORKTREE = '/home/dev/project/.claude/worktrees/wt1'
 
 // Fixed prefix before `...agentArgs` in the composed `tmux new-session` argv
 // passed to execFileSync('tmux', [...]):
-// ['new-session', '-d', '-s', tmuxSession, '-c', cwd, '-x', '120', '-y', '30', ...agentArgs]
-const agentArgsFromCall = (argv: string[]): string[] => argv.slice(10)
+// ['-L', 'pewpew', 'new-session', '-d', '-s', tmuxSession, '-c', cwd, '-x', '120', '-y', '30',
+//  'env', '-u', 'TMUX', '-u', 'TMUX_PANE', ...agentArgs]
+const AGENT_ENV_SCRUB = ['env', '-u', 'TMUX', '-u', 'TMUX_PANE']
+const LOCAL_TMUX_PREFIX_LEN = 12
+const agentArgsFromCall = (argv: string[]): string[] =>
+  argv.slice(LOCAL_TMUX_PREFIX_LEN + AGENT_ENV_SCRUB.length)
 
 // Same, but for the remote argv passed to execRemote(host, [...]), which
 // includes the leading 'tmux' element itself (one more than the local case).
@@ -227,12 +246,65 @@ describe('createPty', () => {
     state.tmuxAvailable = true
     state.bwrapAvailable = true
     state.tmuxArgvCalls = []
+    state.tmuxCalls = []
+    state.liveTmuxServers = new Set(['pewpew'])
+    state.tmuxListOutput = {}
     state.mkdirCalls = []
     // isSandboxAvailable() memoizes a successful real-bwrap probe; without
     // resetting it here, the first test to see bwrapAvailable=true would
     // permanently mask every later test simulating bwrap being unusable.
     __resetSandboxProbeCacheForTesting()
     warnSpy.mockClear()
+  })
+
+  it('runs local tmux calls on the dedicated pewpew socket', () => {
+    createPty('s1', WORKTREE, { tool: 'claude' })
+    reattachPty('s1')
+    expect(hasTmuxSession('s1')).toBe(true)
+    destroyPty('s1')
+    expect(state.tmuxCalls.length).toBeGreaterThan(0)
+    for (const argv of state.tmuxCalls) {
+      expect(argv.slice(0, 2)).toEqual(['-L', 'pewpew'])
+    }
+  })
+
+  it('keeps managing a session still alive on the default server (pre-dedicated-socket upgrade)', async () => {
+    state.liveTmuxServers = new Set(['default'])
+    expect(hasTmuxSession('legacy')).toBe(true)
+    state.tmuxCalls = []
+
+    reattachPty('legacy')
+    await captureThumbnails()
+    destroyPty('legacy')
+
+    const attachAndKill = state.tmuxCalls.filter(
+      (argv) => argv.includes('capture-pane') || argv.includes('kill-session')
+    )
+    expect(attachAndKill.length).toBe(3)
+    for (const argv of attachAndKill) {
+      expect(argv[0]).not.toBe('-L')
+    }
+  })
+
+  it('reports no tmux session when neither server has it', () => {
+    state.liveTmuxServers = new Set()
+    expect(hasTmuxSession('gone')).toBe(false)
+  })
+
+  it('discovers pewpew sessions from both the dedicated and the default server', () => {
+    state.tmuxListOutput = {
+      pewpew: 'pewpew-a1\nnotes\n',
+      default: 'pewpew-b2\npewpew-a1\nwork\n',
+    }
+    expect(discoverTmuxSessions().sort()).toEqual(['a1', 'b2'])
+  })
+
+  it('unsets TMUX/TMUX_PANE for the agent so its own bare tmux calls miss pewpew’s server', () => {
+    createPty('s1', WORKTREE, { tool: 'claude' })
+    const argv = state.tmuxArgvCalls[0]
+    expect(
+      argv.slice(LOCAL_TMUX_PREFIX_LEN, LOCAL_TMUX_PREFIX_LEN + AGENT_ENV_SCRUB.length)
+    ).toEqual(AGENT_ENV_SCRUB)
   })
 
   it('never sandboxes claude, even when bwrap is available, and never probes or warns about it', () => {

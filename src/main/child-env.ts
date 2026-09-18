@@ -50,6 +50,12 @@ function filterColonList(value: string, keep: (entry: string) => boolean): strin
 export function sanitizeChildEnv(env: NodeJS.ProcessEnv = process.env): NodeJS.ProcessEnv {
   const out: NodeJS.ProcessEnv = { ...env }
 
+  // Launched from inside a tmux pane (e.g. `npm run dev`), pewpew inherits that
+  // pane's TMUX/TMUX_PANE. Left in place, a bare `tmux` in a child would follow
+  // $TMUX to the launching pane's server instead of the one it means to use.
+  delete out.TMUX
+  delete out.TMUX_PANE
+
   // npm exports npm_config_*/npm_package_*/npm_execpath/npm_lifecycle_*/INIT_CWD,
   // prepends every ancestor directory's node_modules/.bin (and node-gyp-bin) to
   // PATH, and points NODE at its own node binary — all for the life of any
