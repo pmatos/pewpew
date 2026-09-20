@@ -80,6 +80,9 @@ const state = vi.hoisted(() => ({
   // Session ids for which the mocked destroyRemotePty rejects (simulates an
   // SSH teardown failure), for removeSession failure-path coverage.
   destroyRemotePtyThrows: new Set<string>(),
+  // Runs inside the mocked destroyRemotePty (before it settles) so a test can
+  // land an event while killSession is suspended on the teardown await.
+  destroyRemotePtyHook: null as ((sessionId: string) => void) | null,
   // Response returned by the mocked cleanup dialog: 0 = Delete worktree,
   // 1 = Keep worktree, 2 = Keep and open in file manager.
   dialogResponse: 1,
@@ -213,6 +216,7 @@ vi.mock('./pty-manager', () => ({
   },
   destroyPty: vi.fn(),
   destroyRemotePty: vi.fn(async (sessionId: string) => {
+    state.destroyRemotePtyHook?.(sessionId)
     if (state.destroyRemotePtyThrows.has(sessionId)) {
       throw new Error('ssh teardown failed')
     }
@@ -431,6 +435,7 @@ beforeEach(() => {
   state.hasPtyResult = new Set()
   state.hasTmuxSessionIds = new Set()
   state.destroyRemotePtyThrows = new Set()
+  state.destroyRemotePtyHook = null
   state.dialogResponse = 1
   state.dialogThrows = false
   showMessageBoxMock.mockClear()
@@ -3909,6 +3914,27 @@ describe('auto-reconnect cancellation', () => {
     // The pending backoff timer must have been canceled — no reattach fired.
     expect(state.reattachRemotePtyCalls).toEqual([])
     expect(sm.getSessions()[0].status).toBe('dead')
+  })
+})
+
+describe('killSession — remote teardown race', () => {
+  it('marks the live session offline when a hook event replaces it during the teardown await', async () => {
+    const remote = baseRemoteSession({ id: 'r1', status: 'idle' })
+    writeSessionsJson([remote])
+    const sm = await loadSessionManager()
+    sm.restoreSessions()
+    sm.initSessionManager()
+    const before = sm.getSessions()[0]
+
+    state.destroyRemotePtyHook = () => {
+      sm.handleHookEvent('session.activity', { cwd: remote.worktreePath }, 'h1')
+    }
+    await sm.killSession('r1')
+
+    const after = sm.getSessions()[0]
+    expect(after).not.toBe(before)
+    expect(after.status).toBe('dead')
+    expect(after.connectionState).toBe('offline')
   })
 })
 
