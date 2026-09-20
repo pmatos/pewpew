@@ -51,7 +51,7 @@ Persisted candidate memory for the `pm-deepen` routine. Reconciled against `gh` 
 
 ## session-store
 
-- **Status**: in-flight
+- **Status**: landed
 - **Score**: 24/25 (leverage 5, locality 5, blast radius 2, heat 5)
 - **Files**: ~5 estimated (new `session-store.ts` + its test, `session-manager.ts`, `remote-reconnect.ts`, `session-manager.test.ts`)
 - **Modules**: `src/main/session-manager.ts`, `src/main/remote-reconnect.ts`, new `src/main/session-store.ts`
@@ -67,6 +67,10 @@ Persisted candidate memory for the `pm-deepen` routine. Reconciled against `gh` 
 - **Landed shape**: ports-and-adapters design (3 ports: persist/broadcast/tray), `batch(body: () => boolean)` making the try/finally shape unrepresentable, caller-supplied `now` so the store has no clock dependency. 3 files, `session-manager.ts` -86 net lines, `session-manager.test.ts` and `remote-reconnect.ts` both untouched. Gate green: tsc, eslint, vitest 912/912, build.
 - **Follow-ups this PR deliberately left**: the two deferred-notify bugs above (now one-line fixes in the store's vocabulary); `lastKnownStateWrites` is not pruned on `delete` (slow leak, unobservable because ids are `randomUUID`); the `?? 0` "never written" sentinel in the rate limiter is carried over and pinned by a test rather than replaced with an absence check.
 
+### Run 2026-09-21 — reconciled
+
+- PR #320 merged 2026-09-20 (`9109c5c` on main) → status `in-flight` → `landed`. `session-store.ts` + `session-store.test.ts` (371 lines) are on main; `session-manager.ts` is down to 2087 lines. The follow-ups above are unclaimed and remain a human's to schedule.
+
 ## materialize-pr-worktree
 
 - **Status**: proposed
@@ -77,6 +81,7 @@ Persisted candidate memory for the `pm-deepen` routine. Reconciled against `gh` 
 - **First seen**: 2026-09-02
 - **Correction**: 2026-09-18 — the bug claim is true but **narrower** than filed. The local path does probe (`session-manager.ts:1685`) but uses the result only to gate the fork bail-out; only the **same-repo** case still does try-then-fallback (`:1691` → `:1700`). The fork branch is already symmetric with remote.
 - **Prerequisite**: there are **zero tests for `createRemotePrSession`** — all 12 `createPrSession` test calls pass `hostId = null`. Remote-executor tests are prerequisite work, not optional.
+- **Re-checked (2026-09-21)**: friction re-verified present; unchanged by PR #320.
 
 ## resolve-local-review-context
 
@@ -87,6 +92,7 @@ Persisted candidate memory for the `pm-deepen` routine. Reconciled against `gh` 
 - **Summary**: Extract the shared review-IPC preamble (getSession → reject remote → reviewGit) into one resolver; the three review:* handlers collapse to a call each.
 - **First seen**: 2026-09-02
 - **Score note**: 2026-09-18 — re-scored 19 → 18. Range shifted 596-641 → 628-673 (5 duplicated lines × 3 handlers). Heat 5 → 3: `index.ts` moved 2026-09-12 but this block dates to 2026-07-10. Blast radius 2 → 1. Caveat: there is **no `src/main/index.test.ts`** anywhere in the repo, so the preamble has zero coverage today; `review.test.ts` covers only the pure functions it calls into.
+- **Re-checked (2026-09-21)**: friction re-verified present; `src/main/index.test.ts` still absent, so the coverage caveat stands.
 
 ## create-broadcast-setting-store
 
@@ -97,6 +103,7 @@ Persisted candidate memory for the `pm-deepen` routine. Reconciled against `gh` 
 - **Summary**: A createBroadcastSetting factory owning the stale-reply race guard the two setting stores currently hand-sync.
 - **First seen**: 2026-09-02
 - **Reason (note)**: 2026-09-18 — re-scored 18 → 17 (heat 3 → 2; `theme.ts` last touched 2026-05-11, `animations.ts` 2026-07-13). **This is where issue #185 actually lives** (`545dd45`, `6d5a609`), not on `session-store`. The predicted drift has already happened: `theme.ts:38` still carries the no-op-broadcast bug that `animations.ts:53-63` fixed in `6d5a609` — a matching cross-window broadcast returns early without bumping `mutationCount`, so a slow in-flight `getTheme()` reply passes the guard at `:55` and clobbers. No `theme.test.ts` or `animations.test.ts` exists; all three race-guard fixes landed untested, so characterization tests are prerequisite work and also most of the value.
+- **Re-checked (2026-09-21)**: friction re-verified present, including the `theme.ts:38` no-op-broadcast bug.
 
 ## git-runner-factories
 
@@ -107,6 +114,7 @@ Persisted candidate memory for the `pm-deepen` routine. Reconciled against `gh` 
 - **Summary**: localGitRunner/remoteGitRunner factories owning the GitRunner adapter and a uniform timeout policy (createPrSession's runner currently has no timeout).
 - **First seen**: 2026-09-02
 - **Score note**: 2026-09-18 — re-scored 17 → 18 (locality 3 → 4). Timeout claim **confirmed**: `session-manager.ts:1614-1619` passes no options object at all, while the otherwise byte-identical `createIssueSession` runner at `:1756-1763` passes `{ timeout: 30000 }`. The un-timed runner performs `git fetch` against a possibly-unreachable fork upstream at `:1677`. Eight construction sites, five different timeout policies. Bonus: the `GitRunner` **type** is declared byte-identically in `origin-base.ts:6` and `review.ts:9`. Constraint: the `deps.runGit ??` injection points at `:1614-1615`/`:1756-1757` are the existing test seam and must be preserved.
+- **Re-checked (2026-09-21)**: friction re-verified present; would be partially subsumed by `worktree-add-strategy`, which lands the adapter it asks for.
 
 ## single-owner-pr-metadata
 
@@ -117,6 +125,7 @@ Persisted candidate memory for the `pm-deepen` routine. Reconciled against `gh` 
 - **Summary**: Delete the dead duplicate of PrViewInfo/PR_VIEW_FIELDS/forkFieldsFromPr/describePrLookupFailure from `github.ts`, leaving `pr-worktree-planner.ts` the single owner.
 - **First seen**: 2026-09-02
 - **Reason (note)**: 2026-09-18 — re-scored 17 → 18 (blast radius 2 → 1). It is a **pure deletion**, not a migration: `github.ts`'s `PrViewInfo`/`PR_VIEW_FIELDS` have zero importers repo-wide, and its `forkFieldsFromPr`/`describePrLookupFailure` are reachable only from `github.test.ts`. The duplication is byte-identical across ~33 lines but for one return annotation. `pr-worktree-planner.test.ts` already holds a superset of the coverage being deleted. Residual of commit `92129d6`, which did the same for five other symbols. Ranked below the 21s on heat alone (both files cold since 2026-07-10).
+- **Re-checked (2026-09-21)**: friction re-verified present; still a pure deletion.
 
 ## unify-gh-query-dispatch
 
@@ -127,6 +136,7 @@ Persisted candidate memory for the `pm-deepen` routine. Reconciled against `gh` 
 - **Summary**: A runGh dispatcher owning probe + local/remote branch + error wrapping once, so each gh query declares only its endpoint/jq/parser.
 - **First seen**: 2026-09-02
 - **Constraint**: 2026-09-18 — the return types (`NumberedGhItem[] | string` etc.) are mirrored in `preload/index.ts:44-66` and `env.d.ts:65-71`. A dispatcher is safe **only if** it preserves the `T | string` convention; it must stay strictly separate from `gh-string-error-union`. Best-covered module of the set (30 tests), so low-risk whenever scheduled.
+- **Re-checked (2026-09-21)**: friction re-verified present.
 
 ## hunk-key-value
 
@@ -137,6 +147,7 @@ Persisted candidate memory for the `pm-deepen` routine. Reconciled against `gh` 
 - **Summary**: Give the `filePath::hunkIndex` composite key a hunkKey/parseHunkKey owner instead of building it in three places and splitting it in a fourth.
 - **First seen**: 2026-09-02
 - **Score note**: 2026-09-18 — re-scored 15 → 14 (heat 3 → 1; all four files last touched 2026-05-11). Confirmed: byte-identical `getHunkKey` copies at `DiffViewer.tsx:11-13` and `prompt-generator.ts:31-33`, inlined at `review.ts:31`, split at `ReviewOverlay.tsx:287`. The split uses `split('::')[0]`, which truncates at the first `::` — a tie-breaker, not the headline. The string form is load-bearing: it keys `ReviewSessionState.annotations` and leaks into the DOM as `data-hunk-key`.
+- **Re-checked (2026-09-21)**: friction re-verified present; all four files still cold since 2026-05-11.
 
 ## config-ipc-passthrough
 
@@ -148,6 +159,7 @@ Persisted candidate memory for the `pm-deepen` routine. Reconciled against `gh` 
 - **First seen**: 2026-09-02
 - **Reason**: Leverage 1 — fails the deletion test; mostly moves IPC plumbing rather than concentrating behaviour, and touches the published IPC contract.
 - **Re-checked**: 2026-09-18 — **filter still applies, strengthened.** Now 14 channels (`index.ts:675-753`). Each channel name is mirrored three times (handler → `preload/index.ts:95-117` → `env.d.ts:97-112`), so a dispatcher edits 3 layers plus 5 renderer consumers / 15 call sites and _widens_ the IPC surface to an untyped key-string channel. Two of the 14 are not passthroughs at all (`config:save-theme`, `config:save-reduce-animations` each fan out a `BrowserWindow.getAllWindows()` broadcast).
+- **Re-checked (2026-09-21)**: Leverage 1 + published IPC surface — **filter still applies**, unchanged since 2026-09-18 (`index.ts` untouched since).
 
 ## repo-ref-value-object
 
@@ -159,6 +171,7 @@ Persisted candidate memory for the `pm-deepen` routine. Reconciled against `gh` 
 - **First seen**: 2026-09-02
 - **Reason**: Published-interface change — rewrites exported shared types and the preload IPC surface; the autonomy contract bars expanding a published interface unattended beyond what the pick requires.
 - **Re-checked**: 2026-09-18 — **filter still applies.** 25 declaration sites in 10 files, crossing `shared/types.ts:177-181`, `preload/index.ts:44/57/66` and `env.d.ts:58/64/69` simultaneously. Staging note for a human: `pr-worktree-planner.ts` already concentrates the `owner/name` parsing and is the natural home; `single-owner-pr-metadata` should land first.
+- **Re-checked (2026-09-21)**: Published-interface change — **filter still applies**, unchanged since 2026-09-18.
 
 ## gh-string-error-union
 
@@ -170,11 +183,12 @@ Persisted candidate memory for the `pm-deepen` routine. Reconciled against `gh` 
 - **First seen**: 2026-09-02
 - **Reason**: Pervasive-convention migration across many files, not a single seam.
 - **Re-checked**: 2026-09-18 — **filter still applies.** 25 signature sites and 10 `typeof x === 'string'` discrimination sites across 7 files. Every `Promise<T | string>` in `env.d.ts:42-71` is a de-facto wire-format commitment (the renderer discriminates by `typeof`), so it cannot be done file-by-file without compatibility shims on both sides.
+- **Re-checked (2026-09-21)**: Pervasive-convention migration — **filter still applies**, unchanged since 2026-09-18.
 
 ## pty-entry-registration
 
-- **Status**: proposed
-- **Score**: 22/25 (leverage 4, locality 5, blast radius 1, heat 4)
+- **Status**: in-flight
+- **Score**: 23/25 (leverage 4, locality 5, blast radius 1, heat 5)
 - **Files**: ~3 estimated (`pty-manager.ts`, `pty-manager.test.ts`, `session-record.ts` for the name helper)
 - **Modules**: `src/main/pty-manager.ts`, `src/main/session-record.ts`
 - **Summary**: One `registerPtyEntry` primitive owning the four-times-repeated pty registration epilogue (entry construction, onData/onExit wiring, SSH refcount release, exit notification, `ptys.set`), plus a `tmuxSessionName` helper for the 11 open-coded `pewpew-${id}` sites.
@@ -182,6 +196,21 @@ Persisted candidate memory for the `pm-deepen` routine. Reconciled against `gh` 
 - **Evidence**: 4 epilogues at `pty-manager.ts:418-433`, `:538-555`, `:804-818`, `:847-863`. Omitting `releaseRemoteEntry` leaks an SSH refcount (only path back to `releaseHostConnection`); omitting `notifyUnexpectedExitIfPresent` breaks the dead-session detection `session-manager.ts:311-341` depends on. `reattachPty:820-832` re-implements `getScrollback`'s local branch verbatim (cf. `:762-771`) while `reattachRemotePty:865` just calls it. Three teardown paths order delete/release/kill differently (`:577-583`, `:593-599`, `:641-647`), undocumented. `ptys.set` at `:818` overwrites without destroying, leaking the prior node-pty — a hazard documented in a _different file_, `session-manager.ts:1228-1231`.
 - **Test surface**: `reattachPty` and `reattachRemotePty` have **no tests at all**, and `pty-manager.test.ts`'s `fakePty()` (`:26-34`) stubs `onData`/`onExit` as no-ops so even the tested paths never exercise the wiring. Making `fakePty` capture its handlers is a self-contained first step.
 - **Constraint**: the `pewpew-${id}` string form is persisted into `Session.tmuxSession` (`session-record.ts:38`) and must be produced byte-identically.
+- **Score note**: 2026-09-21 — **re-scored 22/25 → 23/25**; picked this run. Heat 4 → 5: `a21af71` / PR #321 ("isolate local tmux server and keep killed sessions restartable"), merged **2026-09-18**, edited the `tmuxSocket` field _inside two of the four epilogues_ this candidate unifies. Line ranges from 2026-09-18 are stale — the four registration epilogues are now `pty-manager.ts:476-492`, `:597-616`, `:848-863`, `:892-908`; `releaseRemoteEntry` at `:495-499`, called from `onExit` at `:609` and `:904` only. The `pewpew-${id}` form is open-coded at **10** sites in `pty-manager.ts` (`:453`, `:511`, `:649`, `:675`, `:721`, `:768`, `:785`, `:815`, `:842`, `:881`) plus `session-record.ts:40`. Also duplicated: the remote attach options block at `:588-593` and `:883-888`.
+- **PR**: #325
+- **Landed shape**: `registerPty(sessionId, ptyProcess, placement)` with `PtyPlacement` as a discriminated union and `PtyEntry` split into `LocalPtyEntry` / `RemotePtyEntry`, so the SSH lease follows from the placement instead of from a remembered line — one `onExit` body shared by both placements. Plus `tmuxSessionName` (10 open-codings) and `spawnRemoteAttach` (2 duplicated options blocks). **2 files**, under the ~3 estimate; `pty-manager.ts` +20 net lines (doc comments exceed the ~76 lines of epilogue removed). Gate green: tsc, eslint, vitest 945/945, build.
+- **Evidence of test-first**: two demonstrated reds. (1) `tsc` — `TS2305` on the missing `PtyPlacement` export plus four `TS2578 Unused '@ts-expect-error' directive`, i.e. every illegal placement literal compiled before the union existed. (2) Mutation — deleting `releaseRemoteEntry(entry)` from both `onExit` handlers turns exactly the two remote rows of the lease matrix red (`expected [] to deeply equal [ 'h1' ]`, 2 failed | 37 passed) and leaves both local rows green.
+- **Follow-ups this PR deliberately left**: re-registering a session id orphans the prior entry's lease (`ptys.set` overwrites without teardown, so its `releaseRemoteEntry` is never reached) — a few lines in `registerPty`'s vocabulary now, but a behaviour change that would have made the mutation proof meaningless; and `session-record.ts:40` still spells `pewpew-${id}` itself, because sharing `tmuxSessionName` needs its own leaf module rather than an import from `pty-manager.ts` (which pulls in `node-pty` and `electron`).
+
+### Run 2026-09-21 — complete
+
+- **Outcome**: complete
+- **Stopped at**: step 6 — PR opened
+- **Branch**: `sym/pewpew/routine/refactor-audit/01M30GVV0Q`, adopted (all four conditions held: non-default, 0 commits ahead of `origin/main`, no upstream, unpublished on origin). Not renamed — an adopted branch keeps the caller's name so the harness can find the PR.
+- **Committed**: report, backlog, `pty-manager.test.ts`, `pty-manager.ts`, new `CONTEXT.md` (6 commits)
+- **Evidence**: PR #325; gate green — tsc, eslint, vitest 945/945 (under `TMPDIR=/tmp`), build
+- **Degradation**: the **advisor was rate-limited at step 4**, so the design adjudication was made by this run against the three designs as written and committed (`4898162`) rather than by an independent reviewer — the skill's stated fallback.
+- **Next**: review/merge #325. The next firing picks up the four candidates tied at 21/25 — `adoption-gate` first by the tie-break (lower blast radius, then higher heat), then `remote-hook-merge-executor` (which **carries a verified bug**: a malformed remote `.claude/settings.local.json` aborts `installRemoteHooks` before the `mv`, so the remote claude session cannot be created, while local claude and remote codex both recover), then `remote-exec-result-check` and `worktree-add-strategy`.
 
 ## remote-hook-merge-executor
 
@@ -194,6 +223,7 @@ Persisted candidate memory for the `pm-deepen` routine. Reconciled against `gh` 
 - **Carries a verified bug**: `installRemoteHooks` (`hook-installer.ts:158`) pipes the prior settings file straight into `jq` with no validity pre-check, while `installRemoteCodexHooks` (`:328-329`) has an explicit `jq -e 'type == "object"'` guard — added with a comment saying it mirrors the local installer's tolerance — and local `installHooks` gets the same tolerance from `parseAsObject` (`:101-111`). A malformed `.claude/settings.local.json` in a remote worktree therefore makes `jq` exit non-zero, `set -e` aborts before the `mv`, and the remote **claude** session cannot be created; local claude and remote codex both recover silently. Nothing documents the divergence as deliberate. **A human scheduling from this entry should read it as a bug report, not only a refactor.**
 - **Evidence**: TS merge loop byte-identical at `:127-137` and `:277-287`; `jq` reduce program byte-identical at `:159-164` and `:334-339`; `mergeCodexHooksFlag` re-encoded a fourth time as awk at `:465-482`.
 - **Test surface**: `hook-installer.test.ts:46-63` already has an `execLocally` harness that runs the remote shell script for real against a `mkdtempSync` dir (used at `:259-273`). Writing a malformed settings file and asserting `installRemoteHooks` does not throw is **a red test available today** — the best immediate red-green in the 2026-09-18 report.
+- **Re-checked (2026-09-21)**: friction re-verified present; ranked joint-2nd at 21/25 this run.
 
 ## remote-exec-result-check
 
@@ -205,6 +235,7 @@ Persisted candidate memory for the `pm-deepen` routine. Reconciled against `gh` 
 - **First seen**: 2026-09-18
 - **Evidence**: the detail line `result.stderr.trim() || result.stdout.trim() || \`exit ${result.code}\``appears at 10 non-test sites across 5 modules, always inside`if (result.timedOut || result.code !== 0)`. Existing helper at `remote-command.ts:18-24`; bypassed at `hook-installer.ts:169-172`, `:248-252`, `:344-347`, `:486-489`, `pty-manager.ts:524-527`, `session-manager.ts:864-868`; second private copy at `host-bootstrap.ts:547-557`. All five remote hook-installer functions thread `execRemote`as their first parameter, and`remote-agent-spawn.ts:26`/`pty-manager.ts:502-505` each rebuild the same binding closure.
 - **Test surface**: `hook-installer.test.ts:155-167` already asserts the thrown message carries remote stderr; the detail precedence and timeout branch are assertable through existing `vi.fn` stubs.
+- **Re-checked (2026-09-21)**: friction re-verified present — the open-coded detail line is at **12** non-test sites across 5 modules this run.
 
 ## worktree-add-strategy
 
@@ -216,6 +247,7 @@ Persisted candidate memory for the `pm-deepen` routine. Reconciled against `gh` 
 - **First seen**: 2026-09-18
 - **Evidence**: `worktree-adoption.ts:1-3` claims to be the shared fallback "used by both the local and remote issue- and session-creation paths so those four sites can't drift" — but it covers only the `baseRef === 'origin-default'` half. The `else` half still runs try-then-fallback at `session-manager.ts:1010-1021` (local) and `:776-786` (remote), the exact pattern `createRemotePrSession:895-898` documents removing because "the fallback masked real failures … by surfacing the second attempt's misleading 'branch already exists' error". The `no-origin-remote` / `no-origin-default-branch` mapping is duplicated verbatim at `:1771-1776` and `:1826-1831` and is **absent** from `createSession`/`createRemoteSession`, which let the raw sentinel escape as an Error message.
 - **Test surface**: `session-manager.test.ts:763` and `:2510` already drive these paths through injected `runGit`/`branchExists` deps; the current-HEAD branch of `createSession` needs a `child_process` mock the suite already uses elsewhere.
+- **Re-checked (2026-09-21)**: friction re-verified present; the origin-error triage is still duplicated at `session-manager.ts:1729-1730` / `:1783-1784` and a third time in the renderer at `ProjectTree.tsx:331-333`.
 
 ## adoption-gate
 
@@ -227,6 +259,7 @@ Persisted candidate memory for the `pm-deepen` routine. Reconciled against `gh` 
 - **First seen**: 2026-09-18
 - **Evidence**: `session-manager.ts:413-442` and `:603-637` are structurally identical prologues; the mixed-tool rejection message is duplicated verbatim at `:430-432` and `:622-624`. The two `Map<string, InflightAdoption>` at `:411` and `:598` differ only in key shape (`canonicalPath(worktreePath)` vs `` `${hostId} ${worktreePath}` ``); the comment at `:598-601` says "Mirrors `inflightAdoptions` (local)."
 - **Test surface**: `session-manager.test.ts:494`, `:613`, `:680` already exercise both gates, and `mirrorAllWorktrees` accepts an injected `adopt` dep (`MirrorAllDeps`, `:555-557`).
+- **Re-checked (2026-09-21)**: friction re-verified present; ranges shifted to `session-manager.ts:372-404` / `:557-597` after PR #320. **Runner-up candidate this run** (first among four tied at 21/25, by the tie-break: lower blast radius, then higher heat).
 
 ## session-op-ipc
 
@@ -238,6 +271,7 @@ Persisted candidate memory for the `pm-deepen` routine. Reconciled against `gh` 
 - **First seen**: 2026-09-18
 - **Reason**: **Not pinnable before the change.** The handlers register inside the `app.whenReady()` closure and `src/main/index.ts` has no test file at all, so no characterization test can be written first — the "no way to pin current behaviour" hard filter. The extraction is itself the testability unlock, which makes it a strong candidate for a human; it is simply not implementable under a test-first unattended run. Recorded with its score so a future firing sees the filter instead of re-deriving the candidate and discovering the problem mid-implementation. **Reversible**: extracting any testable seam from `index.ts` first would clear it.
 - **Evidence**: five single-session handlers character-for-character identical but for a verb and a function (`index.ts:522-530`, `:531-539`, `:540-548`, `:549-557`, `:562-570`); three batch handlers identical but for the swallow (`:571-582`, `:583-594`, `:595-606`). Policy stated in a comment at `:516-520`. `sessions:remove-worktree` at `:558-561` sits in the middle of the block and follows neither — no try, no log. `session-manager.ts:1317-1325` is a third copy of the batch shape.
+- **Re-checked (2026-09-21)**: **Filter still applies.** `src/main/index.test.ts` re-verified absent this run, so the handlers still cannot be pinned before the change.
 
 ## remote-session-context
 
@@ -249,6 +283,7 @@ Persisted candidate memory for the `pm-deepen` routine. Reconciled against `gh` 
 - **First seen**: 2026-09-18
 - **Reason**: Leverage 1 — `remote-agent-spawn.ts:52-56` documents the throw-vs-return-string split as deliberate and published, so the proposed seam would unify two things the code says should stay apart.
 - **Residue worth a follow-up**: `host.label || host.alias` is open-coded at 8 sites (`session-manager.ts` ×5, `remote-host-runtime.ts:73`, `:137`, `github-items.ts:125`) while `host-connection.ts:79` has a `hostLabel()` helper with **different** semantics — `getHost(host.hostId)?.label ?? host.alias`, which re-reads the registry so a renamed host shows its new label, and uses `??` not `||`. Two label semantics, one helper, seven bypasses.
+- **Re-checked (2026-09-21)**: Leverage 1 — **filter still applies**; `remote-agent-spawn.ts:52-56` still documents the split as deliberate.
 
 ## local-agent-respawn
 
@@ -259,6 +294,7 @@ Persisted candidate memory for the `pm-deepen` routine. Reconciled against `gh` 
 - **Summary**: Collapse the near-identical bodies of `reviveSession` and `attachLocalSession`.
 - **First seen**: 2026-09-18
 - **Reason**: Leverage 1 — the one behavioural difference (swallow vs propagate a hook-install failure) is documented at `session-manager.ts:1290-1297`, and the remote half is already covered by the landed `spawn-remote-agent-pipeline`. Complexity would move, not concentrate.
+- **Re-checked (2026-09-21)**: Leverage 1 — **filter still applies**; the documented swallow-vs-propagate difference is still at `session-manager.ts:1290-1297`.
 
 ## preload-subscribe
 
@@ -269,6 +305,7 @@ Persisted candidate memory for the `pm-deepen` routine. Reconciled against `gh` 
 - **Summary**: One subscribe helper for the seven identical `on<X>` wrappers.
 - **First seen**: 2026-09-18
 - **Reason**: Leverage 2 — it does concentrate the `removeListener` contract (a leak if forgotten), but there is almost no behaviour behind the interface, so complexity mostly moves. It also touches the published `window.api` shape consumed by the renderer and typed in `env.d.ts`, which none of the ranked candidates do. No test file exists for preload.
+- **Re-checked (2026-09-21)**: Leverage 2 + published `window.api` — **filter still applies**.
 
 ## renderer-error-message
 
@@ -279,16 +316,39 @@ Persisted candidate memory for the `pm-deepen` routine. Reconciled against `gh` 
 - **Summary**: A single `errorMessage(e)` owner for the verbatim copies plus three ad-hoc inlines.
 - **First seen**: 2026-09-18
 - **Reason**: Leverage 1 — four lines, duplicated at `projects.ts:32-36` and `hosts.ts:27-31` with inlines at `review.ts:204`, `ProjectTree.tsx:330`, `origin-base.ts:43`. Complexity just moves.
+- **Re-checked (2026-09-21)**: Leverage 1 — **filter still applies**.
 
 ## project-tree-stale-tokens
 
-- **Status**: dropped
-- **Score**: not scored (hard-filtered)
-- **Files**: ~1 estimated
+- **Status**: proposed
+- **Score**: 20/25 (leverage 3, locality 5, blast radius 1, heat 4)
+- **Files**: ~3 estimated
 - **Modules**: `src/renderer/components/ProjectTree.tsx`
 - **Summary**: One owner for the four stale-reply guard sequences over two refs.
 - **First seen**: 2026-09-18
 - **Reason**: Leverage 2 — contained to a single file and mostly moves. Worth recording: there is a real semantic split at `ProjectTree.tsx:207-220`, `:398-406`, `:428-448`, `:499-519` — three sites claim latest via `(ref.current += 1)`, but `handleSubmitIssues:499` only _reads_ `ref.current`. Adjacent to `create-broadcast-setting-store`; if that factory lands, re-check whether this becomes worth proposing.
+- **Reason (note)**: 2026-09-21 — **moved `dropped` → `proposed`, scored 20/25.** The leverage-2 filter no longer holds. An independent scan this run found **five** guard sites over two refs, not four, and — decisively — that this is the repo's cleanest instance of _a pure function extracted only for testability while the real bugs hide in how it is called_. `resolveBulkPrDialogDefaults` is `export`ed at `ProjectTree.tsx:26-41` purely so a test can reach it, and it is the one piece of the flow containing **no** token logic; the guard it serves lives at the call site (`openAllPrs:398`, `:406`), outside the tested module. `ProjectTree.test.ts` is 24 lines with one test covering only the extracted function; the guards have **zero** coverage and three guard fixes landed untested. That is a locality failure, not a cosmetic one — leverage 2 → 3. Ranks below this run's pick, so the reversal did not change the 2026-09-21 outcome.
+
+## spawned-session-commit
+
+- **Status**: dropped
+- **Score**: not scored (hard-filtered)
+- **Files**: ~1 estimated
+- **Modules**: `src/main/session-manager.ts`
+- **Summary**: A shared commit epilogue for the `buildSession` → `registerSpawnedSession` → `onSessionsChanged` → `return session` sequence repeated at five spawn sites.
+- **First seen**: 2026-09-21
+- **Reason**: Leverage 1 — fails the deletion test. The local-only extras (`getRepoFingerprint(...).then` at `session-manager.ts:463-468`, `resolvePrNumberAsync` at `:470`) are _correctly_ absent from the remote sites: `resolvePrNumberAsync:217-220` bails on `session.hostId`, and remote sessions take `repoFingerprint` from `remoteProject`. The asymmetry is intentional, so a shared epilogue would immediately need an options flag per difference — complexity would move into flags, not concentrate.
+
+## config-field-handlers
+
+- **Status**: dropped
+- **Score**: not scored (hard-filtered)
+- **Files**: ~2 estimated
+- **Modules**: `src/main/index.ts` (675-755)
+- **Summary**: A `registerConfigField(channel, key, { broadcast })` seam over the twelve `config:get-X` / `config:save-X` handlers whose getters are all `return getConfig().X` and whose setters all read → mutate → `saveConfig` → optionally broadcast.
+- **First seen**: 2026-09-21
+- **Reason**: **Not pinnable before the change** — there is no `src/main/index.test.ts` anywhere in the repo (re-verified 2026-09-21), so none of this behaviour can be characterised first. Same filter as `session-op-ipc`, and reversible on the same condition: extracting any testable seam from `index.ts` first would clear it.
+- **Note**: distinct from `config-ipc-passthrough` (which proposes a _generic key-string channel_ and fails on leverage + published IPC surface). This one keeps the 14 channel names exactly as they are and collapses only the handler bodies, so it does not widen the IPC surface. It is the main-side twin of `create-broadcast-setting-store`: `config:save-theme:728-739` and `config:save-reduce-animations:744-754` are the same `BrowserWindow.getAllWindows()` broadcast loop twice.
 
 ## Run log
 

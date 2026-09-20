@@ -1,4 +1,4 @@
-import { describe, it, expect, vi, beforeEach } from 'vitest'
+import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest'
 
 vi.mock('electron', () => ({
   dialog: {
@@ -23,16 +23,60 @@ const state = {
   // hit EROFS under --ro-bind / /). Only codex/omp ever call it — claude is
   // never sandboxed.
   remoteStateDir: '/home/dev/.omp/agent/sessions/encoded-wt1' as string | undefined,
+  // Every fakePty ever handed to production code, in spawn order, so a test can
+  // drive the handlers pty-manager registered on it.
+  ptys: [] as FakePty[],
+  retainCalls: [] as string[],
+  releaseCalls: [] as string[],
+  broadcasts: [] as Array<[string, unknown]>,
+  captureOutput: '',
 }
 
-function fakePty() {
-  return {
-    onData: () => undefined,
-    onExit: () => undefined,
+interface FakePty {
+  onData: (fn: (data: string) => void) => void
+  onExit: (fn: () => void) => void
+  write: () => void
+  resize: () => void
+  kill: () => void
+  emitData: (data: string) => void
+  emitExit: () => void
+  killed: boolean
+}
+
+// Handlers accumulate in arrays rather than single slots: host-connection's
+// spawnAttach registers its own onExit on the same pty in production, so a
+// single-slot fake would bake in an assumption that is false there.
+function fakePty(): FakePty {
+  const dataHandlers: Array<(data: string) => void> = []
+  const exitHandlers: Array<() => void> = []
+  const p: FakePty = {
+    onData: (fn) => {
+      dataHandlers.push(fn)
+    },
+    onExit: (fn) => {
+      exitHandlers.push(fn)
+    },
     write: () => undefined,
     resize: () => undefined,
-    kill: () => undefined,
+    kill: () => {
+      p.killed = true
+    },
+    emitData: (data) => {
+      for (const fn of dataHandlers) fn(data)
+    },
+    emitExit: () => {
+      for (const fn of exitHandlers) fn()
+    },
+    killed: false,
   }
+  state.ptys.push(p)
+  return p
+}
+
+const lastPty = (): FakePty => {
+  const p = state.ptys[state.ptys.length - 1]
+  if (!p) throw new Error('no pty was spawned')
+  return p
 }
 
 vi.mock('child_process', () => ({
@@ -55,6 +99,7 @@ vi.mock('child_process', () => ({
         throw new Error('no server running')
       }
       if (args.includes('list-sessions')) return state.tmuxListOutput[server] ?? ''
+      if (args.includes('capture-pane')) return state.captureOutput
       return ''
     }
     return ''
@@ -103,9 +148,19 @@ vi.mock('./host-connection', () => ({
     }
     return { stdout: '', stderr: '', code: 0, timedOut: false }
   },
-  retainHostConnection: () => undefined,
-  releaseHostConnection: () => undefined,
+  retainHostConnection: (hostId: string) => {
+    state.retainCalls.push(hostId)
+  },
+  releaseHostConnection: (hostId: string) => {
+    state.releaseCalls.push(hostId)
+  },
   spawnAttach: () => fakePty(),
+}))
+
+vi.mock('./window-registry', () => ({
+  broadcastToAll: (channel: string, payload: unknown) => {
+    state.broadcasts.push([channel, payload])
+  },
 }))
 
 import { homedir } from 'os'
@@ -116,12 +171,19 @@ import {
   captureThumbnails,
   createRemotePty,
   destroyPty,
+  destroyRemotePty,
+  detachPty,
   discoverTmuxSessions,
+  hasPty,
   hasTmuxSession,
   reattachPty,
+  reattachRemotePty,
+  setUnexpectedExitListener,
+  stopPtyManager,
   TMUX_SOCKET,
   __resetSandboxProbeCacheForTesting,
 } from './pty-manager'
+import type { PtyPlacement } from './pty-manager'
 import { buildSandboxArgs } from './agent-sandbox'
 import { OMP_HOOK_SCRIPT } from './hook-installer'
 import { canonicalPath, encodeOmpSessionDirName } from './agent-state-paths'
@@ -144,6 +206,14 @@ const agentArgsFromCall = (argv: string[]): string[] =>
 // Same, but for the remote argv passed to execRemote(host, [...]), which
 // includes the leading 'tmux' element itself (one more than the local case).
 const remoteAgentArgsFromCall = (argv: string[]): string[] => argv.slice(11)
+
+beforeEach(() => {
+  state.ptys = []
+  state.retainCalls = []
+  state.releaseCalls = []
+  state.broadcasts = []
+  state.captureOutput = ''
+})
 
 describe('buildAgentArgs', () => {
   it('defaults to claude with --permission-mode auto', () => {
@@ -471,5 +541,156 @@ describe('createRemotePty', () => {
     })
     const argv = remoteAgentArgsFromCall(tmuxCall())
     expect(argv).toEqual(buildAgentArgs({ tool: 'omp' }))
+  })
+})
+
+// The registration epilogue every spawn path shares. Nothing here was
+// observable before: fakePty() used to stub onData/onExit as no-ops, and
+// reattachPty/reattachRemotePty had no tests at all.
+describe('pty registration', () => {
+  const host = { hostId: 'h1', alias: 'dev', label: 'Dev' } as Host
+
+  afterEach(() => {
+    for (const id of ['reg-lc', 'reg-rc', 'reg-lr', 'reg-rr', 'reg-td', 'reg-replay']) {
+      detachPty(id)
+    }
+    setUnexpectedExitListener(null)
+    stopPtyManager()
+  })
+
+  // The lease matrix. A remote pty holds the host's SSH connection for its
+  // lifetime and is the only path back to releaseHostConnection; a local one
+  // holds nothing. Forgetting either half is silent today.
+  it('a local pty retains nothing and releases nothing when it exits on its own', () => {
+    createPty('reg-lc', WORKTREE, { tool: 'claude' })
+    expect(state.retainCalls).toEqual([])
+
+    lastPty().emitExit()
+
+    expect(state.releaseCalls).toEqual([])
+  })
+
+  it('a remote pty retains on registration and releases exactly once when it exits', async () => {
+    await createRemotePty('reg-rc', WORKTREE, host, { tool: 'claude' })
+    expect(state.retainCalls).toEqual(['h1'])
+    expect(state.releaseCalls).toEqual([])
+
+    lastPty().emitExit()
+    expect(state.releaseCalls).toEqual(['h1'])
+
+    lastPty().emitExit()
+    expect(state.releaseCalls).toEqual(['h1'])
+  })
+
+  it('a local reattach retains nothing and releases nothing when it exits', () => {
+    reattachPty('reg-lr')
+    expect(state.retainCalls).toEqual([])
+
+    lastPty().emitExit()
+
+    expect(state.releaseCalls).toEqual([])
+  })
+
+  it('a remote reattach retains, and releases exactly once when it exits', async () => {
+    await reattachRemotePty('reg-rr', host)
+    expect(state.retainCalls).toEqual(['h1'])
+
+    lastPty().emitExit()
+
+    expect(state.releaseCalls).toEqual(['h1'])
+  })
+
+  it('releases exactly once when teardown beats the exit handler to it', async () => {
+    await reattachRemotePty('reg-td', host)
+    const ptyProcess = lastPty()
+
+    await destroyRemotePty('reg-td', host)
+    expect(state.releaseCalls).toEqual(['h1'])
+
+    ptyProcess.emitExit()
+    expect(state.releaseCalls).toEqual(['h1'])
+  })
+
+  // The other half of the epilogue: output is wired into the coalescing buffer,
+  // and an exit that did not go through teardown reports the session as dead.
+  it('streams pty output to every window through the coalescing flush', () => {
+    vi.useFakeTimers()
+    try {
+      createPty('reg-replay', WORKTREE, { tool: 'claude' })
+      lastPty().emitData('hello')
+      expect(state.broadcasts).toEqual([])
+
+      vi.advanceTimersByTime(16)
+
+      expect(state.broadcasts).toEqual([['pty:data', { sessionId: 'reg-replay', data: 'hello' }]])
+    } finally {
+      vi.useRealTimers()
+    }
+  })
+
+  it('replays captured scrollback ahead of live output on reattach', () => {
+    state.captureOutput = 'prior output'
+    vi.useFakeTimers()
+    try {
+      reattachPty('reg-replay')
+      lastPty().emitData(' and live')
+
+      vi.advanceTimersByTime(16)
+
+      expect(state.broadcasts).toEqual([
+        ['pty:data', { sessionId: 'reg-replay', data: 'prior output and live' }],
+      ])
+    } finally {
+      vi.useRealTimers()
+    }
+  })
+
+  it('reports an exit that did not go through teardown as an unexpected exit', () => {
+    const exited: string[] = []
+    setUnexpectedExitListener((id) => exited.push(id))
+
+    createPty('reg-lc', WORKTREE, { tool: 'claude' })
+    lastPty().emitExit()
+
+    expect(exited).toEqual(['reg-lc'])
+    expect(hasPty('reg-lc')).toBe(false)
+  })
+
+  it('stays silent when the entry was already torn down', () => {
+    const exited: string[] = []
+    setUnexpectedExitListener((id) => exited.push(id))
+
+    createPty('reg-lc', WORKTREE, { tool: 'claude' })
+    const ptyProcess = lastPty()
+    detachPty('reg-lc')
+
+    ptyProcess.emitExit()
+
+    expect(exited).toEqual([])
+  })
+})
+
+// The placement union is the whole point of the interface: a registration site
+// states where the pty lives, and the lease rule follows from that rather than
+// from a line it has to remember. These assertions are checked by `tsc`, not at
+// runtime — each @ts-expect-error is itself an error if the code below compiles.
+describe('PtyPlacement', () => {
+  const host = { hostId: 'h1', alias: 'dev', label: 'Dev' } as Host
+
+  it('cannot describe a pty that is both local and remote, or neither', () => {
+    const local: PtyPlacement = { kind: 'local', tmuxSocket: TMUX_SOCKET }
+    const remote: PtyPlacement = { kind: 'remote', host }
+    expect([local.kind, remote.kind]).toEqual(['local', 'remote'])
+
+    // @ts-expect-error a remote placement has no tmux socket of its own
+    const mixed: PtyPlacement = { kind: 'remote', host, tmuxSocket: TMUX_SOCKET }
+    // @ts-expect-error a remote placement without a host is not a placement
+    const hostless: PtyPlacement = { kind: 'remote' }
+    // @ts-expect-error a local placement does not hold a host connection
+    const leaky: PtyPlacement = { kind: 'local', tmuxSocket: TMUX_SOCKET, host }
+    // @ts-expect-error a pty is always somewhere
+    const nowhere: PtyPlacement = {}
+
+    expect([mixed, hostless, leaky, nowhere]).toHaveLength(4)
   })
 })
