@@ -18,8 +18,8 @@ env:
 
 jobs:
   claude-review:
-    # Skip dependabot PRs (job shows as "skipped", not "failed")
-    if: github.event.pull_request.user.login != 'dependabot[bot]'
+    # Skip dependabot and pmatos's own PRs (job shows as "skipped", not "failed")
+    if: ${{ github.event.pull_request.user.login != 'dependabot[bot]' && github.event.pull_request.user.login != 'pmatos' }}
 
     runs-on: ubuntu-latest
     permissions:
@@ -30,14 +30,14 @@ jobs:
 
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v7
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           fetch-depth: 1
           persist-credentials: false
 
       - name: Run Claude Code Review
         id: claude-review
-        uses: anthropics/claude-code-action@v1
+        uses: anthropics/claude-code-action@9cdae7f0d995e3ba7c33f226087fdf82a59cd520 # v1.0.223
         with:
           claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
           prompt: '/code-review xhigh --comment ${{ github.event.pull_request.number }}'
