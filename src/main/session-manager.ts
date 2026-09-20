@@ -1038,7 +1038,10 @@ export async function killSession(id: string): Promise<void> {
   if (session.hostId) {
     const host = getRequiredHost(session.hostId)
     await destroyRemotePty(id, host)
-    session.connectionState = 'offline'
+    // handleHookEvent may have swapped the stored Session (store.replace)
+    // during the await, so re-resolve instead of writing through `session`.
+    const live = store.get(id)
+    if (live) live.connectionState = 'offline'
     updateSession(id, 'dead')
     return
   }
