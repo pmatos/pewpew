@@ -40,6 +40,7 @@ interface Harness {
   trayed: Session[][]
   order: string[]
   persistThrows: { on: boolean }
+  broadcastThrows: { on: boolean }
 }
 
 // The whole harness: three recorders and no vi.mock. The store imports nothing
@@ -51,6 +52,7 @@ function harness(...seed: Session[]): Harness {
     trayed: [] as Session[][],
     order: [] as string[],
     persistThrows: { on: false },
+    broadcastThrows: { on: false },
   }
   const store = createSessionStore({
     persist: {
@@ -63,6 +65,7 @@ function harness(...seed: Session[]): Harness {
     broadcast: {
       publish: (s) => {
         h.order.push('broadcast')
+        if (h.broadcastThrows.on) throw new Error('renderer gone')
         h.published.push(s)
       },
     },
@@ -155,6 +158,15 @@ describe('changed() is the only thing that reaches a sink', () => {
     h.persistThrows.on = true
     expect(() => h.store.changed()).toThrow('ENOSPC')
     expect(h.order).toEqual(['persist'])
+  })
+
+  it('a throwing broadcast aborts before the tray, but persist already landed', () => {
+    const h = harness(session())
+    h.broadcastThrows.on = true
+    expect(() => h.store.changed()).toThrow('renderer gone')
+    expect(h.order).toEqual(['persist', 'broadcast'])
+    expect(h.saved).toHaveLength(1)
+    expect(h.trayed).toEqual([])
   })
 
   it('no mutator notifies on its own', () => {
