@@ -188,6 +188,15 @@ describe('membership', () => {
     expect(h.store.get('b')?.status).toBe('dead')
   })
 
+  it('insert on an existing id replaces the entry: last write wins, no duplicate', () => {
+    const first = session({ id: 'a', status: 'idle' })
+    const second = session({ id: 'a', status: 'dead' })
+    const h = harness(first)
+    h.store.insert(second)
+    expect(h.store.get('a')).toBe(second)
+    expect(h.store.all()).toEqual([second])
+  })
+
   it('replace is a no-op for an unknown id or the object already stored', () => {
     const stored = session({ id: 'a' })
     const h = harness(stored)
