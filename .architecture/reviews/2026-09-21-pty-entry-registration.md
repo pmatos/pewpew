@@ -2,7 +2,7 @@
 
 **Scope**: Hot spots by churn over the last 120 commits — `src/main/session-manager.ts` (2087 LOC, 67 touches), `src/main/pty-manager.ts` (914, 13), `src/main/index.ts` (900, 13), `src/renderer/components/ProjectTree.tsx` (1206, 16), `src/main/host-bootstrap.ts` / `host-connection.ts` / `hook-installer.ts`. Scoped this way because deepening pays off through _future_ change: YAGNI applies to cold code however shallow it looks. The three previously-landed extractions (`remote-agent-spawn.ts`, `remote-reconnect.ts`, `session-store.ts`) were excluded from re-proposal and their residue re-checked instead.
 **Picked**: `pty-entry-registration` — see `.architecture/backlog.md`
-**Degradations**: none. `gh` authenticated; sub-agent available for the scan and for design-it-twice; advisor available for adjudication.
+**Degradations**: one. The **advisor was rate-limited at step 4**, so the design adjudication was made by this run against the three written designs rather than by an independent reviewer — the skill's stated fallback. `gh` authenticated; sub-agents available for the scan and for design-it-twice; no flags forced; no skill absent.
 
 **Diagram legend**: solid edges are the **interface** a caller must learn; dashed edges are inside the implementation, behind the **seam**.
 
@@ -363,6 +363,8 @@ function registerPty(sessionId: string, ptyProcess: IPty, placement: PtyPlacemen
 - **Files**: 2 (4 with the optional `session-record.ts` extension, which needs no test changes because `session-record.test.ts` already asserts the literal `pewpew-<id>` strings).
 
 ### Adjudication
+
+**Adjudicated without an advisor** — the advisor was rate-limited at step 4. Per the skill's stated fallback, the verdict below was reached against the three designs _as written above_, which is why they were written into the report and committed (`4898162`) before any adjudication. Criteria are the fixed ones, applied in order.
 
 Criteria, in this order: **depth** (behaviour per unit of interface a caller must learn) → **locality** (where change, bugs and verification concentrate) → **seam placement** (is the seam where something actually varies; one adapter is hypothetical, two is real) → **test surface** (can the behaviour be exercised through the interface) → **blast radius** (smaller diff wins between otherwise-equal designs).
 
