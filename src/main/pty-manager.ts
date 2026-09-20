@@ -82,15 +82,38 @@ export function buildAgentArgs(options?: SpawnOptions): string[] {
   return args
 }
 
-interface PtyEntry {
+/**
+ * Where a session's terminal lives. This is the one thing a registration site
+ * chooses, and everything that differs between a local and a remote pty follows
+ * from it: which tmux server teardown talks to, whether thumbnails go over SSH,
+ * and whether the host's SSH connection is leased for the pty's lifetime.
+ */
+export type PtyPlacement =
+  | { readonly kind: 'local'; readonly tmuxSocket: TmuxSocket }
+  | { readonly kind: 'remote'; readonly host: Host }
+
+interface PtyEntryBase {
   pty: IPty
   tmuxSession: string
-  // Local entries only: which tmux server holds the session (see TMUX_SOCKET).
-  tmuxSocket?: TmuxSocket
   buffer: string
-  host?: Host
-  released?: boolean
 }
+
+interface LocalPtyEntry extends PtyEntryBase {
+  kind: 'local'
+  // Which tmux server holds the session (see TMUX_SOCKET). Not optional: both
+  // local registration sites always know their server.
+  tmuxSocket: TmuxSocket
+}
+
+interface RemotePtyEntry extends PtyEntryBase {
+  kind: 'remote'
+  host: Host
+  // Only a remote entry holds an SSH lease, so only a remote entry can carry
+  // the flag saying it has been handed back.
+  released: boolean
+}
+
+type PtyEntry = LocalPtyEntry | RemotePtyEntry
 
 const ptys = new Map<string, PtyEntry>()
 let flushTimer: ReturnType<typeof setTimeout> | null = null
@@ -147,10 +170,17 @@ function appendToBuffer(entry: PtyEntry, data: string): void {
 // every pewpew session down with it. Remote hosts still use their default server.
 export const TMUX_SOCKET = 'pewpew'
 
+// The one place the tmux session name is spelled. It is persisted into
+// Session.tmuxSession (session-record.ts) and matched by discoverTmuxSessions,
+// so it must never drift.
+export const TMUX_SESSION_PREFIX = 'pewpew-'
+
+const tmuxSessionName = (sessionId: string): string => `${TMUX_SESSION_PREFIX}${sessionId}`
+
 // 'default' is the user's default server: sessions started before the dedicated
 // socket existed still live there, and re-spawning them on the new server would
 // run a second agent in the same worktree.
-type TmuxSocket = typeof TMUX_SOCKET | 'default'
+export type TmuxSocket = typeof TMUX_SOCKET | 'default'
 
 const LOCAL_SOCKETS: readonly TmuxSocket[] = [TMUX_SOCKET, 'default']
 
@@ -180,7 +210,7 @@ const findLiveSocket = (tmuxSession: string): TmuxSocket | undefined =>
 
 // A registered entry knows its server; without one, try every candidate.
 const socketsFor = (entry?: PtyEntry): readonly TmuxSocket[] =>
-  entry?.tmuxSocket ? [entry.tmuxSocket] : LOCAL_SOCKETS
+  entry?.kind === 'local' ? [entry.tmuxSocket] : LOCAL_SOCKETS
 
 function spawnLocalAttach(socket: TmuxSocket, tmuxSession: string, cwd?: string): IPty {
   return pty.spawn('tmux', tmuxArgs(socket, ['attach-session', '-t', tmuxSession]), {
@@ -188,6 +218,15 @@ function spawnLocalAttach(socket: TmuxSocket, tmuxSession: string, cwd?: string)
     cols: 120,
     rows: 30,
     cwd,
+    env: sanitizeChildEnv() as Record<string, string>,
+  })
+}
+
+function spawnRemoteAttach(host: Host, tmuxSession: string): IPty {
+  return spawnAttach(host, ['tmux', 'attach-session', '-t', tmuxSession], {
+    name: 'xterm-256color',
+    cols: 120,
+    rows: 30,
     env: sanitizeChildEnv() as Record<string, string>,
   })
 }
@@ -450,7 +489,7 @@ export function createPty(sessionId: string, cwd: string, options?: SpawnOptions
     throw new Error('tmux not found')
   }
 
-  const tmuxSession = `pewpew-${sessionId}`
+  const tmuxSession = tmuxSessionName(sessionId)
   const sandboxPrefix = buildLocalSandboxPrefix(sessionId, options?.projectPath, cwd, options?.tool)
   const agentArgs = [...AGENT_ENV_SCRUB, ...sandboxPrefix, ...buildAgentArgs(options)]
 
@@ -473,29 +512,76 @@ export function createPty(sessionId: string, cwd: string, options?: SpawnOptions
   // Attach to it via node-pty
   const ptyProcess = spawnLocalAttach(TMUX_SOCKET, tmuxSession, cwd)
 
-  const entry: PtyEntry = {
-    pty: ptyProcess,
-    tmuxSession,
-    tmuxSocket: TMUX_SOCKET,
-    buffer: '',
-  }
+  registerPty(sessionId, ptyProcess, { kind: 'local', tmuxSocket: TMUX_SOCKET })
+  return sandboxPrefix.length > 0
+}
+
+function releaseRemoteEntry(entry: PtyEntry): void {
+  if (entry.kind !== 'remote' || entry.released) return
+  entry.released = true
+  void releaseHostConnection(entry.host.hostId)
+}
+
+/** A registered pty, seen from the site that registered it. */
+interface RegisteredPty {
+  /**
+   * Push text into this session's output stream as if the pty had emitted it —
+   * used to replay tmux scrollback after a reattach. Goes through the same
+   * coalescing flush as live output, so a replay issued first arrives first.
+   */
+  replay(text: string): void
+}
+
+/**
+ * Register a freshly-spawned pty as session `sessionId`'s terminal and own its
+ * whole lifecycle. After this returns the session is routable by writePty and
+ * resizePty, its output is coalesced into `pty:data` broadcasts, and — for a
+ * remote placement — the host's SSH connection is retained for exactly as long
+ * as the entry is registered.
+ *
+ * The lease is not a parameter. It follows from `placement`, which is why the
+ * four spawn paths can no longer disagree about it: there is one onExit body,
+ * shared by both placements, and releaseRemoteEntry decides from the entry.
+ *
+ * Ordering, all synchronous: retain (remote only) -> onData -> onExit ->
+ * ptys.set. The retain precedes the exit handler so an exit can never release a
+ * lease that was never taken, and ptys.set comes last so
+ * notifyUnexpectedExitIfPresent keeps its "still present means the agent died
+ * on its own" meaning.
+ */
+function registerPty(sessionId: string, ptyProcess: IPty, placement: PtyPlacement): RegisteredPty {
+  const tmuxSession = tmuxSessionName(sessionId)
+  const entry: PtyEntry =
+    placement.kind === 'remote'
+      ? {
+          pty: ptyProcess,
+          tmuxSession,
+          buffer: '',
+          kind: 'remote',
+          host: placement.host,
+          released: false,
+        }
+      : {
+          pty: ptyProcess,
+          tmuxSession,
+          buffer: '',
+          kind: 'local',
+          tmuxSocket: placement.tmuxSocket,
+        }
+
+  if (entry.kind === 'remote') retainHostConnection(entry.host.hostId)
 
   ptyProcess.onData((data) => {
     appendToBuffer(entry, data)
   })
 
   ptyProcess.onExit(() => {
+    releaseRemoteEntry(entry)
     notifyUnexpectedExitIfPresent(sessionId)
   })
 
   ptys.set(sessionId, entry)
-  return sandboxPrefix.length > 0
-}
-
-function releaseRemoteEntry(entry: PtyEntry): void {
-  if (!entry.host || entry.released) return
-  entry.released = true
-  void releaseHostConnection(entry.host.hostId)
+  return { replay: (text) => appendToBuffer(entry, text) }
 }
 
 // See createPty's doc comment for what the returned boolean means. Remote
@@ -508,7 +594,7 @@ export async function createRemotePty(
   host: Host,
   options?: SpawnOptions
 ): Promise<boolean> {
-  const tmuxSession = `pewpew-${sessionId}`
+  const tmuxSession = tmuxSessionName(sessionId)
   let sandboxPrefix: string[] = []
   if (options?.projectPath) {
     if (options.tool === 'codex') {
@@ -585,32 +671,8 @@ export async function createRemotePty(
     throw new Error(`Failed to create remote tmux session: ${detail}`)
   }
 
-  const ptyProcess = spawnAttach(host, ['tmux', 'attach-session', '-t', tmuxSession], {
-    name: 'xterm-256color',
-    cols: 120,
-    rows: 30,
-    env: sanitizeChildEnv() as Record<string, string>,
-  })
-
-  retainHostConnection(host.hostId)
-
-  const entry: PtyEntry = {
-    pty: ptyProcess,
-    tmuxSession,
-    buffer: '',
-    host,
-  }
-
-  ptyProcess.onData((data) => {
-    appendToBuffer(entry, data)
-  })
-
-  ptyProcess.onExit(() => {
-    releaseRemoteEntry(entry)
-    notifyUnexpectedExitIfPresent(sessionId)
-  })
-
-  ptys.set(sessionId, entry)
+  const ptyProcess = spawnRemoteAttach(host, tmuxSession)
+  registerPty(sessionId, ptyProcess, { kind: 'remote', host })
   return sandboxPrefix.length > 0
 }
 
@@ -646,7 +708,7 @@ export function detachPty(sessionId: string): void {
 /** Kill both node-pty and the tmux session (full teardown). */
 export function destroyPty(sessionId: string): void {
   const entry = ptys.get(sessionId)
-  const tmuxSession = entry?.tmuxSession ?? `pewpew-${sessionId}`
+  const tmuxSession = entry?.tmuxSession ?? tmuxSessionName(sessionId)
 
   if (entry) {
     ptys.delete(sessionId)
@@ -672,7 +734,7 @@ export function destroyPty(sessionId: string): void {
 
 export async function destroyRemotePty(sessionId: string, host: Host): Promise<void> {
   const entry = ptys.get(sessionId)
-  const tmuxSession = entry?.tmuxSession ?? `pewpew-${sessionId}`
+  const tmuxSession = entry?.tmuxSession ?? tmuxSessionName(sessionId)
 
   const result = await execRemote(host, ['tmux', 'kill-session', '-t', tmuxSession], {
     timeoutMs: 5000,
@@ -718,7 +780,7 @@ export function hasPty(sessionId: string): boolean {
 }
 
 export function hasTmuxSession(sessionId: string): boolean {
-  return findLiveSocket(`pewpew-${sessionId}`) !== undefined
+  return findLiveSocket(tmuxSessionName(sessionId)) !== undefined
 }
 
 export async function captureThumbnails(opts?: {
@@ -731,16 +793,12 @@ export async function captureThumbnails(opts?: {
   const result: Record<string, string> = {}
   const remoteEntries: RemoteSessionEntry[] = []
   for (const [sessionId, entry] of ptys) {
-    if (entry.host) {
+    if (entry.kind === 'remote') {
       remoteEntries.push({ sessionId, host: entry.host, tmuxSession: entry.tmuxSession })
       continue
     }
     try {
-      const text = runTmux(
-        entry.tmuxSocket ?? TMUX_SOCKET,
-        ['capture-pane', '-t', entry.tmuxSession, '-p'],
-        3000
-      )
+      const text = runTmux(entry.tmuxSocket, ['capture-pane', '-t', entry.tmuxSession, '-p'], 3000)
       result[sessionId] = text
       opts?.onCapture?.(sessionId, text)
     } catch {
@@ -765,7 +823,7 @@ export async function captureThumbnails(opts?: {
 }
 
 export async function hasRemoteTmuxSession(sessionId: string, host: Host): Promise<boolean> {
-  const result = await execRemote(host, ['tmux', 'has-session', '-t', `pewpew-${sessionId}`], {
+  const result = await execRemote(host, ['tmux', 'has-session', '-t', tmuxSessionName(sessionId)], {
     timeoutMs: 3000,
   })
   return result.code === 0 && !result.timedOut
@@ -782,7 +840,7 @@ export async function probeRemoteTmuxSession(
   sessionId: string,
   host: Host
 ): Promise<RemoteTmuxProbeResult> {
-  const result = await execRemote(host, ['tmux', 'has-session', '-t', `pewpew-${sessionId}`], {
+  const result = await execRemote(host, ['tmux', 'has-session', '-t', tmuxSessionName(sessionId)], {
     timeoutMs: 3000,
   })
   if (result.timedOut) return 'unreachable'
@@ -803,7 +861,7 @@ export async function probeRemoteTmuxSession(
 
 export async function getScrollback(sessionId: string): Promise<string> {
   const entry = ptys.get(sessionId)
-  if (entry?.host) {
+  if (entry?.kind === 'remote') {
     const result = await execRemote(
       entry.host,
       ['tmux', 'capture-pane', '-t', entry.tmuxSession, '-p', '-e', '-S', '-5000'],
@@ -812,7 +870,7 @@ export async function getScrollback(sessionId: string): Promise<string> {
     return result.code === 0 && !result.timedOut ? result.stdout : ''
   }
 
-  const tmuxSession = `pewpew-${sessionId}`
+  const tmuxSession = tmuxSessionName(sessionId)
   for (const socket of socketsFor(entry)) {
     try {
       return runTmux(socket, ['capture-pane', '-t', tmuxSession, '-p', '-e', '-S', '-5000'], 5000)
@@ -829,7 +887,8 @@ export function discoverTmuxSessions(): string[] {
     try {
       const output = runTmux(socket, ['list-sessions', '-F', '#{session_name}'], 5000)
       for (const name of output.split('\n')) {
-        if (name.startsWith('pewpew-')) sessions.add(name.replace('pewpew-', ''))
+        if (name.startsWith(TMUX_SESSION_PREFIX))
+          sessions.add(name.slice(TMUX_SESSION_PREFIX.length))
       }
     } catch {
       // No server on this socket
@@ -839,28 +898,13 @@ export function discoverTmuxSessions(): string[] {
 }
 
 export function reattachPty(sessionId: string): void {
-  const tmuxSession = `pewpew-${sessionId}`
+  const tmuxSession = tmuxSessionName(sessionId)
   const tmuxSocket = findLiveSocket(tmuxSession) ?? TMUX_SOCKET
 
   // Attach to existing tmux session via node-pty
   const ptyProcess = spawnLocalAttach(tmuxSocket, tmuxSession)
 
-  const entry: PtyEntry = {
-    pty: ptyProcess,
-    tmuxSession,
-    tmuxSocket,
-    buffer: '',
-  }
-
-  ptyProcess.onData((data) => {
-    appendToBuffer(entry, data)
-  })
-
-  ptyProcess.onExit(() => {
-    notifyUnexpectedExitIfPresent(sessionId)
-  })
-
-  ptys.set(sessionId, entry)
+  const session = registerPty(sessionId, ptyProcess, { kind: 'local', tmuxSocket })
 
   // Replay scrollback history
   try {
@@ -870,7 +914,7 @@ export function reattachPty(sessionId: string): void {
       5000
     )
     if (scrollback) {
-      appendToBuffer(entry, scrollback)
+      session.replay(scrollback)
     }
   } catch {
     // Scrollback capture may fail — not critical
@@ -878,37 +922,13 @@ export function reattachPty(sessionId: string): void {
 }
 
 export async function reattachRemotePty(sessionId: string, host: Host): Promise<void> {
-  const tmuxSession = `pewpew-${sessionId}`
+  const tmuxSession = tmuxSessionName(sessionId)
 
-  const ptyProcess = spawnAttach(host, ['tmux', 'attach-session', '-t', tmuxSession], {
-    name: 'xterm-256color',
-    cols: 120,
-    rows: 30,
-    env: sanitizeChildEnv() as Record<string, string>,
-  })
-
-  retainHostConnection(host.hostId)
-
-  const entry: PtyEntry = {
-    pty: ptyProcess,
-    tmuxSession,
-    buffer: '',
-    host,
-  }
-
-  ptyProcess.onData((data) => {
-    appendToBuffer(entry, data)
-  })
-
-  ptyProcess.onExit(() => {
-    releaseRemoteEntry(entry)
-    notifyUnexpectedExitIfPresent(sessionId)
-  })
-
-  ptys.set(sessionId, entry)
+  const ptyProcess = spawnRemoteAttach(host, tmuxSession)
+  const session = registerPty(sessionId, ptyProcess, { kind: 'remote', host })
 
   const scrollback = await getScrollback(sessionId)
   if (scrollback) {
-    appendToBuffer(entry, scrollback)
+    session.replay(scrollback)
   }
 }
