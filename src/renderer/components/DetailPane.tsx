@@ -3,6 +3,7 @@ import Terminal from './Terminal'
 import ReviewOverlay from './ReviewOverlay'
 import { useSessionsStore } from '../stores/sessions'
 import { useHostsStore } from '../stores/hosts'
+import { isRestartableFinished } from '../../shared/session-status'
 
 interface Props {
   sessionId: string
@@ -15,6 +16,7 @@ export default function DetailPane({ sessionId, sessionName, onClose }: Props) {
   const hosts = useHostsStore((s) => s.hosts)
   const host = session?.hostId ? hosts.find((h) => h.hostId === session.hostId) : null
   const isDead = session?.status === 'dead'
+  const canRestart = !!session && isRestartableFinished(session)
   const connectionState = session?.connectionState
   const isRemote = !!session?.hostId
   const isPending = isRemote && connectionState === 'pending'
@@ -27,6 +29,9 @@ export default function DetailPane({ sessionId, sessionName, onClose }: Props) {
   const isOffline = isRemote && connectionState === 'offline'
   const showReconnectOverlay = !isDead && (isPending || isAuthFailed || isUnreachable || isOffline)
   const [reviving, setReviving] = useState(false)
+  // Bumped after a restart so a still-mounted Terminal remounts, re-fits, and
+  // pushes its size to the freshly spawned pty (which starts at 120x30).
+  const [terminalGeneration, setTerminalGeneration] = useState(0)
   const [reconnecting, setReconnecting] = useState(false)
   // Monotonic flip count — each toggle increments by 1, rotating +180deg.
   // Using a counter (instead of a boolean) keeps the rotation going in the
@@ -106,7 +111,10 @@ export default function DetailPane({ sessionId, sessionName, onClose }: Props) {
     setReviving(true)
     try {
       await window.api.reviveSession(sessionId)
+      setTerminalGeneration((g) => g + 1)
     } catch {
+      // Main logs the failure; re-enable the button below.
+    } finally {
       setReviving(false)
     }
   }
@@ -135,6 +143,16 @@ export default function DetailPane({ sessionId, sessionName, onClose }: Props) {
           ←
         </button>
         <span className="detail-pane-title">{sessionName}</span>
+        {canRestart && (
+          <button
+            className="detail-pane-restart"
+            onClick={handleRevive}
+            disabled={reviving}
+            title="Resume this session in its worktree"
+          >
+            {reviving ? 'Restarting…' : 'Restart session'}
+          </button>
+        )}
         {host && (
           <span className="detail-pane-host">
             {host.label} - {session?.connectionState ?? 'offline'}
@@ -214,7 +232,7 @@ export default function DetailPane({ sessionId, sessionName, onClose }: Props) {
           <div className="flip-container">
             <div className="flip-inner" style={{ transform: `rotateY(${flipCount * 180}deg)` }}>
               <div className="flip-front">
-                <Terminal sessionId={sessionId} />
+                <Terminal key={terminalGeneration} sessionId={sessionId} />
               </div>
               <div className="flip-back">
                 {reviewOpen && reviewEnabled && (

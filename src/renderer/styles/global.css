@@ -1095,6 +1095,28 @@ body,
   padding: 2px 6px;
 }
 
+.detail-pane-restart {
+  margin-left: auto;
+  background: none;
+  color: var(--accent-green);
+  border: 1px solid var(--accent-green);
+  border-radius: 4px;
+  padding: 2px 10px;
+  font-size: 12px;
+  font-weight: 600;
+  cursor: pointer;
+}
+
+.detail-pane-restart:hover:not(:disabled) {
+  background: var(--accent-green);
+  color: var(--text-on-accent);
+}
+
+.detail-pane-restart:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+
 .detail-pane-terminal {
   flex: 1;
   overflow: hidden;

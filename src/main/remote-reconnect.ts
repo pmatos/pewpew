@@ -9,6 +9,7 @@ import {
   type ProbeTransition,
 } from './probe-transition'
 import { classifyAutoReconnectResult } from './reconnect-outcome'
+import { isTerminalStatus } from '../shared/session-status'
 
 // Read/notify slice of the session registry. CONTRACT: `get`/`values` return the
 // registry's own *live, mutable* Session objects, never copies — the coordinator
@@ -71,15 +72,6 @@ function taggedConnectionState(err: unknown): HostConnectionState | undefined {
   return (err as HostConnectionTaggedError | null)?.hostConnectionState
 }
 
-// 'completed'/'error' are terminal statuses: the user has made a cleanup
-// decision (or the session errored), so no probe/reattach path may touch them —
-// probing one would find its tmux gone and flip it to 'dead', silently reverting
-// a Keep. All three entry guards below (manual reconnect, auto attempt, batch
-// filter) share this predicate; computeProbeTransition independently returns
-// null for them as the last line of defense.
-const isTerminal = (status: Session['status']): boolean =>
-  status === 'completed' || status === 'error'
-
 export interface RemoteReconnectCoordinator {
   reconnectRemoteSession(id: string): Promise<void>
   attemptAutoReconnect(id: string): Promise<AttemptOutcome>
@@ -126,7 +118,7 @@ export function createRemoteReconnectCoordinator(
     // deriveRestoredState already restores terminal remotes as 'live' (not
     // 'pending'), so the UI no longer offers Reconnect for them.
     const current = sessions.get(id)
-    if (current && isTerminal(current.status)) return
+    if (current && isTerminalStatus(current.status)) return
 
     const existing = inflightReconnects.get(id)
     if (existing) {
@@ -275,7 +267,7 @@ export function createRemoteReconnectCoordinator(
     if (!session.hostId) return 'gave-up'
     // The session ended normally (completed/error) between scheduling and now —
     // don't probe/reattach, which would flip it to 'dead' with a bogus toast.
-    if (isTerminal(session.status)) return 'gave-up'
+    if (isTerminalStatus(session.status)) return 'gave-up'
 
     // A manual reconnect (or the user's Retry click) may have already reattached
     // between the drop and this tick. Detect a genuine live attach via the pty —
@@ -356,14 +348,14 @@ export function createRemoteReconnectCoordinator(
 
     const pending: Session[] = []
     for (const session of sessions.values()) {
-      // Skip terminal sessions from the pending pool (see isTerminal).
+      // Skip terminal sessions from the pending pool (see isTerminalStatus).
       // deriveRestoredState restores terminal remotes as 'live' (not 'pending'),
       // so they shouldn't reach here — this is defense-in-depth against any
       // other path leaving a terminal session 'pending'.
       if (
         session.hostId === hostId &&
         session.connectionState === 'pending' &&
-        !isTerminal(session.status)
+        !isTerminalStatus(session.status)
       ) {
         pending.push(session)
       }

@@ -1329,6 +1329,53 @@ describe('removeSession', () => {
   })
 })
 
+describe('promptCleanup — local session killed from outside', () => {
+  it('does not prompt or relabel a local session whose pty already died', async () => {
+    const local = baseLocalSession({ id: 'l1', status: 'idle' })
+    mkdirSync(local.worktreePath, { recursive: true })
+    state.liveTmuxIds = ['l1']
+    writeSessionsJson([local])
+    const sm = await loadSessionManager()
+    sm.restoreSessions()
+    sm.initSessionManager()
+
+    state.unexpectedExitListener?.('l1')
+    sm.handleHookEvent('session.end', { cwd: local.worktreePath, reason: 'other' }, null)
+    await new Promise((resolve) => setTimeout(resolve, 0))
+
+    expect(showMessageBoxMock).not.toHaveBeenCalled()
+    expect(sm.getSessions()[0].status).toBe('dead')
+  })
+
+  it('still prompts and honours Keep on a normal exit, and the kept session can be restarted', async () => {
+    const local = baseLocalSession({ id: 'l1', status: 'idle' })
+    mkdirSync(local.worktreePath, { recursive: true })
+    state.liveTmuxIds = ['l1']
+    state.dialogResponse = 1
+    writeSessionsJson([local])
+    const sm = await loadSessionManager()
+    sm.restoreSessions()
+    sm.initSessionManager()
+
+    sm.handleHookEvent(
+      'session.end',
+      { cwd: local.worktreePath, reason: 'prompt_input_exit' },
+      null
+    )
+    state.unexpectedExitListener?.('l1')
+    await new Promise((resolve) => setTimeout(resolve, 0))
+
+    expect(showMessageBoxMock).toHaveBeenCalledTimes(1)
+    expect(sm.getSessions()[0].status).toBe('completed')
+    state.createPtyCalls = []
+
+    await sm.reviveSession('l1')
+
+    expect(sm.getSessions()[0].status).toBe('idle')
+    expect(state.createPtyCalls.map((c) => c.sessionId)).toEqual(['l1'])
+  })
+})
+
 describe('probePendingSessionsOnHost', () => {
   function threePendingOnH1(): Session[] {
     return [
@@ -1904,6 +1951,52 @@ describe('kill/revive clears stale connectionState=pending', () => {
     expect(got.status).toBe('idle')
     expect(got.connectionState).toBeUndefined()
     expect(state.createPtyCalls.map((c) => c.sessionId)).toEqual(['l1'])
+  })
+})
+
+describe('reviveSession — completed/error sessions', () => {
+  it('restarts a local completed session by resuming it', async () => {
+    const local = baseLocalSession({ id: 'l1', status: 'completed' })
+    mkdirSync(local.worktreePath, { recursive: true })
+    writeSessionsJson([local])
+    const sm = await loadSessionManager()
+    sm.restoreSessions()
+    sm.initSessionManager()
+    expect(sm.getSessions()[0].status).toBe('dead')
+    state.createPtyCalls = []
+
+    await sm.reviveSession('l1')
+
+    expect(sm.getSessions()[0].status).toBe('idle')
+    expect(state.createPtyCalls.map((c) => c.sessionId)).toEqual(['l1'])
+  })
+
+  it('does not attach a second pty when one is already live', async () => {
+    const local = baseLocalSession({ id: 'l1', status: 'dead' })
+    mkdirSync(local.worktreePath, { recursive: true })
+    writeSessionsJson([local])
+    const sm = await loadSessionManager()
+    sm.restoreSessions()
+    state.hasPtyResult.add('l1')
+    state.createPtyCalls = []
+
+    await sm.reviveSession('l1')
+
+    expect(state.createPtyCalls).toEqual([])
+    expect(sm.getSessions()[0].status).toBe('idle')
+  })
+
+  it('still refuses to restart a running session and a remote completed session', async () => {
+    const running = baseLocalSession({ id: 'l1', status: 'idle' })
+    const remoteDone = baseRemoteSession({ id: 'r1', status: 'completed' })
+    mkdirSync(running.worktreePath, { recursive: true })
+    writeSessionsJson([running, remoteDone])
+    const sm = await loadSessionManager()
+    sm.restoreSessions()
+    sm.initSessionManager()
+
+    await expect(sm.reviveSession('l1')).rejects.toThrow(/not restartable/)
+    await expect(sm.reviveSession('r1')).rejects.toThrow(/not restartable/)
   })
 })
 
