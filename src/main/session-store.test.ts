@@ -1,4 +1,4 @@
-import { describe, it, expect, vi } from 'vitest'
+import { describe, it, expect } from 'vitest'
 import type { Session } from '../shared/types'
 import {
   createSessionStore,
@@ -364,8 +364,8 @@ describe('the SessionLookup port remote-reconnect declares', () => {
       changed(): void
     } = h.store
     expect(lookup.get('a')).toBe(h.store.get('a'))
-    const spy = vi.fn()
-    expect(typeof lookup.changed).toBe('function')
-    expect(spy).not.toHaveBeenCalled()
+    lookup.changed()
+    expect(h.order).toEqual(['persist', 'broadcast', 'tray'])
+    expect(h.saved[0]?.[0]).toBe(h.store.get('a'))
   })
 })
