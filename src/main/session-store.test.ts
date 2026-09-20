@@ -116,6 +116,17 @@ describe('reads hand back live references', () => {
     }
     expect(seen).toEqual(['a', 'c'])
   })
+
+  it('values tolerates deleting the current entry mid-iteration: nothing is skipped or repeated', () => {
+    const h = harness(session({ id: 'a' }), session({ id: 'b' }), session({ id: 'c' }))
+    const seen: string[] = []
+    for (const s of h.store.values()) {
+      seen.push(s.id)
+      if (s.id !== 'b') h.store.delete(s.id)
+    }
+    expect(seen).toEqual(['a', 'b', 'c'])
+    expect(h.store.all().map((s) => s.id)).toEqual(['b'])
+  })
 })
 
 describe('changed() is the only thing that reaches a sink', () => {
