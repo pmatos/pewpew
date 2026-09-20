@@ -187,7 +187,7 @@ Persisted candidate memory for the `pm-deepen` routine. Reconciled against `gh` 
 
 ## pty-entry-registration
 
-- **Status**: proposed
+- **Status**: in-flight
 - **Score**: 23/25 (leverage 4, locality 5, blast radius 1, heat 5)
 - **Files**: ~3 estimated (`pty-manager.ts`, `pty-manager.test.ts`, `session-record.ts` for the name helper)
 - **Modules**: `src/main/pty-manager.ts`, `src/main/session-record.ts`
@@ -197,6 +197,20 @@ Persisted candidate memory for the `pm-deepen` routine. Reconciled against `gh` 
 - **Test surface**: `reattachPty` and `reattachRemotePty` have **no tests at all**, and `pty-manager.test.ts`'s `fakePty()` (`:26-34`) stubs `onData`/`onExit` as no-ops so even the tested paths never exercise the wiring. Making `fakePty` capture its handlers is a self-contained first step.
 - **Constraint**: the `pewpew-${id}` string form is persisted into `Session.tmuxSession` (`session-record.ts:38`) and must be produced byte-identically.
 - **Score note**: 2026-09-21 — **re-scored 22/25 → 23/25**; picked this run. Heat 4 → 5: `a21af71` / PR #321 ("isolate local tmux server and keep killed sessions restartable"), merged **2026-09-18**, edited the `tmuxSocket` field _inside two of the four epilogues_ this candidate unifies. Line ranges from 2026-09-18 are stale — the four registration epilogues are now `pty-manager.ts:476-492`, `:597-616`, `:848-863`, `:892-908`; `releaseRemoteEntry` at `:495-499`, called from `onExit` at `:609` and `:904` only. The `pewpew-${id}` form is open-coded at **10** sites in `pty-manager.ts` (`:453`, `:511`, `:649`, `:675`, `:721`, `:768`, `:785`, `:815`, `:842`, `:881`) plus `session-record.ts:40`. Also duplicated: the remote attach options block at `:588-593` and `:883-888`.
+- **PR**: #325
+- **Landed shape**: `registerPty(sessionId, ptyProcess, placement)` with `PtyPlacement` as a discriminated union and `PtyEntry` split into `LocalPtyEntry` / `RemotePtyEntry`, so the SSH lease follows from the placement instead of from a remembered line — one `onExit` body shared by both placements. Plus `tmuxSessionName` (10 open-codings) and `spawnRemoteAttach` (2 duplicated options blocks). **2 files**, under the ~3 estimate; `pty-manager.ts` +20 net lines (doc comments exceed the ~76 lines of epilogue removed). Gate green: tsc, eslint, vitest 945/945, build.
+- **Evidence of test-first**: two demonstrated reds. (1) `tsc` — `TS2305` on the missing `PtyPlacement` export plus four `TS2578 Unused '@ts-expect-error' directive`, i.e. every illegal placement literal compiled before the union existed. (2) Mutation — deleting `releaseRemoteEntry(entry)` from both `onExit` handlers turns exactly the two remote rows of the lease matrix red (`expected [] to deeply equal [ 'h1' ]`, 2 failed | 37 passed) and leaves both local rows green.
+- **Follow-ups this PR deliberately left**: re-registering a session id orphans the prior entry's lease (`ptys.set` overwrites without teardown, so its `releaseRemoteEntry` is never reached) — a few lines in `registerPty`'s vocabulary now, but a behaviour change that would have made the mutation proof meaningless; and `session-record.ts:40` still spells `pewpew-${id}` itself, because sharing `tmuxSessionName` needs its own leaf module rather than an import from `pty-manager.ts` (which pulls in `node-pty` and `electron`).
+
+### Run 2026-09-21 — complete
+
+- **Outcome**: complete
+- **Stopped at**: step 6 — PR opened
+- **Branch**: `sym/pewpew/routine/refactor-audit/01M30GVV0Q`, adopted (all four conditions held: non-default, 0 commits ahead of `origin/main`, no upstream, unpublished on origin). Not renamed — an adopted branch keeps the caller's name so the harness can find the PR.
+- **Committed**: report, backlog, `pty-manager.test.ts`, `pty-manager.ts`, new `CONTEXT.md` (6 commits)
+- **Evidence**: PR #325; gate green — tsc, eslint, vitest 945/945 (under `TMPDIR=/tmp`), build
+- **Degradation**: the **advisor was rate-limited at step 4**, so the design adjudication was made by this run against the three designs as written and committed (`4898162`) rather than by an independent reviewer — the skill's stated fallback.
+- **Next**: review/merge #325. The next firing picks up the four candidates tied at 21/25 — `adoption-gate` first by the tie-break (lower blast radius, then higher heat), then `remote-hook-merge-executor` (which **carries a verified bug**: a malformed remote `.claude/settings.local.json` aborts `installRemoteHooks` before the `mv`, so the remote claude session cannot be created, while local claude and remote codex both recover), then `remote-exec-result-check` and `worktree-add-strategy`.
 
 ## remote-hook-merge-executor
 
