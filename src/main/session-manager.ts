@@ -1053,14 +1053,7 @@ export async function killSession(id: string): Promise<void> {
 }
 
 const reconnectCoordinator = createRemoteReconnectCoordinator({
-  sessions: {
-    get: (id) => store.get(id),
-    // Resolve module-local captures at call time (matching the acquireLease
-    // adapter below) so construction never depends on declaration hoisting —
-    // promptCleanup is declared ~300 lines below this literal.
-    values: () => allSessions(),
-    changed: () => onSessionsChanged(),
-  },
+  sessions: store,
   host: {
     get: getHost,
     runtimeState: runtimeStateFor,
