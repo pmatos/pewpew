@@ -269,4 +269,117 @@ Why it outranks the runner-up candidate: the same _locality_ 5, the same _blast 
 
 ## Design
 
-Written at step 4 — see below.
+Three designs were produced in parallel by sub-agents, each briefed for a _radically different_ interface, and written here before any adjudication.
+
+### Design A — `attachPty`: one private function, one type, zero new public surface
+
+```ts
+// `host` present ⇒ remote (SSH refcount retained now, released on exit).
+// `host` absent  ⇒ local (no refcount at all).
+// The `never` members make a mixed target unassignable.
+type PtyTarget =
+  | { readonly tmuxSocket: TmuxSocket; readonly cwd?: string; readonly host?: never }
+  | { readonly host: Host; readonly tmuxSocket?: never; readonly cwd?: never }
+
+/** Attach a node-pty to this session's tmux session and register it as THE entry
+ *  for `sessionId`. Returns a sink that pushes text into the same outbound buffer. */
+function attachPty(sessionId: string, target: PtyTarget): (text: string) => void
+```
+
+- **Placement**: file-local to `pty-manager.ts`, not exported, no new module. The argument: all four callers live in that file, and extracting a registry module would force it to also export `hasPty`, entry lookup for `getScrollback`, entry iteration for `captureThumbnails`, and a delete-and-release for three teardown paths — ~8 exports to serve one file.
+- **Usage**: `attachPty(sessionId, { tmuxSocket: TMUX_SOCKET, cwd })` / `attachPty(sessionId, { host })`; the reattach sites call the returned sink to replay scrollback. `reattachRemotePty` becomes two statements.
+- **What it hides**: that `PtyEntry` exists at all; the `onData`→`appendToBuffer` wiring; that `onExit` must call `releaseRemoteEntry` **first** and only for remote entries; the retain; the remote attach argv and options; `pewpew-${id}`.
+- **Dependency strategy**: injects only `PtyTarget`. `ptys`, `unexpectedExitListener`, `flushTimer` stay module-scoped — the test seam already exists one level lower (`vi.mock('node-pty')`, `vi.mock('./host-connection')`).
+- **Distinctive move**: it also changes behaviour. `attachPty` **supersedes** a prior registration (releases and kills the orphan) and keys the exit handler on _entry identity_ rather than `ptys.has(sessionId)`. Today `ptys.set` silently drops a prior entry, orphaning an ssh client whose refcount is never released; `session-manager.ts:1181-1189` carries a hand-written comment and a `hasPty(id)` guard defending exactly this.
+- **Trade-offs (author's own)**: no injection points; the returned-closure shape is one more concept than returning `void`; the primitive stays private so a failing test points at `createRemotePty`, not at `attachPty`; **and supersession is a real behaviour change, not pure refactoring** — it needs its own test and its own line in the PR body.
+- **Test surface**: first test asserts supersession — `hostReleases` and `first.killed` sampled _before_ firing the orphan's exit, because sampling after makes the assertion pass against unchanged production code (a fake red). Requires `fakePty()` to capture handlers and the `./host-connection` mock to record retain/release.
+- **Files**: 2 (4 with the `tmux-session-name` leaf).
+
+### Design B — `PtyHost` port with a local and a remote adapter
+
+```ts
+// src/main/pty-host.ts
+export type PtyPlacement =
+  | { readonly kind: 'local'; readonly tmuxSocket: TmuxSocket }
+  | { readonly kind: 'remote'; readonly host: Host }
+
+export interface AttachedPty {
+  readonly pty: IPty
+  /** Hand back what the attach claimed. Idempotent, never throws. Locally the identity. */
+  release(): void
+}
+
+export interface PtyHost {
+  readonly placement: PtyPlacement
+  attach(tmuxSession: string, opts?: { cwd?: string }): AttachedPty
+}
+
+export function localPtyHost(tmuxSocket: TmuxSocket): PtyHost
+export function remotePtyHost(host: Host): PtyHost
+```
+
+plus a module-private `registerPty(sessionId, hosting: PtyHost, opts?): PtyEntry` in `pty-manager.ts`.
+
+- **Evidence of two adapters**: each adapter already has two call sites today — local `spawnLocalAttach` at `:474`/`:846`, remote `spawnAttach(...)` duplicated verbatim at `:588-593`/`:883-888`. Different binary (`tmux` vs `ssh`), different argv shaping, different options, different resource claimed.
+- **The honest asymmetry, stated by its author**: `release` has one real implementation and one identity. The design deliberately rejects a `retain()`/`release()` _method pair_ — whose local half would be two hollow methods — and folds the lease into `attach`'s return value instead, so the local arm is an identity element on a real case rather than a placeholder. The port therefore has **one operation with two genuinely different implementations**, plus a two-valued data discriminator.
+- **`PtyEntry` becomes** `{ pty, tmuxSession, buffer, hosting: PtyHost, release: () => void }`; `releaseRemoteEntry:495-499` and the `released` flag **delete**. Three read sites (`socketsFor:182`, `captureThumbnails:734`, `getScrollback:806`) switch to `entry.hosting.placement.kind`.
+- **Trade-offs (author's own)**: the port's own depth is modest — one type, two factories, one method, hiding an argv, an options block, an ordering and an idempotence flag; the genuinely deep unit is `registerPty`. `opts.cwd` is local-only and ignored remotely. `TMUX_SOCKET`/`tmuxArgs` move into `pty-host.ts` and are re-exported, so `runTmux` imports argv shaping back from the port's module.
+- **Test surface**: first a characterization net that is **green on both old and new code** (the net under the call-site rewrite), then `pty-host.test.ts` **red by absence of the module**. `fakePty()` must accumulate handlers in _arrays_, not single slots, because `host-connection.ts:637` already registers its own `onExit` on the same pty.
+- **Files**: 4 for slice 1 (`pty-host.ts` + its test, `pty-manager.ts`, `pty-manager.test.ts`); 7 for the full port; slice 3 (create/has/kill on the port) is explicitly declined — it would force `createPty`/`reattachPty` async and take blast radius from 1 to 3+.
+
+### Design C — `registerPty` whose shape _is_ the lease rule
+
+```ts
+type PtyPlacement =
+  | { readonly kind: 'local'; readonly tmuxSocket: TmuxSocket }
+  | { readonly kind: 'remote'; readonly host: Host }
+
+interface LocalPtyEntry extends PtyEntryBase {
+  kind: 'local'
+  tmuxSocket: TmuxSocket
+}
+interface RemotePtyEntry extends PtyEntryBase {
+  kind: 'remote'
+  host: Host
+  released: boolean
+}
+type PtyEntry = LocalPtyEntry | RemotePtyEntry
+
+interface RegisteredPty {
+  replay(text: string): void
+}
+
+function registerPty(sessionId: string, ptyProcess: IPty, placement: PtyPlacement): RegisteredPty
+```
+
+- **The trick**: there is **one `onExit` body, shared by both placements, that calls `releaseRemoteEntry` unconditionally.** The local/remote branch moves from four hand-written copies into one `if` keyed off the discriminant inside `releaseRemoteEntry`. `retainHostConnection` moves _into_ `registerPty`, so the retain/release pair is created and destroyed at one point.
+- **Illegal states**, verified empirically against this repo's TypeScript with `ts.createProgram` — actual diagnostics quoted: `{ kind: 'remote', host, tmuxSocket }` → **TS2353**; `{ kind: 'remote' }` → **TS2345** (`Property 'host' is missing`); `{}` → **TS2345**; `entry.host` on an un-narrowed entry → **TS2339**. Today `{ pty, tmuxSession, buffer: '', host }` with an `onExit` that forgets `releaseRemoteEntry` compiles cleanly and leaks a lease on every remote session.
+- **Boundary condition, stated by its author**: TypeScript's excess-property check fires only on _fresh_ object literals, so a hoisted `const p = { kind: 'remote' as const, host, tmuxSocket }` would still compile. All four sites are literals and a fifth would be — it is a freshness guarantee, not a nominal one.
+- **`releaseRemoteEntry` keeps its exact name and `(entry: PtyEntry)` signature**, so its three other callers at `:637`, `:653`, `:708` stay byte-identical. That one naming decision is what holds the unrelated ripple to **three** one-line narrowings (`socketsFor:182`, `captureThumbnails:734`, `getScrollback:806`).
+- **Reported honestly as messier**: `destroyPty:664` iterates `socketsFor(entry)` and runs _local_ `tmux kill-session` on both sockets; today a remote entry's `undefined` `tmuxSocket` silently means `LOCAL_SOCKETS`, so destroyPty on a remote session shells out to local tmux twice, harmlessly and nonsensically. The union makes that visible for the first time, and the design **preserves** it rather than fixing it untested.
+- **Residual hole, and why not branded away**: a future site could still mis-tag remote as local. A `unique symbol` brand was considered and rejected because moving the retain inside `registerPty` already **inverts the failure mode** — today's "forget the release → refcount too high → silent permanent leak" becomes "mis-tag → refcount too low → a sibling's release drops a live ControlMaster → the pty dies visibly, immediately."
+- **Test surface**: a 4-row **lease matrix** (local create / remote create / local reattach / remote reattach), no timers needed. Stated plainly: this refactor fixes no live bug, so after the test-only prerequisite the rows are green against today's code — the honest TDD story is **mutation, not a natural red**: delete `releaseRemoteEntry(entry)` from `:609` and row 2 goes red, from `:904` and row 4 goes red. Two of the four rows are the first coverage of any kind for `reattachPty`/`reattachRemotePty`.
+- **Deliberately excluded**: defensively releasing a prior registration's lease. Named as a real latent gap and left as a follow-on, because including it forfeits the property that makes the mutation proof meaningful and the review cheap — _the diff alters no behaviour_.
+- **Files**: 2 (4 with the optional `session-record.ts` extension, which needs no test changes because `session-record.test.ts` already asserts the literal `pewpew-<id>` strings).
+
+### Adjudication
+
+Criteria, in this order: **depth** (behaviour per unit of interface a caller must learn) → **locality** (where change, bugs and verification concentrate) → **seam placement** (is the seam where something actually varies; one adapter is hypothetical, two is real) → **test surface** (can the behaviour be exercised through the interface) → **blast radius** (smaller diff wins between otherwise-equal designs).
+
+**Winner: Design C.** **Runner-up design: Design B.**
+
+**Why C wins on the ordered criteria.**
+
+_Depth._ All three collapse the same four epilogues, so the tie-break is what a caller must learn to use the result correctly. C's is `registerPty(sessionId, pty, placement)` — three arguments, one of them a two-armed union — and the lease rule is not part of what a caller must learn at all, because it is derived from the discriminant. B's caller must learn the port as well: a `PtyHost` with a `placement` and an `attach`, an `AttachedPty` with a `release`, and two factories — four named concepts against C's two, for the same hidden behaviour. B's own author concedes the port's depth is modest and that "the genuinely deep unit is `registerPty`" — which is C's unit, reached without the port.
+
+_Locality._ C and A both put every step in one place. B splits the epilogue across two modules: `registerPty` in `pty-manager.ts` and the attach/lease in `pty-host.ts`, and then has to move `TMUX_SOCKET`/`tmuxArgs` into the port's module and import them back so `runTmux` can shape argv — a cycle avoided by relocating vocabulary rather than by the seam being in the right place. That is locality lost, not gained.
+
+_Seam placement._ This is where B's framing is weakest by its own account: its `release` has one real implementation and one identity. B argues convincingly that folding the lease into `attach`'s return is better than a hollow `retain`/`release` pair — but the conclusion of that argument is that the varying thing is _data_, not behaviour, which is precisely C's `PtyPlacement`. A discriminated union is the right shape for a two-valued fact; a port is the right shape for two implementations, and there is only one operation (`attach`) that genuinely has two.
+
+_Test surface._ C's 4-row lease matrix exercises the invariant through the four public entry points with no timers and no new module, and two rows are the first coverage of any kind for `reattachPty`/`reattachRemotePty`. All three designs are honest that there is no natural red — no live bug is being fixed — and each proposes a different substitute. C's is the most rigorous: a **mutation proof** (delete `releaseRemoteEntry` from `:609`, watch row 2 go red; from `:904`, watch row 4) demonstrates the test observes the invariant rather than the implementation. B's substitute is red-by-absence-of-a-module, which proves only that the module does not exist yet.
+
+_Blast radius._ C: 2 files, three forced one-line narrowings, **no behaviour change**. B: 4 files for slice 1, 7 for the full port. A: 2 files, but it bundles a genuine behaviour change.
+
+**Why A loses.** A's `PtyTarget` uses `host?: never` / `tmuxSocket?: never` rather than a discriminant — equivalent in strictness for fresh literals, but it produces worse error messages and does not give `PtyEntry` itself a shape, so `entry.host` stays readable on any entry and the three `entry.host` read sites keep their incidental phrasing. Decisively, A folds **supersession** — release and kill the orphan, key exit on identity — into the same change. That is a real fix for a real latent leak, and A's author says so plainly. But it is a behaviour change inside a refactor whose value depends on being behaviour-preserving, and it is the one part of A's first test that could not be verified without it. C names the same gap and files it as a follow-on, which is the correct disposition for an unattended run.
+
+**What C must carry from the losers.** From B: `fakePty()` should accumulate handlers in arrays rather than single slots, because `host-connection.ts` registers its own `onExit` on the same pty, and a single-slot fake would encode a false assumption. From A: the supersession gap is real and should be named in the PR body as a follow-on, not left silent.
