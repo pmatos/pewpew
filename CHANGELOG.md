@@ -1,3 +1,10 @@
+## [0.11.1](https://github.com/pmatos/pewpew/compare/v0.11.0...v0.11.1) (2026-09-20)
+
+
+### Bug Fixes
+
+* isolate local tmux server and keep killed sessions restartable ([#321](https://github.com/pmatos/pewpew/issues/321)) ([a21af71](https://github.com/pmatos/pewpew/commit/a21af7125cea558f15ec5d0a38dbb76c9773bc55))
+
 # [0.11.0](https://github.com/pmatos/pewpew/compare/v0.10.6...v0.11.0) (2026-09-13)
 
 
