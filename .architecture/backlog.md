@@ -51,7 +51,7 @@ Persisted candidate memory for the `pm-deepen` routine. Reconciled against `gh` 
 
 ## session-store
 
-- **Status**: in-flight
+- **Status**: landed
 - **Score**: 24/25 (leverage 5, locality 5, blast radius 2, heat 5)
 - **Files**: ~5 estimated (new `session-store.ts` + its test, `session-manager.ts`, `remote-reconnect.ts`, `session-manager.test.ts`)
 - **Modules**: `src/main/session-manager.ts`, `src/main/remote-reconnect.ts`, new `src/main/session-store.ts`
@@ -66,6 +66,10 @@ Persisted candidate memory for the `pm-deepen` routine. Reconciled against `gh` 
 - **PR**: #320
 - **Landed shape**: ports-and-adapters design (3 ports: persist/broadcast/tray), `batch(body: () => boolean)` making the try/finally shape unrepresentable, caller-supplied `now` so the store has no clock dependency. 3 files, `session-manager.ts` -86 net lines, `session-manager.test.ts` and `remote-reconnect.ts` both untouched. Gate green: tsc, eslint, vitest 912/912, build.
 - **Follow-ups this PR deliberately left**: the two deferred-notify bugs above (now one-line fixes in the store's vocabulary); `lastKnownStateWrites` is not pruned on `delete` (slow leak, unobservable because ids are `randomUUID`); the `?? 0` "never written" sentinel in the rate limiter is carried over and pinned by a test rather than replaced with an absence check.
+
+### Run 2026-09-22 — reconciled
+
+- PR #320 merged 2026-09-20 (`9109c5c` on main) → status `in-flight` → `landed`.
 
 ## materialize-pr-worktree
 
@@ -173,7 +177,7 @@ Persisted candidate memory for the `pm-deepen` routine. Reconciled against `gh` 
 
 ## pty-entry-registration
 
-- **Status**: proposed
+- **Status**: in-flight
 - **Score**: 22/25 (leverage 4, locality 5, blast radius 1, heat 4)
 - **Files**: ~3 estimated (`pty-manager.ts`, `pty-manager.test.ts`, `session-record.ts` for the name helper)
 - **Modules**: `src/main/pty-manager.ts`, `src/main/session-record.ts`
@@ -182,6 +186,17 @@ Persisted candidate memory for the `pm-deepen` routine. Reconciled against `gh` 
 - **Evidence**: 4 epilogues at `pty-manager.ts:418-433`, `:538-555`, `:804-818`, `:847-863`. Omitting `releaseRemoteEntry` leaks an SSH refcount (only path back to `releaseHostConnection`); omitting `notifyUnexpectedExitIfPresent` breaks the dead-session detection `session-manager.ts:311-341` depends on. `reattachPty:820-832` re-implements `getScrollback`'s local branch verbatim (cf. `:762-771`) while `reattachRemotePty:865` just calls it. Three teardown paths order delete/release/kill differently (`:577-583`, `:593-599`, `:641-647`), undocumented. `ptys.set` at `:818` overwrites without destroying, leaking the prior node-pty — a hazard documented in a _different file_, `session-manager.ts:1228-1231`.
 - **Test surface**: `reattachPty` and `reattachRemotePty` have **no tests at all**, and `pty-manager.test.ts`'s `fakePty()` (`:26-34`) stubs `onData`/`onExit` as no-ops so even the tested paths never exercise the wiring. Making `fakePty` capture its handlers is a self-contained first step.
 - **Constraint**: the `pewpew-${id}` string form is persisted into `Session.tmuxSession` (`session-record.ts:38`) and must be produced byte-identically.
+- **PR**: #325
+- **Reason (note)**: 2026-09-22 — the committed backlog on `main` still showed `proposed` because the 2026-09-21 firing's re-score (23/25), `in-flight`/PR update and run log live on the #325 branch, not `main` (SKILL.md step 6's second-push hazard). Promoted to `in-flight` here by cross-referencing `gh pr list --state open`; the fuller entry reaches `main` when #325 merges and should win any conflict with this one.
+
+### Run 2026-09-22 — bailed (open architecture PR)
+
+- **Outcome**: bailed-preflight
+- **Stopped at**: step 2 — the `in-flight` entry `pty-entry-registration` still has an open PR (#325); one architecture PR at a time, and this is a default (implementing) run.
+- **Branch**: `sym/pewpew/routine/refactor-audit/01M33370RC`, adopted (all four adoption conditions held: non-default, 0 commits ahead of `origin/main`, no upstream, unpublished on origin). Not renamed — an adopted branch keeps the caller's name.
+- **Committed**: backlog reconciliation only — `session-store` → `landed` (PR #320 merged 2026-09-20), `pty-entry-registration` → `in-flight` (PR #325), plus this exit report. No `reviews/` file: the run stopped at reconciliation, before scoring fresh candidates.
+- **Evidence**: `gh pr view 320` → MERGED 2026-09-20T14:11:22Z; `gh pr view 325` → OPEN since 2026-09-20T23:34:12Z, head `sym/pewpew/routine/refactor-audit/01M30GVV0Q`, `MERGEABLE`, all CI checks green, no review decision.
+- **Next**: review/merge or close #325. Once no architecture PR is open, the next firing picks up the four candidates tied at 21/25 — `adoption-gate` first by the tie-break (lower blast radius, then higher heat). `remote-hook-merge-executor` **carries a verified bug** (a malformed remote `.claude/settings.local.json` aborts `installRemoteHooks` before its `mv`); a human may want to schedule it ahead of the ranking. The next firing re-scores from scratch regardless.
 
 ## remote-hook-merge-executor
 
