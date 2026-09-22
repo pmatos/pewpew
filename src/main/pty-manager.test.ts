@@ -6,6 +6,16 @@ vi.mock('electron', () => ({
   },
 }))
 
+interface FakePty {
+  onData: (listener: (data: string) => void) => void
+  onExit: (listener: () => void) => void
+  write: (data: string) => void
+  resize: (cols: number, rows: number) => void
+  kill: () => void
+  emitData: (data: string) => void
+  emitExit: () => void
+}
+
 const state = {
   tmuxAvailable: true,
   bwrapAvailable: true,
@@ -23,15 +33,27 @@ const state = {
   // hit EROFS under --ro-bind / /). Only codex/omp ever call it — claude is
   // never sandboxed.
   remoteStateDir: '/home/dev/.omp/agent/sessions/encoded-wt1' as string | undefined,
+  localPtys: [] as FakePty[],
+  remotePtys: [] as FakePty[],
+  retainedHostIds: [] as string[],
+  releasedHostIds: [] as string[],
 }
 
-function fakePty() {
+function fakePty(): FakePty {
+  let dataListener: ((data: string) => void) | undefined
+  let exitListener: (() => void) | undefined
   return {
-    onData: () => undefined,
-    onExit: () => undefined,
-    write: () => undefined,
-    resize: () => undefined,
-    kill: () => undefined,
+    onData: (listener) => {
+      dataListener = listener
+    },
+    onExit: (listener) => {
+      exitListener = listener
+    },
+    write: vi.fn(),
+    resize: vi.fn(),
+    kill: vi.fn(),
+    emitData: (data) => dataListener?.(data),
+    emitExit: () => exitListener?.(),
   }
 }
 
@@ -74,7 +96,11 @@ vi.mock('fs', () => ({
 }))
 
 vi.mock('node-pty', () => ({
-  spawn: () => fakePty(),
+  spawn: () => {
+    const instance = fakePty()
+    state.localPtys.push(instance)
+    return instance
+  },
 }))
 
 vi.mock('./host-connection', () => ({
@@ -103,9 +129,17 @@ vi.mock('./host-connection', () => ({
     }
     return { stdout: '', stderr: '', code: 0, timedOut: false }
   },
-  retainHostConnection: () => undefined,
-  releaseHostConnection: () => undefined,
-  spawnAttach: () => fakePty(),
+  retainHostConnection: (hostId: string) => {
+    state.retainedHostIds.push(hostId)
+  },
+  releaseHostConnection: (hostId: string) => {
+    state.releasedHostIds.push(hostId)
+  },
+  spawnAttach: () => {
+    const instance = fakePty()
+    state.remotePtys.push(instance)
+    return instance
+  },
 }))
 
 import { homedir } from 'os'
@@ -117,8 +151,11 @@ import {
   createRemotePty,
   destroyPty,
   discoverTmuxSessions,
+  hasPty,
   hasTmuxSession,
   reattachPty,
+  reattachRemotePty,
+  setUnexpectedExitListener,
   TMUX_SOCKET,
   __resetSandboxProbeCacheForTesting,
 } from './pty-manager'
@@ -249,12 +286,14 @@ describe('createPty', () => {
     state.tmuxCalls = []
     state.liveTmuxServers = new Set(['pewpew'])
     state.tmuxListOutput = {}
+    state.localPtys = []
     state.mkdirCalls = []
     // isSandboxAvailable() memoizes a successful real-bwrap probe; without
     // resetting it here, the first test to see bwrapAvailable=true would
     // permanently mask every later test simulating bwrap being unusable.
     __resetSandboxProbeCacheForTesting()
     warnSpy.mockClear()
+    setUnexpectedExitListener(null)
   })
 
   it('runs local tmux calls on the dedicated pewpew socket', () => {
@@ -374,6 +413,30 @@ describe('createPty', () => {
     expect(state.mkdirCalls).toEqual([])
     expect(warnSpy).not.toHaveBeenCalled()
   })
+  it('keeps a replacement current when a stale local pty exits', () => {
+    const unexpectedExit = vi.fn()
+    setUnexpectedExitListener(unexpectedExit)
+
+    try {
+      createPty('replace-local', WORKTREE, { tool: 'claude' })
+      const first = state.localPtys.at(-1)!
+
+      reattachPty('replace-local')
+      const replacement = state.localPtys.at(-1)!
+
+      expect(first.kill).toHaveBeenCalledTimes(1)
+      first.emitExit()
+      expect(hasPty('replace-local')).toBe(true)
+      expect(unexpectedExit).not.toHaveBeenCalled()
+
+      replacement.emitExit()
+      expect(hasPty('replace-local')).toBe(false)
+      expect(unexpectedExit).toHaveBeenCalledTimes(1)
+      expect(unexpectedExit).toHaveBeenCalledWith('replace-local')
+    } finally {
+      setUnexpectedExitListener(null)
+    }
+  })
 })
 
 describe('createRemotePty', () => {
@@ -386,6 +449,10 @@ describe('createRemotePty', () => {
     state.remoteArgvCalls = []
     state.remoteGitDir = ''
     state.remoteStateDir = OMP_STATE_DIR
+    state.remotePtys = []
+    state.retainedHostIds = []
+    state.releasedHostIds = []
+    setUnexpectedExitListener(null)
   })
 
   // The tmux new-session call is the one whose argv starts with 'tmux' — the
@@ -471,5 +538,36 @@ describe('createRemotePty', () => {
     })
     const argv = remoteAgentArgsFromCall(tmuxCall())
     expect(argv).toEqual(buildAgentArgs({ tool: 'omp' }))
+  })
+  it('releases remote attachments once across replacement and stale exits', async () => {
+    const unexpectedExit = vi.fn()
+    setUnexpectedExitListener(unexpectedExit)
+
+    try {
+      await createRemotePty('replace-remote', WORKTREE, host, { tool: 'claude' })
+      const first = state.remotePtys.at(-1)!
+
+      await reattachRemotePty('replace-remote', host)
+      const replacement = state.remotePtys.at(-1)!
+
+      expect(state.retainedHostIds).toEqual(['h1', 'h1'])
+      expect(state.releasedHostIds).toEqual(['h1'])
+      expect(first.kill).toHaveBeenCalledTimes(1)
+
+      first.emitExit()
+      first.emitExit()
+      expect(state.releasedHostIds).toEqual(['h1'])
+      expect(hasPty('replace-remote')).toBe(true)
+      expect(unexpectedExit).not.toHaveBeenCalled()
+
+      replacement.emitExit()
+      replacement.emitExit()
+      expect(state.releasedHostIds).toEqual(['h1', 'h1'])
+      expect(hasPty('replace-remote')).toBe(false)
+      expect(unexpectedExit).toHaveBeenCalledTimes(1)
+      expect(unexpectedExit).toHaveBeenCalledWith('replace-remote')
+    } finally {
+      setUnexpectedExitListener(null)
+    }
   })
 })
