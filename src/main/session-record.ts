@@ -21,6 +21,12 @@ export interface SessionRecordInput {
   repoFingerprint?: string
 }
 
+export const TMUX_SESSION_PREFIX = 'pewpew-'
+
+export function tmuxSessionFor(sessionId: string): string {
+  return `${TMUX_SESSION_PREFIX}${sessionId}`
+}
+
 // Assemble a freshly-spawned session. This is the single policy site for the
 // shape of a new `Session`, replacing five near-identical object literals in
 // `session-manager`. The returned object is plainly mutable on purpose:
@@ -37,7 +43,7 @@ export function buildSession(input: SessionRecordInput): Session {
     branch: input.branch,
     issueNumber: input.issueNumber,
     pid: 0,
-    tmuxSession: `pewpew-${input.id}`,
+    tmuxSession: tmuxSessionFor(input.id),
     status: 'running',
     lastActivity: input.now,
     hookEvents: [],

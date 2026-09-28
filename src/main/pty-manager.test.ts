@@ -326,6 +326,7 @@ describe('createPty', () => {
     // permanently mask every later test simulating bwrap being unusable.
     __resetSandboxProbeCacheForTesting()
     warnSpy.mockClear()
+    setUnexpectedExitListener(null)
   })
 
   it('runs local tmux calls on the dedicated pewpew socket', () => {
@@ -482,6 +483,7 @@ describe('createRemotePty', () => {
     state.remoteArgvCalls = []
     state.remoteGitDir = ''
     state.remoteStateDir = OMP_STATE_DIR
+    setUnexpectedExitListener(null)
   })
 
   // The tmux new-session call is the one whose argv starts with 'tmux' — the
@@ -596,7 +598,15 @@ describe('pty registration', () => {
   const host = { hostId: 'h1', alias: 'dev', label: 'Dev' } as Host
 
   afterEach(() => {
-    for (const id of ['reg-lc', 'reg-rc', 'reg-lr', 'reg-rr', 'reg-td', 'reg-replay']) {
+    for (const id of [
+      'reg-lc',
+      'reg-rc',
+      'reg-lr',
+      'reg-rr',
+      'reg-td',
+      'reg-replay',
+      'reg-replace',
+    ]) {
       detachPty(id)
     }
     setUnexpectedExitListener(null)
@@ -688,6 +698,59 @@ describe('pty registration', () => {
     } finally {
       vi.useRealTimers()
     }
+  })
+
+  it('retires an old local attachment without deleting its replacement on stale exit', () => {
+    const exited: string[] = []
+    setUnexpectedExitListener((id) => exited.push(id))
+    vi.useFakeTimers()
+    try {
+      reattachPty('reg-replace')
+      const previous = lastPty()
+      reattachPty('reg-replace')
+      const current = lastPty()
+
+      expect(previous.killed).toBe(true)
+      expect(current.killed).toBe(false)
+      previous.emitData('stale')
+      previous.emitExit()
+      expect(hasPty('reg-replace')).toBe(true)
+      expect(exited).toEqual([])
+
+      current.emitData('current')
+      vi.advanceTimersByTime(16)
+      expect(state.broadcasts).toEqual([
+        ['pty:data', { sessionId: 'reg-replace', data: 'current' }],
+      ])
+      current.emitExit()
+      expect(exited).toEqual(['reg-replace'])
+    } finally {
+      vi.useRealTimers()
+    }
+  })
+
+  it('releases a remote lease once on replacement and ignores stale exits', async () => {
+    const exited: string[] = []
+    setUnexpectedExitListener((id) => exited.push(id))
+    await reattachRemotePty('reg-replace', host)
+    const previous = lastPty()
+    await reattachRemotePty('reg-replace', host)
+    const current = lastPty()
+
+    expect(state.retainCalls).toEqual(['h1', 'h1'])
+    expect(state.releaseCalls).toEqual(['h1'])
+    expect(previous.killed).toBe(true)
+    previous.emitExit()
+    previous.emitExit()
+    expect(state.releaseCalls).toEqual(['h1'])
+    expect(hasPty('reg-replace')).toBe(true)
+    expect(exited).toEqual([])
+
+    current.emitExit()
+    current.emitExit()
+    expect(state.releaseCalls).toEqual(['h1', 'h1'])
+    expect(hasPty('reg-replace')).toBe(false)
+    expect(exited).toEqual(['reg-replace'])
   })
 
   it('reports an exit that did not go through teardown as an unexpected exit', () => {

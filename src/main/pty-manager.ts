@@ -29,6 +29,7 @@ import {
   type RemoteAgentState,
 } from './remote-agent-state'
 import { getSandboxConfig, resolvePath } from './config'
+import { tmuxSessionFor, TMUX_SESSION_PREFIX } from './session-record'
 import type { AgentTool, Host } from '../shared/types'
 
 interface SpawnOptions {
@@ -114,29 +115,17 @@ interface RemotePtyEntry extends PtyEntryBase {
 }
 
 type PtyEntry = LocalPtyEntry | RemotePtyEntry
-
 const ptys = new Map<string, PtyEntry>()
 let flushTimer: ReturnType<typeof setTimeout> | null = null
 
-// Fires when the underlying node-pty exits without going through
-// destroyPty/detachPty/destroyRemotePty (those all delete the entry from
-// `ptys` *before* killing the pty, so an entry that's still present at
-// onExit time means the agent or tmux died on its own — e.g. `claude
-// --continue` exiting because no prior conversation exists for the worktree).
-// Lets session-manager flip the session back to 'dead' instead of leaving it
-// at 'idle' with no backing pty, which the Terminal component renders as a
-// permanently empty xterm.
+// Fires when the current node-pty exits without going through an explicit
+// teardown. Registration callbacks compare entry identity so a delayed exit
+// from a replaced attachment cannot delete or report the replacement.
 type UnexpectedExitListener = (sessionId: string) => void
 let unexpectedExitListener: UnexpectedExitListener | null = null
 
 export function setUnexpectedExitListener(fn: UnexpectedExitListener | null): void {
   unexpectedExitListener = fn
-}
-
-function notifyUnexpectedExitIfPresent(sessionId: string): void {
-  if (!ptys.has(sessionId)) return
-  ptys.delete(sessionId)
-  unexpectedExitListener?.(sessionId)
 }
 
 function flushBuffers(): void {
@@ -170,13 +159,6 @@ function appendToBuffer(entry: PtyEntry, data: string): void {
 // every pewpew session down with it. Remote hosts still use their default server.
 export const TMUX_SOCKET = 'pewpew'
 
-// The one place the tmux session name is spelled. It is persisted into
-// Session.tmuxSession (session-record.ts) and matched by discoverTmuxSessions,
-// so it must never drift.
-export const TMUX_SESSION_PREFIX = 'pewpew-'
-
-const tmuxSessionName = (sessionId: string): string => `${TMUX_SESSION_PREFIX}${sessionId}`
-
 // 'default' is the user's default server: sessions started before the dedicated
 // socket existed still live there, and re-spawning them on the new server would
 // run a second agent in the same worktree.
@@ -208,7 +190,7 @@ function hasSessionOn(socket: TmuxSocket, tmuxSession: string): boolean {
 // Some tmux.conf files (Omarchy's ships one) set `detach-on-destroy off`
 // globally. With that set, killing a session migrates its attached client to
 // another session instead of exiting it — pewpew's dead-session detection
-// relies entirely on the attach pty exiting (see notifyUnexpectedExitIfPresent),
+// relies entirely on the attach pty exiting (see registerPty's onExit),
 // so the client silently keeps rendering whatever session it landed on and
 // the dead session's card never updates. Force the option on per-session so
 // pewpew's own tmux clients always exit when their session dies, regardless
@@ -529,7 +511,7 @@ export function createPty(sessionId: string, cwd: string, options?: SpawnOptions
     throw new Error('tmux not found')
   }
 
-  const tmuxSession = tmuxSessionName(sessionId)
+  const tmuxSession = tmuxSessionFor(sessionId)
   const sandboxPrefix = buildLocalSandboxPrefix(sessionId, options?.projectPath, cwd, options?.tool)
   const agentArgs = [...AGENT_ENV_SCRUB, ...sandboxPrefix, ...buildAgentArgs(options)]
 
@@ -573,24 +555,13 @@ interface RegisteredPty {
 }
 
 /**
- * Register a freshly-spawned pty as session `sessionId`'s terminal and own its
- * whole lifecycle. After this returns the session is routable by writePty and
- * resizePty, its output is coalesced into `pty:data` broadcasts, and — for a
- * remote placement — the host's SSH connection is retained for exactly as long
- * as the entry is registered.
- *
- * The lease is not a parameter. It follows from `placement`, which is why the
- * four spawn paths can no longer disagree about it: there is one onExit body,
- * shared by both placements, and releaseRemoteEntry decides from the entry.
- *
- * Ordering, all synchronous: retain (remote only) -> onData -> onExit ->
- * ptys.set. The retain precedes the exit handler so an exit can never release a
- * lease that was never taken, and ptys.set comes last so
- * notifyUnexpectedExitIfPresent keeps its "still present means the agent died
- * on its own" meaning.
+ * Register a spawned attachment before retiring the previous one. Failed
+ * handler setup leaves the previous attachment routable; stale callbacks
+ * cannot affect its replacement.
  */
 function registerPty(sessionId: string, ptyProcess: IPty, placement: PtyPlacement): RegisteredPty {
-  const tmuxSession = tmuxSessionName(sessionId)
+  const previous = ptys.get(sessionId)
+  const tmuxSession = tmuxSessionFor(sessionId)
   const entry: PtyEntry =
     placement.kind === 'remote'
       ? {
@@ -610,18 +581,37 @@ function registerPty(sessionId: string, ptyProcess: IPty, placement: PtyPlacemen
         }
 
   if (entry.kind === 'remote') retainHostConnection(entry.host.hostId)
-
-  ptyProcess.onData((data) => {
-    appendToBuffer(entry, data)
-  })
-
-  ptyProcess.onExit(() => {
-    releaseRemoteEntry(entry)
-    notifyUnexpectedExitIfPresent(sessionId)
-  })
+  try {
+    ptyProcess.onData((data) => {
+      if (ptys.get(sessionId) === entry) appendToBuffer(entry, data)
+    })
+    ptyProcess.onExit(() => {
+      releaseRemoteEntry(entry)
+      if (ptys.get(sessionId) !== entry) return
+      ptys.delete(sessionId)
+      unexpectedExitListener?.(sessionId)
+    })
+  } catch (error) {
+    retirePtyEntry(entry)
+    throw error
+  }
 
   ptys.set(sessionId, entry)
-  return { replay: (text) => appendToBuffer(entry, text) }
+  if (previous) retirePtyEntry(previous)
+  return {
+    replay: (text) => {
+      if (ptys.get(sessionId) === entry) appendToBuffer(entry, text)
+    },
+  }
+}
+
+function retirePtyEntry(entry: PtyEntry): void {
+  releaseRemoteEntry(entry)
+  try {
+    entry.pty.kill()
+  } catch {
+    // Pty may already be dead
+  }
 }
 
 // See createPty's doc comment for what the returned boolean means. Remote
@@ -634,7 +624,7 @@ export async function createRemotePty(
   host: Host,
   options?: SpawnOptions
 ): Promise<boolean> {
-  const tmuxSession = tmuxSessionName(sessionId)
+  const tmuxSession = tmuxSessionFor(sessionId)
   let sandboxPrefix: string[] = []
   if (options?.projectPath) {
     if (options.tool === 'codex') {
@@ -736,29 +726,17 @@ export function detachPty(sessionId: string): void {
   if (!entry) return
 
   ptys.delete(sessionId)
-  releaseRemoteEntry(entry)
-
-  try {
-    entry.pty.kill()
-  } catch {
-    // Pty may already be dead
-  }
+  retirePtyEntry(entry)
 }
 
 /** Kill both node-pty and the tmux session (full teardown). */
 export function destroyPty(sessionId: string): void {
   const entry = ptys.get(sessionId)
-  const tmuxSession = entry?.tmuxSession ?? tmuxSessionName(sessionId)
+  const tmuxSession = entry?.tmuxSession ?? tmuxSessionFor(sessionId)
 
   if (entry) {
     ptys.delete(sessionId)
-    releaseRemoteEntry(entry)
-
-    try {
-      entry.pty.kill()
-    } catch {
-      // Pty may already be dead from tmux exit
-    }
+    retirePtyEntry(entry)
   }
 
   // Always attempt to kill the tmux session — the pty onExit handler may have
@@ -774,7 +752,7 @@ export function destroyPty(sessionId: string): void {
 
 export async function destroyRemotePty(sessionId: string, host: Host): Promise<void> {
   const entry = ptys.get(sessionId)
-  const tmuxSession = entry?.tmuxSession ?? tmuxSessionName(sessionId)
+  const tmuxSession = entry?.tmuxSession ?? tmuxSessionFor(sessionId)
 
   const result = await execRemote(host, ['tmux', 'kill-session', '-t', tmuxSession], {
     timeoutMs: 5000,
@@ -802,12 +780,7 @@ export async function destroyRemotePty(sessionId: string, host: Host): Promise<v
 
   if (entry) {
     ptys.delete(sessionId)
-    try {
-      entry.pty.kill()
-    } catch {
-      // Pty may already be dead from ssh/tmux exit
-    }
-    releaseRemoteEntry(entry)
+    retirePtyEntry(entry)
   }
 }
 
@@ -820,7 +793,7 @@ export function hasPty(sessionId: string): boolean {
 }
 
 export function hasTmuxSession(sessionId: string): boolean {
-  return findLiveSocket(tmuxSessionName(sessionId)) !== undefined
+  return findLiveSocket(tmuxSessionFor(sessionId)) !== undefined
 }
 
 export async function captureThumbnails(opts?: {
@@ -863,7 +836,7 @@ export async function captureThumbnails(opts?: {
 }
 
 export async function hasRemoteTmuxSession(sessionId: string, host: Host): Promise<boolean> {
-  const result = await execRemote(host, ['tmux', 'has-session', '-t', tmuxSessionName(sessionId)], {
+  const result = await execRemote(host, ['tmux', 'has-session', '-t', tmuxSessionFor(sessionId)], {
     timeoutMs: 3000,
   })
   return result.code === 0 && !result.timedOut
@@ -880,7 +853,7 @@ export async function probeRemoteTmuxSession(
   sessionId: string,
   host: Host
 ): Promise<RemoteTmuxProbeResult> {
-  const result = await execRemote(host, ['tmux', 'has-session', '-t', tmuxSessionName(sessionId)], {
+  const result = await execRemote(host, ['tmux', 'has-session', '-t', tmuxSessionFor(sessionId)], {
     timeoutMs: 3000,
   })
   if (result.timedOut) return 'unreachable'
@@ -910,7 +883,7 @@ export async function getScrollback(sessionId: string): Promise<string> {
     return result.code === 0 && !result.timedOut ? result.stdout : ''
   }
 
-  const tmuxSession = tmuxSessionName(sessionId)
+  const tmuxSession = tmuxSessionFor(sessionId)
   for (const socket of socketsFor(entry)) {
     try {
       return runTmux(socket, ['capture-pane', '-t', tmuxSession, '-p', '-e', '-S', '-5000'], 5000)
@@ -938,7 +911,7 @@ export function discoverTmuxSessions(): string[] {
 }
 
 export function reattachPty(sessionId: string): void {
-  const tmuxSession = tmuxSessionName(sessionId)
+  const tmuxSession = tmuxSessionFor(sessionId)
   const tmuxSocket = findLiveSocket(tmuxSession) ?? TMUX_SOCKET
 
   // Attach to existing tmux session via node-pty
@@ -962,7 +935,7 @@ export function reattachPty(sessionId: string): void {
 }
 
 export async function reattachRemotePty(sessionId: string, host: Host): Promise<void> {
-  const tmuxSession = tmuxSessionName(sessionId)
+  const tmuxSession = tmuxSessionFor(sessionId)
 
   const ptyProcess = spawnRemoteAttach(host, tmuxSession)
   const session = registerPty(sessionId, ptyProcess, { kind: 'remote', host })

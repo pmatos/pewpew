@@ -14,11 +14,10 @@ needed to pin it down yet, not that the concept does not exist.
 Carries its own `tmuxSession` name (see below) and, when remote, a `hostId`.
 
 **tmux session name** — the durable name of the tmux session backing a Session,
-spelled `pewpew-<session id>`. Produced by `tmuxSessionName` in
-`src/main/pty-manager.ts`, persisted into `Session.tmuxSession`
-(`src/main/session-record.ts`), and matched by `discoverTmuxSessions` when
-adopting sessions left behind by a previous run. Its spelling is a compatibility
-commitment: changing it orphans every live session.
+spelled `pewpew-<session id>`. Produced by `tmuxSessionFor` in
+`src/main/session-record.ts`, persisted into `Session.tmuxSession`, and matched by
+`discoverTmuxSessions` when adopting sessions left behind by a previous run. Its
+spelling is a compatibility commitment: changing it orphans every live session.
 
 **tmux socket** — which tmux _server_ a local session lives on. `pewpew` is the
 dedicated server; `default` is the user's own, where sessions created before the
