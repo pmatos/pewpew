@@ -37,12 +37,10 @@ import {
 } from './pty-manager'
 import { getRepoFingerprint, gitWorktrees, parseWorktreeList } from './project-scanner'
 import {
-  installHooks,
-  installCodexHooks,
-  ensureCodexHooksFeatureFlag,
-  rollbackCodexHooks,
-} from './hook-installer'
-import { spawnRemoteAgent, installRemoteAgentHooks } from './remote-agent-spawn'
+  createLocalAgentHookLifecycle,
+  createRemoteAgentHookLifecycle,
+} from './agent-hook-lifecycle'
+import { spawnRemoteAgent } from './remote-agent-spawn'
 import { getHost } from './host-registry'
 import { listRemoteProjects } from './remote-project-registry'
 import { getRequiredHost, expectRemoteOk } from './remote-command'
@@ -107,6 +105,7 @@ import type {
 import { isRestartable } from '../shared/session-status'
 
 const execFileAsync = promisify(execFile)
+const localAgentHooks = createLocalAgentHookLifecycle()
 const SESSIONS_PATH = join(CONFIG_DIR, 'sessions.json')
 
 // Read the actual branch checked out in a worktree. Falls back to the
@@ -404,25 +403,6 @@ export async function createSessionForWorktree(
   }
 }
 
-async function installAgentHooks(tool: AgentTool, worktreePath: string): Promise<void> {
-  if (tool === 'codex') {
-    const snapshot = await installCodexHooks(worktreePath, { skipGitignore: true })
-    try {
-      ensureCodexHooksFeatureFlag()
-    } catch (err) {
-      rollbackCodexHooks(snapshot)
-      throw err
-    }
-    return
-  }
-  if (tool === 'omp') {
-    // omp's hook bridge is passed via `--hook <path>` in buildAgentArgs, not
-    // written into the project — nothing to install here.
-    return
-  }
-  await installHooks(worktreePath, { skipGitignore: true })
-}
-
 async function adoptWorktree(
   projectPath: string,
   worktreePath: string,
@@ -441,7 +421,7 @@ async function adoptWorktree(
   const worktreeName = label || (await deriveLabel(worktreePath))
   const branch = resolveBranchFromWorktree(worktreePath, worktreeName, projectName)
 
-  await installAgentHooks(tool, worktreePath)
+  await localAgentHooks.installBeforeSpawn(tool, worktreePath)
   const sandboxed = createPty(id, worktreePath, { tool, projectPath })
 
   const session = buildSession({
@@ -1136,21 +1116,16 @@ export async function reviveSession(id: string): Promise<void> {
                 `Session ${id} (${session.tool}) has no prior conversation on host ${host.alias}; spawning fresh instead of resuming`
               )
             }
-            // See the local branch above: reinstall hooks before spawning so
-            // a long-since-created remote worktree picks up hook fixes that
-            // landed after its last install, instead of running forever
-            // against whatever was current at creation time. Mirrors the
-            // local branch's existsSync guard: installRemoteAgentHooks runs
-            // mkdir -p on the worktree path, which would otherwise silently
-            // resurrect a deleted remote worktree as an empty, non-git
-            // directory instead of letting the tmux spawn below fail loudly.
+            // Reinstall hooks before spawning so a long-since-created remote
+            // worktree picks up hook fixes. Keep the existence probe outside
+            // the lifecycle: an installer may create directories, which would
+            // otherwise resurrect a deleted worktree as an empty directory.
+            const hooks = createRemoteAgentHookLifecycle({
+              host,
+              notifyScriptPath,
+            })
             if (await hasRemoteWorktree(host, session.worktreePath)) {
-              await installRemoteAgentHooks(
-                session.tool,
-                host,
-                session.worktreePath,
-                notifyScriptPath
-              )
+              await hooks.installBeforeSpawn(session.tool, session.worktreePath)
             }
             session.sandboxed = await createRemotePty(id, session.worktreePath, host, {
               continueSession: canResume,
@@ -1198,11 +1173,10 @@ export async function reviveSession(id: string): Promise<void> {
     // Reinstall hooks before spawning: the agent process reads its hook
     // config at process start (see the relocateProject comment above), and a
     // session revived here may have been created long before its worktree's
-    // settings.local.json last saw an installHooks() call — any hook fix
-    // that landed since (e.g. removal of the legacy worktree-guard.sh hook) would
-    // otherwise never reach this worktree until it's relocated or recreated.
+    // hook configuration was last refreshed — any fix that landed since
+    // then would otherwise never reach this worktree until relocation.
     if (existsSync(session.worktreePath)) {
-      await installAgentHooks(session.tool, session.worktreePath)
+      await localAgentHooks.installBeforeSpawn(session.tool, session.worktreePath)
     }
     session.sandboxed = createPty(id, session.worktreePath, {
       continueSession: canResume,
@@ -1240,16 +1214,11 @@ export async function attachLocalSession(id: string): Promise<void> {
           `Session ${id} (${session.tool}) has no prior conversation; spawning fresh instead of resuming`
         )
       }
-      // See reviveSession's local branch: reinstall hooks before spawning so
-      // a session that's been pending since long before its worktree's last
-      // installHooks() call picks up hook fixes landed since then. Best
-      // effort: unlike reviveSession, this path had no hook-install call (and
-      // so no way to fail on one) before this change — a pending session
-      // always spawned successfully regardless of hook file state. Swallow a
-      // failure here rather than let it flip an otherwise-healthy attach to
-      // 'dead', since a stale-hooks spawn is strictly better than no spawn.
+      // See reviveSession's local branch: refresh hooks before spawning.
+      // Best effort: pending attach historically spawned regardless of hook
+      // file state, so a stale-hooks spawn is better than no spawn.
       try {
-        await installAgentHooks(session.tool, session.worktreePath)
+        await localAgentHooks.installBeforeSpawn(session.tool, session.worktreePath)
       } catch (err) {
         console.error(`Session ${id}: failed to reinstall hooks before attach`, err)
       }
@@ -1939,11 +1908,10 @@ export async function relocateProject(
   saveConfig(config)
 
   if (toolsInUse.has('claude') || toolsInUse.size === 0) {
-    await installHooks(newProjectPath)
+    await localAgentHooks.installProjectHooks('claude', newProjectPath)
   }
   if (toolsInUse.has('codex')) {
-    await installCodexHooks(newProjectPath)
-    ensureCodexHooksFeatureFlag()
+    await localAgentHooks.installProjectHooks('codex', newProjectPath)
   }
   onSessionsChanged()
 

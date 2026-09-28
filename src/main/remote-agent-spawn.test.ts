@@ -4,6 +4,7 @@ import type { Host } from '../shared/types'
 // Shared, ordered log so "hooks before pty" is a single assertion across the
 // two mocked modules.
 const calls: string[] = []
+const hookInstallMock = vi.hoisted(() => vi.fn())
 let revParseStdout = 'feature/x\n'
 let ptyOptions: Record<string, unknown> | undefined
 
@@ -24,30 +25,14 @@ vi.mock('./pty-manager', () => ({
   ),
 }))
 
-vi.mock('./hook-installer', () => ({
-  installRemoteHooks: vi.fn(async () => {
-    calls.push('installRemoteHooks')
-  }),
-  installRemoteCodexHooks: vi.fn(async () => {
-    calls.push('installRemoteCodexHooks')
-    return {}
-  }),
-  ensureRemoteCodexHooksFeatureFlag: vi.fn(async () => {
-    calls.push('ensureRemoteCodexHooksFeatureFlag')
-  }),
-  rollbackRemoteCodexHooks: vi.fn(async () => {
-    calls.push('rollbackRemoteCodexHooks')
-  }),
-  commitRemoteCodexHooks: vi.fn(async () => {
-    calls.push('commitRemoteCodexHooks')
+vi.mock('./agent-hook-lifecycle', () => ({
+  createRemoteAgentHookLifecycle: () => ({
+    installBeforeSpawn: hookInstallMock,
+    installProjectHooks: vi.fn(),
   }),
 }))
 
-vi.mock('./host-connection', () => ({
-  exec: vi.fn(async () => ({ stdout: '', stderr: '', code: 0, timedOut: false })),
-}))
-
-import { spawnRemoteAgent, installRemoteAgentHooks } from './remote-agent-spawn'
+import { spawnRemoteAgent } from './remote-agent-spawn'
 
 const host = { hostId: 'h1', alias: 'dev', label: 'Dev' } as unknown as Host
 
@@ -75,12 +60,16 @@ beforeEach(() => {
   calls.length = 0
   revParseStdout = 'feature/x\n'
   ptyOptions = undefined
+  hookInstallMock.mockReset()
+  hookInstallMock.mockImplementation(async () => {
+    calls.push('installAgentHooks')
+  })
 })
 
 describe('spawnRemoteAgent', () => {
   it('installs the agent hooks strictly before spawning the pty', async () => {
     await spawnRemoteAgent(baseArgs())
-    expect(calls.indexOf('installRemoteHooks')).toBeLessThan(calls.indexOf('createRemotePty'))
+    expect(calls.indexOf('installAgentHooks')).toBeLessThan(calls.indexOf('createRemotePty'))
   })
 
   it('passes createRemotePty exactly the mapped options (ompHookScriptPath → notifyHookPath)', async () => {
@@ -116,32 +105,8 @@ describe('spawnRemoteAgent', () => {
   })
 
   it('does not spawn the pty if hook installation fails', async () => {
-    const { installRemoteHooks } = await import('./hook-installer')
-    vi.mocked(installRemoteHooks).mockRejectedValueOnce(new Error('hook install failed'))
+    hookInstallMock.mockRejectedValueOnce(new Error('hook install failed'))
     await expect(spawnRemoteAgent(baseArgs())).rejects.toThrow('hook install failed')
     expect(calls).not.toContain('createRemotePty')
-  })
-})
-
-describe('installRemoteAgentHooks', () => {
-  it('installs claude/default hooks via installRemoteHooks', async () => {
-    await installRemoteAgentHooks('claude', host, '/remote/wt', '/n.sh')
-    expect(calls).toContain('installRemoteHooks')
-  })
-
-  it('is a no-op for omp (hook bridge is a plain file installed elsewhere)', async () => {
-    await installRemoteAgentHooks('omp', host, '/remote/wt', '/n.sh')
-    expect(calls).not.toContain('installRemoteHooks')
-    expect(calls).not.toContain('installRemoteCodexHooks')
-  })
-
-  it('rolls back codex hooks when the feature-flag step fails', async () => {
-    const { ensureRemoteCodexHooksFeatureFlag } = await import('./hook-installer')
-    vi.mocked(ensureRemoteCodexHooksFeatureFlag).mockRejectedValueOnce(new Error('flag failed'))
-    await expect(installRemoteAgentHooks('codex', host, '/remote/wt', '/n.sh')).rejects.toThrow(
-      'flag failed'
-    )
-    expect(calls).toContain('rollbackRemoteCodexHooks')
-    expect(calls).not.toContain('commitRemoteCodexHooks')
   })
 })
