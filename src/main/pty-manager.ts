@@ -175,6 +175,31 @@ function hasSessionOn(socket: TmuxSocket, tmuxSession: string): boolean {
   }
 }
 
+// Some tmux.conf files (Omarchy's ships one) set `detach-on-destroy off`
+// globally. With that set, killing a session migrates its attached client to
+// another session instead of exiting it — pewpew's dead-session detection
+// relies entirely on the attach pty exiting (see notifyUnexpectedExitIfPresent),
+// so the client silently keeps rendering whatever session it landed on and
+// the dead session's card never updates. Force the option on per-session so
+// pewpew's own tmux clients always exit when their session dies, regardless
+// of the user's tmux.conf. Best effort: a session that's already gone (race)
+// shouldn't block create/attach.
+function setDetachOnDestroy(socket: TmuxSocket, tmuxSession: string): void {
+  try {
+    runTmux(socket, ['set-option', '-t', tmuxSession, 'detach-on-destroy', 'on'])
+  } catch {
+    // Ignore — see comment above.
+  }
+}
+
+async function setRemoteDetachOnDestroy(host: Host, tmuxSession: string): Promise<void> {
+  try {
+    await execRemote(host, ['tmux', 'set-option', '-t', tmuxSession, 'detach-on-destroy', 'on'])
+  } catch {
+    // Ignore — see setDetachOnDestroy.
+  }
+}
+
 const findLiveSocket = (tmuxSession: string): TmuxSocket | undefined =>
   LOCAL_SOCKETS.find((socket) => hasSessionOn(socket, tmuxSession))
 
@@ -469,6 +494,7 @@ export function createPty(sessionId: string, cwd: string, options?: SpawnOptions
     '30',
     ...agentArgs,
   ])
+  setDetachOnDestroy(TMUX_SOCKET, tmuxSession)
 
   // Attach to it via node-pty
   const ptyProcess = spawnLocalAttach(TMUX_SOCKET, tmuxSession, cwd)
@@ -584,6 +610,7 @@ export async function createRemotePty(
     const detail = create.stderr.trim() || create.stdout.trim() || `exit ${create.code}`
     throw new Error(`Failed to create remote tmux session: ${detail}`)
   }
+  await setRemoteDetachOnDestroy(host, tmuxSession)
 
   const ptyProcess = spawnAttach(host, ['tmux', 'attach-session', '-t', tmuxSession], {
     name: 'xterm-256color',
@@ -841,6 +868,8 @@ export function discoverTmuxSessions(): string[] {
 export function reattachPty(sessionId: string): void {
   const tmuxSession = `pewpew-${sessionId}`
   const tmuxSocket = findLiveSocket(tmuxSession) ?? TMUX_SOCKET
+  // Patches sessions created before this option was added at spawn time.
+  setDetachOnDestroy(tmuxSocket, tmuxSession)
 
   // Attach to existing tmux session via node-pty
   const ptyProcess = spawnLocalAttach(tmuxSocket, tmuxSession)
@@ -879,6 +908,8 @@ export function reattachPty(sessionId: string): void {
 
 export async function reattachRemotePty(sessionId: string, host: Host): Promise<void> {
   const tmuxSession = `pewpew-${sessionId}`
+  // Patches sessions created before this option was added at spawn time.
+  await setRemoteDetachOnDestroy(host, tmuxSession)
 
   const ptyProcess = spawnAttach(host, ['tmux', 'attach-session', '-t', tmuxSession], {
     name: 'xterm-256color',

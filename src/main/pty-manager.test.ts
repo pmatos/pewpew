@@ -268,6 +268,42 @@ describe('createPty', () => {
     }
   })
 
+  // A tmux.conf that sets `detach-on-destroy off` globally (Omarchy ships
+  // one) makes a killed session's client migrate to another session instead
+  // of exiting, so pewpew's onExit-based dead-session detection never fires.
+  // Pinning the option per-session at create and at reattach time defeats
+  // that regardless of the user's tmux.conf — see the real-tmux integration
+  // test in pty-manager.tmux-detach.test.ts for proof tmux actually honors it.
+  it('pins detach-on-destroy on for the session at create and at reattach time', () => {
+    createPty('s1', WORKTREE, { tool: 'claude' })
+    const createSetOption = state.tmuxCalls.find(
+      (argv) => argv.includes('set-option') && argv.includes('pewpew-s1')
+    )
+    expect(createSetOption).toEqual([
+      '-L',
+      TMUX_SOCKET,
+      'set-option',
+      '-t',
+      'pewpew-s1',
+      'detach-on-destroy',
+      'on',
+    ])
+
+    state.tmuxCalls = []
+    reattachPty('s1')
+    const reattachSetOption = state.tmuxCalls.find((argv) => argv.includes('set-option'))
+    expect(reattachSetOption).toEqual([
+      '-L',
+      TMUX_SOCKET,
+      'set-option',
+      '-t',
+      'pewpew-s1',
+      'detach-on-destroy',
+      'on',
+    ])
+    destroyPty('s1')
+  })
+
   it('keeps managing a session still alive on the default server (pre-dedicated-socket upgrade)', async () => {
     state.liveTmuxServers = new Set(['default'])
     expect(hasTmuxSession('legacy')).toBe(true)
@@ -405,6 +441,25 @@ describe('createRemotePty', () => {
     expect(argv).toEqual(buildAgentArgs({ tool: 'claude' }))
     expect(argv).not.toContain('bwrap')
     expect(state.remoteArgvCalls.some((argv) => argv[0] === 'sh')).toBe(false)
+  })
+
+  it('pins detach-on-destroy on for the remote session after creating it', async () => {
+    await createRemotePty('s1', WORKTREE, host, {
+      tool: 'claude',
+      projectPath: PROJECT,
+      remoteSocketPath: REMOTE_SOCKET,
+    })
+    const setOptionCall = state.remoteArgvCalls.find(
+      (argv) => argv[0] === 'tmux' && argv.includes('set-option')
+    )
+    expect(setOptionCall).toEqual([
+      'tmux',
+      'set-option',
+      '-t',
+      'pewpew-s1',
+      'detach-on-destroy',
+      'on',
+    ])
   })
 
   it('includes the sandbox prefix with state and stable hook socket directory when sandboxAvailable is true (omp)', async () => {
