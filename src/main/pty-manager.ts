@@ -175,6 +175,39 @@ function hasSessionOn(socket: TmuxSocket, tmuxSession: string): boolean {
   }
 }
 
+// Some tmux.conf files (Omarchy's ships one) set `detach-on-destroy off`
+// globally. With that set, killing a session migrates its attached client to
+// another session instead of exiting it — pewpew's dead-session detection
+// relies entirely on the attach pty exiting (see notifyUnexpectedExitIfPresent),
+// so the client silently keeps rendering whatever session it landed on and
+// the dead session's card never updates. Force the option on per-session so
+// pewpew's own tmux clients always exit when their session dies, regardless
+// of the user's tmux.conf.
+//
+// Exported so pty-manager.tmux-detach.test.ts can run this exact tmux
+// invocation against a real server on its own throwaway socket, proving tmux
+// actually honors it — a hardcoded copy of these args in the test could
+// silently drift from what production sends.
+export function detachOnDestroyArgs(tmuxSession: string): string[] {
+  return ['set-option', '-t', tmuxSession, 'detach-on-destroy', 'on']
+}
+
+// Best effort: a session that's already gone (race) shouldn't block create/attach.
+function setDetachOnDestroy(socket: TmuxSocket, tmuxSession: string): void {
+  try {
+    runTmux(socket, detachOnDestroyArgs(tmuxSession))
+  } catch {
+    // Ignore — see comment above.
+  }
+}
+
+// Best effort, same as setDetachOnDestroy.
+async function setRemoteDetachOnDestroy(host: Host, tmuxSession: string): Promise<void> {
+  await execRemote(host, ['tmux', ...detachOnDestroyArgs(tmuxSession)]).catch(() => {
+    // Ignore — see setDetachOnDestroy.
+  })
+}
+
 const findLiveSocket = (tmuxSession: string): TmuxSocket | undefined =>
   LOCAL_SOCKETS.find((socket) => hasSessionOn(socket, tmuxSession))
 
@@ -182,12 +215,32 @@ const findLiveSocket = (tmuxSession: string): TmuxSocket | undefined =>
 const socketsFor = (entry?: PtyEntry): readonly TmuxSocket[] =>
   entry?.tmuxSocket ? [entry.tmuxSocket] : LOCAL_SOCKETS
 
+// The sole local tmux-attach primitive — pinning the option here, rather
+// than at each caller, guarantees every local attach (session create,
+// reattach on app restart, whatever comes next) is covered, including
+// sessions that predate this option existing at all.
 function spawnLocalAttach(socket: TmuxSocket, tmuxSession: string, cwd?: string): IPty {
+  setDetachOnDestroy(socket, tmuxSession)
   return pty.spawn('tmux', tmuxArgs(socket, ['attach-session', '-t', tmuxSession]), {
     name: 'xterm-256color',
     cols: 120,
     rows: 30,
     cwd,
+    env: sanitizeChildEnv() as Record<string, string>,
+  })
+}
+
+// The remote counterpart of spawnLocalAttach — same single-choke-point
+// reasoning. Doesn't await the pin: it's best-effort (see
+// setRemoteDetachOnDestroy) and only needs to land before the session could
+// ever be destroyed, not before the client attaches, so there's no reason to
+// serialize it ahead of the attach's own SSH round trip.
+function remoteTmuxAttach(host: Host, tmuxSession: string): IPty {
+  void setRemoteDetachOnDestroy(host, tmuxSession)
+  return spawnAttach(host, ['tmux', 'attach-session', '-t', tmuxSession], {
+    name: 'xterm-256color',
+    cols: 120,
+    rows: 30,
     env: sanitizeChildEnv() as Record<string, string>,
   })
 }
@@ -585,12 +638,7 @@ export async function createRemotePty(
     throw new Error(`Failed to create remote tmux session: ${detail}`)
   }
 
-  const ptyProcess = spawnAttach(host, ['tmux', 'attach-session', '-t', tmuxSession], {
-    name: 'xterm-256color',
-    cols: 120,
-    rows: 30,
-    env: sanitizeChildEnv() as Record<string, string>,
-  })
+  const ptyProcess = remoteTmuxAttach(host, tmuxSession)
 
   retainHostConnection(host.hostId)
 
@@ -880,12 +928,7 @@ export function reattachPty(sessionId: string): void {
 export async function reattachRemotePty(sessionId: string, host: Host): Promise<void> {
   const tmuxSession = `pewpew-${sessionId}`
 
-  const ptyProcess = spawnAttach(host, ['tmux', 'attach-session', '-t', tmuxSession], {
-    name: 'xterm-256color',
-    cols: 120,
-    rows: 30,
-    env: sanitizeChildEnv() as Record<string, string>,
-  })
+  const ptyProcess = remoteTmuxAttach(host, tmuxSession)
 
   retainHostConnection(host.hostId)
 

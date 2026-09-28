@@ -116,9 +116,11 @@ import {
   captureThumbnails,
   createRemotePty,
   destroyPty,
+  detachOnDestroyArgs,
   discoverTmuxSessions,
   hasTmuxSession,
   reattachPty,
+  reattachRemotePty,
   TMUX_SOCKET,
   __resetSandboxProbeCacheForTesting,
 } from './pty-manager'
@@ -268,6 +270,31 @@ describe('createPty', () => {
     }
   })
 
+  // A tmux.conf that sets `detach-on-destroy off` globally (Omarchy ships
+  // one) makes a killed session's client migrate to another session instead
+  // of exiting, so pewpew's onExit-based dead-session detection never fires.
+  // Pinning the option per-session at create and at reattach time defeats
+  // that regardless of the user's tmux.conf — see the real-tmux integration
+  // test in pty-manager.tmux-detach.test.ts for proof tmux actually honors it.
+  it('pins detach-on-destroy on for the session at create time', () => {
+    createPty('s1', WORKTREE, { tool: 'claude' })
+    const createSetOption = state.tmuxCalls.find(
+      (argv) => argv.includes('set-option') && argv.includes('pewpew-s1')
+    )
+    expect(createSetOption).toEqual(['-L', TMUX_SOCKET, ...detachOnDestroyArgs('pewpew-s1')])
+    destroyPty('s1')
+  })
+
+  it('pins detach-on-destroy on for the session at reattach time', () => {
+    createPty('s1', WORKTREE, { tool: 'claude' })
+    state.tmuxCalls = []
+
+    reattachPty('s1')
+    const reattachSetOption = state.tmuxCalls.find((argv) => argv.includes('set-option'))
+    expect(reattachSetOption).toEqual(['-L', TMUX_SOCKET, ...detachOnDestroyArgs('pewpew-s1')])
+    destroyPty('s1')
+  })
+
   it('keeps managing a session still alive on the default server (pre-dedicated-socket upgrade)', async () => {
     state.liveTmuxServers = new Set(['default'])
     expect(hasTmuxSession('legacy')).toBe(true)
@@ -407,6 +434,18 @@ describe('createRemotePty', () => {
     expect(state.remoteArgvCalls.some((argv) => argv[0] === 'sh')).toBe(false)
   })
 
+  it('pins detach-on-destroy on for the remote session after creating it', async () => {
+    await createRemotePty('s1', WORKTREE, host, {
+      tool: 'claude',
+      projectPath: PROJECT,
+      remoteSocketPath: REMOTE_SOCKET,
+    })
+    const setOptionCall = state.remoteArgvCalls.find(
+      (argv) => argv[0] === 'tmux' && argv.includes('set-option')
+    )
+    expect(setOptionCall).toEqual(['tmux', ...detachOnDestroyArgs('pewpew-s1')])
+  })
+
   it('includes the sandbox prefix with state and stable hook socket directory when sandboxAvailable is true (omp)', async () => {
     await createRemotePty('s1', WORKTREE, host, {
       tool: 'omp',
@@ -471,5 +510,12 @@ describe('createRemotePty', () => {
     })
     const argv = remoteAgentArgsFromCall(tmuxCall())
     expect(argv).toEqual(buildAgentArgs({ tool: 'omp' }))
+  })
+
+  describe('reattachRemotePty', () => {
+    it('pins detach-on-destroy on for the session before attaching', async () => {
+      await reattachRemotePty('s1', host)
+      expect(state.remoteArgvCalls[0]).toEqual(['tmux', ...detachOnDestroyArgs('pewpew-s1')])
+    })
   })
 })
