@@ -26,8 +26,6 @@
 root="$1"
 [ -z "$root" ] && exit 0
 
-payload=$(cat)
-
 if ! command -v jq >/dev/null 2>&1; then
   # jq is required for every decision this hook makes, so its absence can't
   # be treated as "nothing to guard here" — that would silently disable the
@@ -36,6 +34,7 @@ if ! command -v jq >/dev/null 2>&1; then
   printf '%s' '{"hookSpecificOutput":{"hookEventName":"PreToolUse","permissionDecision":"deny","permissionDecisionReason":"pewpew: worktree guard cannot run because jq is not installed on this host; blocking the write (fail-closed)"}}'
   exit 0
 fi
+payload=$(cat)
 
 # A payload that isn't valid JSON at all is indistinguishable, further down,
 # from "a tool call with no file_path" (both make the later jq extractions

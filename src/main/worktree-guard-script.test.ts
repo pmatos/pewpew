@@ -280,8 +280,9 @@ describe('worktree-guard.sh', () => {
   })
 
   it('fails closed (denies) when jq is not installed on PATH', () => {
+    // The missing-jq branch never reads the payload. Supplying stdin can
+    // race the early exit and make execFileSync fail with EPIPE instead.
     const out = execFileSync('/bin/bash', [SCRIPT, root], {
-      input: JSON.stringify(writePayload(join(root, 'inside.txt'))),
       encoding: 'utf-8',
       env: { PATH: '/nonexistent-bin-dir' },
     })
