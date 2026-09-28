@@ -116,6 +116,7 @@ import {
   captureThumbnails,
   createRemotePty,
   destroyPty,
+  detachOnDestroyArgs,
   discoverTmuxSessions,
   hasTmuxSession,
   reattachPty,
@@ -275,33 +276,22 @@ describe('createPty', () => {
   // Pinning the option per-session at create and at reattach time defeats
   // that regardless of the user's tmux.conf — see the real-tmux integration
   // test in pty-manager.tmux-detach.test.ts for proof tmux actually honors it.
-  it('pins detach-on-destroy on for the session at create and at reattach time', () => {
+  it('pins detach-on-destroy on for the session at create time', () => {
     createPty('s1', WORKTREE, { tool: 'claude' })
     const createSetOption = state.tmuxCalls.find(
       (argv) => argv.includes('set-option') && argv.includes('pewpew-s1')
     )
-    expect(createSetOption).toEqual([
-      '-L',
-      TMUX_SOCKET,
-      'set-option',
-      '-t',
-      'pewpew-s1',
-      'detach-on-destroy',
-      'on',
-    ])
+    expect(createSetOption).toEqual(['-L', TMUX_SOCKET, ...detachOnDestroyArgs('pewpew-s1')])
+    destroyPty('s1')
+  })
 
+  it('pins detach-on-destroy on for the session at reattach time', () => {
+    createPty('s1', WORKTREE, { tool: 'claude' })
     state.tmuxCalls = []
+
     reattachPty('s1')
     const reattachSetOption = state.tmuxCalls.find((argv) => argv.includes('set-option'))
-    expect(reattachSetOption).toEqual([
-      '-L',
-      TMUX_SOCKET,
-      'set-option',
-      '-t',
-      'pewpew-s1',
-      'detach-on-destroy',
-      'on',
-    ])
+    expect(reattachSetOption).toEqual(['-L', TMUX_SOCKET, ...detachOnDestroyArgs('pewpew-s1')])
     destroyPty('s1')
   })
 
@@ -453,14 +443,7 @@ describe('createRemotePty', () => {
     const setOptionCall = state.remoteArgvCalls.find(
       (argv) => argv[0] === 'tmux' && argv.includes('set-option')
     )
-    expect(setOptionCall).toEqual([
-      'tmux',
-      'set-option',
-      '-t',
-      'pewpew-s1',
-      'detach-on-destroy',
-      'on',
-    ])
+    expect(setOptionCall).toEqual(['tmux', ...detachOnDestroyArgs('pewpew-s1')])
   })
 
   it('includes the sandbox prefix with state and stable hook socket directory when sandboxAvailable is true (omp)', async () => {
@@ -532,14 +515,7 @@ describe('createRemotePty', () => {
   describe('reattachRemotePty', () => {
     it('pins detach-on-destroy on for the session before attaching', async () => {
       await reattachRemotePty('s1', host)
-      expect(state.remoteArgvCalls[0]).toEqual([
-        'tmux',
-        'set-option',
-        '-t',
-        'pewpew-s1',
-        'detach-on-destroy',
-        'on',
-      ])
+      expect(state.remoteArgvCalls[0]).toEqual(['tmux', ...detachOnDestroyArgs('pewpew-s1')])
     })
   })
 })

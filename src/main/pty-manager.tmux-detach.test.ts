@@ -19,30 +19,15 @@
 import { describe, it, expect, beforeEach, afterEach } from 'vitest'
 import { execFileSync } from 'child_process'
 import { unlinkSync } from 'fs'
+import { tmpdir } from 'os'
 import * as pty from 'node-pty'
-import type { IPty } from 'node-pty'
-import { detachOnDestroyArgs } from './pty-manager'
+import { detachOnDestroyArgs, isTmuxAvailable } from './pty-manager'
 
-function tmuxAvailable(): boolean {
-  try {
-    execFileSync('tmux', ['-V'], { stdio: 'pipe' })
-    return true
-  } catch {
-    return false
-  }
-}
-
-const HAS_TMUX = tmuxAvailable()
-
-describe.skipIf(!HAS_TMUX)('detach-on-destroy against a real tmux server', () => {
+describe.skipIf(!isTmuxAvailable())('detach-on-destroy against a real tmux server', () => {
   let socket: string
 
   function tmux(...args: string[]): string {
     return execFileSync('tmux', ['-L', socket, ...args], { encoding: 'utf-8' })
-  }
-
-  function pinDetachOnDestroy(session: string): void {
-    tmux(...detachOnDestroyArgs(session))
   }
 
   async function waitForClientOn(session: string, timeoutMs = 5000): Promise<void> {
@@ -59,16 +44,15 @@ describe.skipIf(!HAS_TMUX)('detach-on-destroy against a real tmux server', () =>
     throw new Error(`no client attached to ${session} within ${timeoutMs}ms`)
   }
 
-  function attach(session: string): { ptyProcess: IPty; exited: Promise<void> } {
+  function attach(session: string): Promise<void> {
     const ptyProcess = pty.spawn('tmux', ['-L', socket, 'attach-session', '-t', session], {
       name: 'xterm-256color',
       cols: 80,
       rows: 24,
     })
-    const exited = new Promise<void>((resolve) => {
+    return new Promise<void>((resolve) => {
       ptyProcess.onExit(() => resolve())
     })
-    return { ptyProcess, exited }
   }
 
   async function exitedWithin(exited: Promise<void>, timeoutMs: number): Promise<boolean> {
@@ -99,14 +83,14 @@ describe.skipIf(!HAS_TMUX)('detach-on-destroy against a real tmux server', () =>
     // tmux doesn't reliably unlink its socket file on kill-server; clean up
     // so throwaway sockets don't pile up in TMPDIR across runs.
     try {
-      unlinkSync(`${process.env.TMPDIR ?? '/tmp'}/tmux-${process.getuid?.() ?? 0}/${socket}`)
+      unlinkSync(`${tmpdir()}/tmux-${process.getuid?.() ?? 0}/${socket}`)
     } catch {
       // Already gone, or never created (e.g. new-session itself failed).
     }
   })
 
   it('client migrates instead of exiting when the hostile global default is left in place', async () => {
-    const { exited } = attach('A')
+    const exited = attach('A')
     await waitForClientOn('A')
 
     tmux('kill-session', '-t', 'A')
@@ -117,8 +101,8 @@ describe.skipIf(!HAS_TMUX)('detach-on-destroy against a real tmux server', () =>
   })
 
   it('client exits when pewpew pins detach-on-destroy on for its own session', async () => {
-    pinDetachOnDestroy('A')
-    const { exited } = attach('A')
+    tmux(...detachOnDestroyArgs('A'))
+    const exited = attach('A')
     await waitForClientOn('A')
 
     tmux('kill-session', '-t', 'A')
