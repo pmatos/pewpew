@@ -9,17 +9,19 @@
 // against a real tmux server — a mocked child_process can't catch a wrong
 // assumption about tmux's own behavior, only a real tmux binary can.
 //
-// Deliberately does not import pty-manager.ts's setDetachOnDestroy: that
-// function is hardwired to TMUX_SOCKET ('pewpew'), which is the name of the
-// user's real, live, persistent tmux server — running this suite against it
-// would create and kill sessions there. Each test gets its own throwaway
-// socket instead, and the set-option argv below is kept byte-for-byte in
-// sync with pty-manager.ts's setDetachOnDestroy.
+// Deliberately does not import pty-manager.ts's setDetachOnDestroy itself:
+// that function is hardwired to TMUX_SOCKET ('pewpew'), which is the name of
+// the user's real, live, persistent tmux server — running this suite against
+// it would create and kill sessions there. Each test gets its own throwaway
+// socket instead, but the exact argv setDetachOnDestroy sends is imported
+// from production (detachOnDestroyArgs) so this test can't silently drift
+// from what pewpew actually runs.
 import { describe, it, expect, beforeEach, afterEach } from 'vitest'
 import { execFileSync } from 'child_process'
 import { unlinkSync } from 'fs'
 import * as pty from 'node-pty'
 import type { IPty } from 'node-pty'
+import { detachOnDestroyArgs } from './pty-manager'
 
 function tmuxAvailable(): boolean {
   try {
@@ -39,9 +41,8 @@ describe.skipIf(!HAS_TMUX)('detach-on-destroy against a real tmux server', () =>
     return execFileSync('tmux', ['-L', socket, ...args], { encoding: 'utf-8' })
   }
 
-  // Mirrors pty-manager.ts's setDetachOnDestroy exactly.
   function pinDetachOnDestroy(session: string): void {
-    tmux('set-option', '-t', session, 'detach-on-destroy', 'on')
+    tmux(...detachOnDestroyArgs(session))
   }
 
   async function waitForClientOn(session: string, timeoutMs = 5000): Promise<void> {

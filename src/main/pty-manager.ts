@@ -182,11 +182,20 @@ function hasSessionOn(socket: TmuxSocket, tmuxSession: string): boolean {
 // so the client silently keeps rendering whatever session it landed on and
 // the dead session's card never updates. Force the option on per-session so
 // pewpew's own tmux clients always exit when their session dies, regardless
-// of the user's tmux.conf. Best effort: a session that's already gone (race)
-// shouldn't block create/attach.
+// of the user's tmux.conf.
+//
+// Exported so pty-manager.tmux-detach.test.ts can run this exact tmux
+// invocation against a real server on its own throwaway socket, proving tmux
+// actually honors it — a hardcoded copy of these args in the test could
+// silently drift from what production sends.
+export function detachOnDestroyArgs(tmuxSession: string): string[] {
+  return ['set-option', '-t', tmuxSession, 'detach-on-destroy', 'on']
+}
+
+// Best effort: a session that's already gone (race) shouldn't block create/attach.
 function setDetachOnDestroy(socket: TmuxSocket, tmuxSession: string): void {
   try {
-    runTmux(socket, ['set-option', '-t', tmuxSession, 'detach-on-destroy', 'on'])
+    runTmux(socket, detachOnDestroyArgs(tmuxSession))
   } catch {
     // Ignore — see comment above.
   }
@@ -194,7 +203,7 @@ function setDetachOnDestroy(socket: TmuxSocket, tmuxSession: string): void {
 
 async function setRemoteDetachOnDestroy(host: Host, tmuxSession: string): Promise<void> {
   try {
-    await execRemote(host, ['tmux', 'set-option', '-t', tmuxSession, 'detach-on-destroy', 'on'])
+    await execRemote(host, ['tmux', ...detachOnDestroyArgs(tmuxSession)])
   } catch {
     // Ignore — see setDetachOnDestroy.
   }

@@ -119,6 +119,7 @@ import {
   discoverTmuxSessions,
   hasTmuxSession,
   reattachPty,
+  reattachRemotePty,
   TMUX_SOCKET,
   __resetSandboxProbeCacheForTesting,
 } from './pty-manager'
@@ -526,5 +527,19 @@ describe('createRemotePty', () => {
     })
     const argv = remoteAgentArgsFromCall(tmuxCall())
     expect(argv).toEqual(buildAgentArgs({ tool: 'omp' }))
+  })
+
+  describe('reattachRemotePty', () => {
+    it('pins detach-on-destroy on for the session before attaching', async () => {
+      await reattachRemotePty('s1', host)
+      expect(state.remoteArgvCalls[0]).toEqual([
+        'tmux',
+        'set-option',
+        '-t',
+        'pewpew-s1',
+        'detach-on-destroy',
+        'on',
+      ])
+    })
   })
 })
