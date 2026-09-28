@@ -21,8 +21,10 @@ export interface SessionRecordInput {
   repoFingerprint?: string
 }
 
+export const TMUX_SESSION_PREFIX = 'pewpew-'
+
 export function tmuxSessionFor(sessionId: string): string {
-  return `pewpew-${sessionId}`
+  return `${TMUX_SESSION_PREFIX}${sessionId}`
 }
 
 // Assemble a freshly-spawned session. This is the single policy site for the
