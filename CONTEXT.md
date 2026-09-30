@@ -37,3 +37,13 @@ exactly once, by whichever of the exit handler or a teardown path runs first. A
 local session holds no lease. A lease that is never handed back keeps the host's
 ControlMaster alive forever, with no error anywhere — which is why placement,
 not a remembered line of code, decides whether one is taken.
+
+## Agent integration
+
+**Agent hook lifecycle** — the per-tool preparation performed before a fresh
+agent process starts. Claude installs worktree-scoped notify hooks;
+Codex stages its hooks, enables the host-wide feature flag, and restores the
+prior file if that step fails; omp needs no project install because its bridge
+is installed on the host and passed on the command line. Local filesystem and
+remote SSH implementations are adapters behind `AgentHookLifecycle`; callers
+state lifecycle intent without coordinating those tool-specific transactions.

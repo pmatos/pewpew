@@ -15,7 +15,8 @@ import {
   type CanvasState,
 } from './config'
 import { scanProjects } from './project-scanner'
-import { installHooks, isSettingsGitignored, migrateLegacyGuardHooks } from './hook-installer'
+import { isSettingsGitignored, migrateLegacyGuardHooks } from './hook-installer'
+import { createLocalAgentHookLifecycle } from './agent-hook-lifecycle'
 import { startHookServer, stopHookServer } from './hook-server'
 import { createTray } from './tray'
 import { registerWindow, broadcastToAll, safeSend } from './window-registry'
@@ -91,6 +92,7 @@ import type {
 } from '../shared/types'
 
 const execFileAsync = promisify(execFile)
+const localAgentHooks = createLocalAgentHookLifecycle()
 
 // Largest untracked file that gets synthesized into the review diff; bigger or
 // binary files are skipped so the review view stays responsive.
@@ -356,7 +358,7 @@ app.whenReady().then(async () => {
   })
 
   ipcMain.handle('projects:setup', async (_event, projectPath: string) => {
-    await installHooks(projectPath)
+    await localAgentHooks.installProjectHooks('claude', projectPath)
   })
 
   ipcMain.handle('projects:create', async (_event, name: string) => {

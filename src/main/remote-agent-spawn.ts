@@ -1,47 +1,8 @@
 import { createRemotePty } from './pty-manager'
 import { expectRemoteOk } from './remote-command'
-import { exec as execRemote } from './host-connection'
-import {
-  installRemoteHooks,
-  installRemoteCodexHooks,
-  ensureRemoteCodexHooksFeatureFlag,
-  rollbackRemoteCodexHooks,
-  commitRemoteCodexHooks,
-} from './hook-installer'
+import { createRemoteAgentHookLifecycle } from './agent-hook-lifecycle'
 import type { AgentTool, Host } from '../shared/types'
 import type { PreparedRemoteHost } from './remote-host-runtime'
-
-// Installs the agent's lifecycle hooks into a remote worktree. Dispatches on the
-// tool: codex snapshots + feature-flags + commits (rolling back on failure), omp
-// is a no-op (its hook bridge is a plain file installed by bootstrapHost), and
-// claude/default merge hooks into the worktree. Kept exported because
-// reviveSession spawns fresh without going through spawnRemoteAgent.
-export async function installRemoteAgentHooks(
-  tool: AgentTool,
-  host: Host,
-  worktreePath: string,
-  notifyScriptPath: string
-): Promise<void> {
-  const remote = (argv: string[], opts?: { timeoutMs?: number }) => execRemote(host, argv, opts)
-  if (tool === 'codex') {
-    const snapshot = await installRemoteCodexHooks(remote, worktreePath, notifyScriptPath)
-    try {
-      await ensureRemoteCodexHooksFeatureFlag(remote)
-    } catch (err) {
-      await rollbackRemoteCodexHooks(remote, snapshot)
-      throw err
-    }
-    await commitRemoteCodexHooks(remote, snapshot)
-    return
-  }
-  if (tool === 'omp') {
-    // omp's hook bridge is installed as a plain file by bootstrapHost (see
-    // ompHookScriptPath) and passed via `--hook <path>` in buildAgentArgs —
-    // no settings/hooks JSON to merge into the remote worktree here.
-    return
-  }
-  await installRemoteHooks(remote, worktreePath, notifyScriptPath)
-}
 
 export interface SpawnRemoteAgentArgs {
   id: string
@@ -79,7 +40,11 @@ export async function spawnRemoteAgent(
       )
     ).trim() || branchFallback
 
-  await installRemoteAgentHooks(tool, host, worktreePath, prepared.notifyScriptPath)
+  const hooks = createRemoteAgentHookLifecycle({
+    host,
+    notifyScriptPath: prepared.notifyScriptPath,
+  })
+  await hooks.installBeforeSpawn(tool, worktreePath)
 
   const sandboxed = await createRemotePty(id, worktreePath, host, {
     tool,
