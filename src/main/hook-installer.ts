@@ -125,22 +125,13 @@ export function stripLegacyGuardHooks(hooks: Record<string, unknown[]>): {
       result[event] = groups
       continue
     }
-    const nextGroups: unknown[] = []
-    let eventChanged = false
-    for (const group of groups) {
-      if (!isMatcherGroup(group) || !group.hooks.some(isLegacyGuardHandler)) {
-        nextGroups.push(group)
-        continue
-      }
-      eventChanged = true
-      const handlers = group.hooks.filter((h) => !isLegacyGuardHandler(h))
-      if (handlers.length > 0) nextGroups.push({ ...group, hooks: handlers })
-    }
-    if (eventChanged) {
+    const next = groups.flatMap((group) => {
+      if (!isMatcherGroup(group) || !group.hooks.some(isLegacyGuardHandler)) return [group]
       changed = true
-      if (nextGroups.length === 0) continue
-    }
-    result[event] = eventChanged ? nextGroups : groups
+      const handlers = group.hooks.filter((h) => !isLegacyGuardHandler(h))
+      return handlers.length > 0 ? [{ ...group, hooks: handlers }] : []
+    })
+    if (next.length > 0 || groups.length === 0) result[event] = next
   }
   return { hooks: result, changed }
 }
@@ -159,14 +150,7 @@ export function removeLegacyGuardFromSettings(projectPath: string): boolean {
   const settingsPath = join(projectPath, '.claude', 'settings.local.json')
   const raw = tryReadFile(settingsPath)
   if (raw === null || !LEGACY_GUARD_RE.test(raw)) return false
-  let parsed: unknown
-  try {
-    parsed = JSON.parse(raw)
-  } catch {
-    return false
-  }
-  if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) return false
-  const settings = parsed as Record<string, unknown>
+  const settings = parseAsObject(raw)
   const { hooks, changed } = stripLegacyGuardHooks(readHooksObject(settings))
   if (!changed) return false
   settings.hooks = hooks
@@ -174,16 +158,14 @@ export function removeLegacyGuardFromSettings(projectPath: string): boolean {
   return true
 }
 
-export function migrateLegacyGuardHooks(paths: Iterable<string>): string[] {
-  const migrated: string[] = []
+export function migrateLegacyGuardHooks(paths: Iterable<string>): void {
   for (const path of new Set(paths)) {
     try {
-      if (removeLegacyGuardFromSettings(path)) migrated.push(path)
+      removeLegacyGuardFromSettings(path)
     } catch (err) {
       console.error(`Failed to remove legacy worktree guard from ${path}`, err)
     }
   }
-  return migrated
 }
 
 export async function installHooks(

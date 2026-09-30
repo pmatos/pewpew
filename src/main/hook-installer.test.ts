@@ -242,7 +242,7 @@ describe('removeLegacyGuardFromSettings / migrateLegacyGuardHooks', () => {
     expect(removeLegacyGuardFromSettings(state.tmpProject)).toBe(false)
   })
 
-  it('migrates existing worktrees in bulk and returns only the ones it changed', async () => {
+  it('migrates existing worktrees in bulk, skipping clean and missing ones', async () => {
     const clean = mkdtempSync(join(tmpdir(), 'codex-clean-'))
     const missing = join(state.tmpProject, 'does-not-exist')
     try {
@@ -250,9 +250,10 @@ describe('removeLegacyGuardFromSettings / migrateLegacyGuardHooks', () => {
       writeSettings(clean, { hooks: { Stop: [] } })
 
       const { migrateLegacyGuardHooks } = await loadInstaller()
-      const migrated = migrateLegacyGuardHooks([state.tmpProject, clean, missing, state.tmpProject])
+      const cleanRaw = readFileSync(settingsPathOf(clean), 'utf-8')
+      migrateLegacyGuardHooks([state.tmpProject, clean, missing, state.tmpProject])
 
-      expect(migrated).toEqual([state.tmpProject])
+      expect(readFileSync(settingsPathOf(clean), 'utf-8')).toBe(cleanRaw)
       expect(readFileSync(settingsPathOf(state.tmpProject), 'utf-8')).not.toContain(
         'worktree-guard'
       )
