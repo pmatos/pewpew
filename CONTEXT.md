@@ -41,7 +41,7 @@ not a remembered line of code, decides whether one is taken.
 ## Agent integration
 
 **Agent hook lifecycle** — the per-tool preparation performed before a fresh
-agent process starts. Claude installs worktree-scoped notify and guard hooks;
+agent process starts. Claude installs worktree-scoped notify hooks;
 Codex stages its hooks, enables the host-wide feature flag, and restores the
 prior file if that step fails; omp needs no project install because its bridge
 is installed on the host and passed on the command line. Local filesystem and

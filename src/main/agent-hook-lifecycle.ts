@@ -77,8 +77,7 @@ export function createRemoteAgentHookLifecycle(context: RemoteHookContext): Agen
     execRemote(context.host, argv, opts)
 
   return createAgentHookLifecycle({
-    installClaude: (path) =>
-      installRemoteHooks(remote, path, context.notifyScriptPath),
+    installClaude: (path) => installRemoteHooks(remote, path, context.notifyScriptPath),
     stageCodex: async (path) => {
       const snapshot = await installRemoteCodexHooks(remote, path, context.notifyScriptPath)
       return {

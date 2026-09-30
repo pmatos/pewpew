@@ -171,11 +171,7 @@ vi.mock('./project-scanner', async (importOriginal) => {
 
 vi.mock('./agent-hook-lifecycle', () => {
   const lifecycle = (location: 'local' | 'remote') => {
-    const install = async (
-      intent: 'before-spawn' | 'project',
-      tool: AgentTool,
-      path: string
-    ) => {
+    const install = async (intent: 'before-spawn' | 'project', tool: AgentTool, path: string) => {
       state.hookInstallCalls.push({ location, intent, tool, path })
       if (state.hookInstallFailure) {
         const error = state.hookInstallFailure
