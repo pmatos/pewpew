@@ -1117,7 +1117,6 @@ export async function reviveSession(id: string): Promise<void> {
         async ({
           agentPaths,
           notifyScriptPath,
-          guardScriptPath,
           ompHookScriptPath,
           remoteSocketPath,
           sandboxAvailable,
@@ -1150,8 +1149,7 @@ export async function reviveSession(id: string): Promise<void> {
                 session.tool,
                 host,
                 session.worktreePath,
-                notifyScriptPath,
-                guardScriptPath
+                notifyScriptPath
               )
             }
             session.sandboxed = await createRemotePty(id, session.worktreePath, host, {
@@ -1201,7 +1199,7 @@ export async function reviveSession(id: string): Promise<void> {
     // config at process start (see the relocateProject comment above), and a
     // session revived here may have been created long before its worktree's
     // settings.local.json last saw an installHooks() call — any hook fix
-    // that landed since (e.g. worktree-guard.sh's /tmp exemption) would
+    // that landed since (e.g. removal of the legacy worktree-guard.sh hook) would
     // otherwise never reach this worktree until it's relocated or recreated.
     if (existsSync(session.worktreePath)) {
       await installAgentHooks(session.tool, session.worktreePath)
@@ -1913,17 +1911,6 @@ export async function relocateProject(
     s.projectName = remap.projectName
     s.worktreePath = remap.worktreePath
     if (fingerprint) s.repoFingerprint = fingerprint
-
-    // worktree-guard.sh bakes the root in as an argv literal at install
-    // time; relocating the project changes that path out from under it, so
-    // the guard's own `cd "$root"` starts failing and denies every write in
-    // the relocated worktree. Reinstall the hook with the fresh worktreePath
-    // BEFORE recreating the PTY below — Claude reads its hook config at
-    // process start, so if the PTY launched first it would run its entire
-    // lifetime against the stale, now-failing guard command.
-    if (s.tool === 'claude' && existsSync(s.worktreePath)) {
-      await installHooks(s.worktreePath, { skipGitignore: true })
-    }
 
     // Recreate PTY so tmux gets the new worktree cwd
     if (hasPty(s.id)) {

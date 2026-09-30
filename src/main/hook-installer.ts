@@ -13,13 +13,11 @@ import { promisify } from 'util'
 import { join } from 'path'
 import { homedir } from 'os'
 import { CONFIG_DIR } from './config'
-import { shellQuote } from './shell-quote'
 import type { ExecResult } from './host-connection'
 
 const execFileAsync = promisify(execFile)
 
 const NOTIFY_SCRIPT = join(CONFIG_DIR, 'hooks', 'notify.sh')
-const GUARD_SCRIPT = join(CONFIG_DIR, 'hooks', 'worktree-guard.sh')
 
 // omp (oh-my-pi) loads its hook bridge directly via the CLI's `--hook <path>`
 // flag rather than a declarative JSON hooks file, so there's no install/merge
@@ -29,32 +27,14 @@ const GUARD_SCRIPT = join(CONFIG_DIR, 'hooks', 'worktree-guard.sh')
 // notify.sh), from the repo's hooks/omp-notify.ts.
 export const OMP_HOOK_SCRIPT = join(CONFIG_DIR, 'hooks', 'omp-notify.ts')
 
-// Claude Code's own sandbox only isolates Bash subprocesses; the built-in
-// Write/Edit/MultiEdit/NotebookEdit tools go through the permission system
-// instead. pewpew runs claude under --permission-mode=auto (see
-// buildAgentArgs in pty-manager.ts) rather than --dangerously-skip-
-// permissions, so that system's own classifier is in the loop — but it's a
-// probabilistic approval mode, not a hard boundary. This PreToolUse hook is
-// the backstop that unconditionally stops an agent from writing outside its
-// session worktree through those tools — see hooks/worktree-guard.sh. It
-// does not cover Bash writes.
-function buildHooks(
-  notifyScript: string,
-  guardScript: string,
-  root: string
-): Record<string, unknown[]> {
+function buildHooks(notifyScript: string): Record<string, unknown[]> {
   const notifyHook = { type: 'command', command: notifyScript }
-  const guardHook = {
-    type: 'command',
-    command: `${shellQuote(guardScript)} ${shellQuote(root)}`,
-  }
   return {
     SessionStart: [{ hooks: [notifyHook] }],
     Stop: [{ hooks: [notifyHook] }],
     PostToolUse: [{ matcher: 'Read|Write|Edit|Bash', hooks: [notifyHook] }],
     SessionEnd: [{ hooks: [notifyHook] }],
     Notification: [{ hooks: [notifyHook] }],
-    PreToolUse: [{ matcher: 'Write|Edit|MultiEdit|NotebookEdit', hooks: [guardHook] }],
   }
 }
 
@@ -67,8 +47,8 @@ function buildCodexHooks(notifyScript: string): Record<string, unknown[]> {
   }
 }
 
-function ccPewpewHookJson(notifyScript: string, guardScript: string, root: string): string {
-  return JSON.stringify(buildHooks(notifyScript, guardScript, root))
+function ccPewpewHookJson(notifyScript: string): string {
+  return JSON.stringify(buildHooks(notifyScript))
 }
 
 function ccPewpewCodexHookJson(notifyScript: string): string {
@@ -114,6 +94,95 @@ function isExternalHook(entry: unknown): boolean {
   return !/pewpew/.test(JSON.stringify(entry))
 }
 
+// Older pewpew versions installed a PreToolUse write guard into each Claude
+// worktree. It is gone, but already-installed settings files still reference
+// it, so every install strips those handlers. Matching is on the script name
+// only: other hooks, including user-added ones under the same event, survive.
+const LEGACY_GUARD_MARKER = 'worktree-guard'
+
+const isLegacyGuardHandler = (handler: unknown): boolean =>
+  JSON.stringify(handler).includes(LEGACY_GUARD_MARKER)
+
+function isMatcherGroup(group: unknown): group is { hooks: unknown[] } {
+  return (
+    typeof group === 'object' &&
+    group !== null &&
+    Array.isArray((group as { hooks?: unknown }).hooks)
+  )
+}
+
+export function stripLegacyGuardHooks(hooks: Record<string, unknown[]>): {
+  hooks: Record<string, unknown[]>
+  changed: boolean
+} {
+  let changed = false
+  const result: Record<string, unknown[]> = {}
+  for (const [event, groups] of Object.entries(hooks)) {
+    if (!Array.isArray(groups)) {
+      result[event] = groups
+      continue
+    }
+    const nextGroups: unknown[] = []
+    let eventChanged = false
+    for (const group of groups) {
+      if (!isMatcherGroup(group) || !group.hooks.some(isLegacyGuardHandler)) {
+        nextGroups.push(group)
+        continue
+      }
+      eventChanged = true
+      const handlers = group.hooks.filter((h) => !isLegacyGuardHandler(h))
+      if (handlers.length > 0) nextGroups.push({ ...group, hooks: handlers })
+    }
+    if (eventChanged) {
+      changed = true
+      if (nextGroups.length === 0) continue
+    }
+    result[event] = eventChanged ? nextGroups : groups
+  }
+  return { hooks: result, changed }
+}
+
+function readHooksObject(existing: Record<string, unknown>): Record<string, unknown[]> {
+  const hooks = existing.hooks
+  return hooks && typeof hooks === 'object' && !Array.isArray(hooks)
+    ? (hooks as Record<string, unknown[]>)
+    : {}
+}
+
+// Removes legacy guard handlers from an existing settings.local.json without
+// touching anything else. Returns whether the file was rewritten; a file that
+// has no guard entry (or is absent/unparseable) is left byte-for-byte alone.
+export function removeLegacyGuardFromSettings(projectPath: string): boolean {
+  const settingsPath = join(projectPath, '.claude', 'settings.local.json')
+  const raw = tryReadFile(settingsPath)
+  if (raw === null || !raw.includes(LEGACY_GUARD_MARKER)) return false
+  let parsed: unknown
+  try {
+    parsed = JSON.parse(raw)
+  } catch {
+    return false
+  }
+  if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) return false
+  const settings = parsed as Record<string, unknown>
+  const { hooks, changed } = stripLegacyGuardHooks(readHooksObject(settings))
+  if (!changed) return false
+  settings.hooks = hooks
+  writeFileSync(settingsPath, JSON.stringify(settings, null, 2))
+  return true
+}
+
+export function migrateLegacyGuardHooks(paths: Iterable<string>): string[] {
+  const migrated: string[] = []
+  for (const path of new Set(paths)) {
+    try {
+      if (removeLegacyGuardFromSettings(path)) migrated.push(path)
+    } catch (err) {
+      console.error(`Failed to remove legacy worktree guard from ${path}`, err)
+    }
+  }
+  return migrated
+}
+
 export async function installHooks(
   projectPath: string,
   { skipGitignore = false }: { skipGitignore?: boolean } = {}
@@ -126,8 +195,8 @@ export async function installHooks(
   const raw = tryReadFile(settingsPath)
   const existing: Record<string, unknown> = raw === null ? {} : parseAsObject(raw)
 
-  const newHooks = buildHooks(NOTIFY_SCRIPT, GUARD_SCRIPT, projectPath)
-  const existingHooks = (existing.hooks || {}) as Record<string, unknown[]>
+  const newHooks = buildHooks(NOTIFY_SCRIPT)
+  const existingHooks = stripLegacyGuardHooks(readHooksObject(existing)).hooks
   const merged: Record<string, unknown[]> = { ...existingHooks }
 
   for (const [event, entries] of Object.entries(newHooks)) {
@@ -136,20 +205,27 @@ export async function installHooks(
   }
 
   existing.hooks = merged
-  writeFileSync(settingsPath, JSON.stringify(existing, null, 2))
+  const next = JSON.stringify(existing, null, 2)
+  if (next !== raw) writeFileSync(settingsPath, next)
 
   if (!skipGitignore) {
     ensureGitignore(projectPath, '.claude/settings.local.json')
   }
 }
 
+const REMOTE_STRIP_LEGACY_GUARD_JQ =
+  '  def isguard: (tostring | contains("worktree-guard"));\n' +
+  '  def hasguard: (type == "object" and (.hooks | type) == "array" and (.hooks | map(isguard) | any));\n' +
+  '  def stripgroup: if hasguard then (.hooks |= map(select(isguard | not))) | (if (.hooks | length) == 0 then empty else . end) else . end;\n' +
+  '  def stripevent: if type == "array" and (map(hasguard) | any) then map(stripgroup) else . end;\n' +
+  '  def stripall: if type == "object" then with_entries(.value as $v | .value |= stripevent | if ((.value | type) == "array" and (.value | length) == 0 and ($v | type) == "array" and ($v | length) > 0) then empty else . end) else . end;\n'
+
 export async function installRemoteHooks(
   execRemote: (argv: string[], opts?: { timeoutMs?: number }) => Promise<ExecResult>,
   worktreePath: string,
-  notifyScriptPath: string,
-  guardScriptPath: string
+  notifyScriptPath: string
 ): Promise<void> {
-  const hooksJson = ccPewpewHookJson(notifyScriptPath, guardScriptPath, worktreePath)
+  const hooksJson = ccPewpewHookJson(notifyScriptPath)
   const script =
     'set -e\n' +
     'claude_dir="$1/.claude"\n' +
@@ -157,12 +233,13 @@ export async function installRemoteHooks(
     'mkdir -p "$claude_dir"\n' +
     'if [ -s "$settings" ]; then cat "$settings"; else printf "{}"; fi |\n' +
     'jq --argjson newHooks "$2" \'\n' +
-    '  .hooks = (.hooks // {}) |\n' +
+    REMOTE_STRIP_LEGACY_GUARD_JQ +
+    '  .hooks = ((.hooks // {}) | stripall) |\n' +
     '  reduce ($newHooks | keys[]) as $k (.;\n' +
     '    .hooks[$k] = (((.hooks[$k] // []) | map(select(((. | tostring) | contains("pewpew")) | not))) + $newHooks[$k])\n' +
     '  )\n' +
     '\' > "$settings.tmp"\n' +
-    'mv "$settings.tmp" "$settings"\n'
+    'if [ -f "$settings" ] && cmp -s "$settings.tmp" "$settings"; then rm -f "$settings.tmp"; else mv "$settings.tmp" "$settings"; fi\n'
   const result = await execRemote(['sh', '-c', script, '_', worktreePath, hooksJson], {
     timeoutMs: 15000,
   })

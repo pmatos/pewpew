@@ -10,6 +10,7 @@ import {
   statSync,
   symlinkSync,
   lstatSync,
+  utimesSync,
 } from 'fs'
 import { execFileSync, execFile } from 'child_process'
 import { tmpdir } from 'os'
@@ -63,71 +64,192 @@ async function execLocally(argv: string[]) {
   }
 }
 
+const LEGACY_GUARD_COMMAND = "'/home/dev/.config/pewpew/hooks/worktree-guard.sh' '/home/dev/proj'"
+const LEGACY_GUARD_GROUP = {
+  matcher: 'Write|Edit|MultiEdit|NotebookEdit',
+  hooks: [{ type: 'command', command: LEGACY_GUARD_COMMAND }],
+}
+const USER_PRE_TOOL_GROUP = {
+  matcher: 'Bash',
+  hooks: [{ type: 'command', command: '/usr/local/bin/other-guard.sh' }],
+}
+
+type HookGroup = { matcher?: string; hooks: Array<{ command: string }> }
+type SettingsJson = { hooks: Record<string, HookGroup[]> }
+
+function settingsPathOf(root: string): string {
+  return join(root, '.claude', 'settings.local.json')
+}
+
+function writeSettings(root: string, settings: unknown, raw?: string): void {
+  mkdirSync(join(root, '.claude'), { recursive: true })
+  writeFileSync(settingsPathOf(root), raw ?? JSON.stringify(settings))
+}
+
+function readSettings(root: string): SettingsJson {
+  return JSON.parse(readFileSync(settingsPathOf(root), 'utf-8')) as SettingsJson
+}
+
+function ageFile(path: string): number {
+  const old = new Date('2020-01-01T00:00:00Z')
+  utimesSync(path, old, old)
+  return statSync(path).mtimeMs
+}
+
+const legacySettings = () => ({
+  permissions: { allow: ['Bash(ls)'] },
+  hooks: {
+    PreToolUse: [USER_PRE_TOOL_GROUP, LEGACY_GUARD_GROUP],
+    Stop: [
+      { hooks: [{ type: 'command', command: '/home/dev/.config/pewpew/hooks/notify.sh' }] },
+      { hooks: [{ type: 'command', command: '/usr/local/bin/user-stop.sh' }] },
+    ],
+  },
+})
+
 describe('installHooks (Claude)', () => {
-  it('writes .claude/settings.local.json with a PreToolUse guard entry scoped to the project root', async () => {
+  it('installs notify hooks only — no PreToolUse guard on a fresh install', async () => {
     const { installHooks } = await loadInstaller()
     await installHooks(state.tmpProject, { skipGitignore: true })
 
-    const json = JSON.parse(
-      readFileSync(join(state.tmpProject, '.claude', 'settings.local.json'), 'utf-8')
-    ) as {
-      hooks: Record<string, Array<{ matcher?: string; hooks: Array<{ command: string }> }>>
-    }
-
-    expect(json.hooks.PostToolUse).toHaveLength(1)
-    expect(json.hooks.PreToolUse).toHaveLength(1)
-    expect(json.hooks.PreToolUse[0].matcher).toBe('Write|Edit|MultiEdit|NotebookEdit')
-    const guardCommand = json.hooks.PreToolUse[0].hooks[0].command
-    expect(guardCommand).toContain('worktree-guard.sh')
-    expect(guardCommand).toContain(state.tmpProject)
-  })
-
-  it('replaces a stale guard entry (different root) on re-install rather than duplicating it', async () => {
-    const { installHooks } = await loadInstaller()
-    await installHooks(state.tmpProject, { skipGitignore: true })
-    await installHooks(state.tmpProject, { skipGitignore: true })
-
-    const json = JSON.parse(
-      readFileSync(join(state.tmpProject, '.claude', 'settings.local.json'), 'utf-8')
-    ) as { hooks: Record<string, unknown[]> }
-
-    expect(json.hooks.PreToolUse).toHaveLength(1)
-    expect(json.hooks.SessionStart).toHaveLength(1)
-  })
-
-  it('preserves an existing non-pewpew PreToolUse hook when merging', async () => {
-    const claudeDir = join(state.tmpProject, '.claude')
-    mkdirSync(claudeDir, { recursive: true })
-    writeFileSync(
-      join(claudeDir, 'settings.local.json'),
-      JSON.stringify({
-        hooks: {
-          PreToolUse: [
-            {
-              matcher: 'Bash',
-              hooks: [{ type: 'command', command: '/usr/local/bin/other-guard.sh' }],
-            },
-          ],
-        },
-      })
+    const raw = readFileSync(settingsPathOf(state.tmpProject), 'utf-8')
+    const json = JSON.parse(raw) as SettingsJson
+    expect(Object.keys(json.hooks).sort()).toEqual(
+      ['Notification', 'PostToolUse', 'SessionEnd', 'SessionStart', 'Stop'].sort()
     )
+    expect(json.hooks.PostToolUse).toHaveLength(1)
+    expect(raw).not.toContain('worktree-guard')
+  })
+
+  it('strips a pre-existing guard on upgrade and preserves every other hook', async () => {
+    writeSettings(state.tmpProject, legacySettings())
 
     const { installHooks } = await loadInstaller()
     await installHooks(state.tmpProject, { skipGitignore: true })
 
-    const json = JSON.parse(
-      readFileSync(join(state.tmpProject, '.claude', 'settings.local.json'), 'utf-8')
-    ) as { hooks: Record<string, Array<{ hooks: Array<{ command: string }> }>> }
+    const raw = readFileSync(settingsPathOf(state.tmpProject), 'utf-8')
+    const json = JSON.parse(raw) as SettingsJson & { permissions: unknown }
+    expect(raw).not.toContain('worktree-guard')
+    expect(json.permissions).toEqual({ allow: ['Bash(ls)'] })
+    expect(json.hooks.PreToolUse).toEqual([USER_PRE_TOOL_GROUP])
+    const stopCommands = json.hooks.Stop.map((g) => g.hooks[0].command)
+    expect(stopCommands).toContain('/usr/local/bin/user-stop.sh')
+    expect(stopCommands.filter((c) => c.endsWith('notify.sh'))).toHaveLength(1)
+  })
 
-    expect(json.hooks.PreToolUse).toHaveLength(2)
-    const commands = json.hooks.PreToolUse.map((g) => g.hooks[0].command)
-    expect(commands).toContain('/usr/local/bin/other-guard.sh')
-    expect(commands.some((c) => c.includes('worktree-guard.sh'))).toBe(true)
+  it('drops the PreToolUse key when the guard was its only entry', async () => {
+    writeSettings(state.tmpProject, { hooks: { PreToolUse: [LEGACY_GUARD_GROUP] } })
+
+    const { installHooks } = await loadInstaller()
+    await installHooks(state.tmpProject, { skipGitignore: true })
+
+    expect(readSettings(state.tmpProject).hooks).not.toHaveProperty('PreToolUse')
+  })
+
+  it('keeps a user handler that shares a matcher group with the guard', async () => {
+    writeSettings(state.tmpProject, {
+      hooks: {
+        PreToolUse: [
+          {
+            matcher: 'Write',
+            hooks: [
+              { type: 'command', command: LEGACY_GUARD_COMMAND },
+              { type: 'command', command: '/usr/local/bin/lint-write.sh' },
+            ],
+          },
+        ],
+      },
+    })
+
+    const { installHooks } = await loadInstaller()
+    await installHooks(state.tmpProject, { skipGitignore: true })
+
+    expect(readSettings(state.tmpProject).hooks.PreToolUse).toEqual([
+      {
+        matcher: 'Write',
+        hooks: [{ type: 'command', command: '/usr/local/bin/lint-write.sh' }],
+      },
+    ])
+  })
+
+  it('is idempotent: a second install leaves the file untouched', async () => {
+    writeSettings(state.tmpProject, legacySettings())
+
+    const { installHooks } = await loadInstaller()
+    await installHooks(state.tmpProject, { skipGitignore: true })
+    const afterFirst = readFileSync(settingsPathOf(state.tmpProject), 'utf-8')
+    const mtime = ageFile(settingsPathOf(state.tmpProject))
+
+    await installHooks(state.tmpProject, { skipGitignore: true })
+
+    expect(readFileSync(settingsPathOf(state.tmpProject), 'utf-8')).toBe(afterFirst)
+    expect(statSync(settingsPathOf(state.tmpProject)).mtimeMs).toBe(mtime)
+  })
+})
+
+describe('removeLegacyGuardFromSettings / migrateLegacyGuardHooks', () => {
+  it('removes only guard entries and reports the rewrite once', async () => {
+    writeSettings(state.tmpProject, legacySettings())
+
+    const { removeLegacyGuardFromSettings } = await loadInstaller()
+    expect(removeLegacyGuardFromSettings(state.tmpProject)).toBe(true)
+
+    const json = readSettings(state.tmpProject)
+    expect(json.hooks.PreToolUse).toEqual([USER_PRE_TOOL_GROUP])
+    expect(json.hooks.Stop).toHaveLength(2)
+
+    const mtime = ageFile(settingsPathOf(state.tmpProject))
+    expect(removeLegacyGuardFromSettings(state.tmpProject)).toBe(false)
+    expect(statSync(settingsPathOf(state.tmpProject)).mtimeMs).toBe(mtime)
+  })
+
+  it('does not rewrite a file that has no guard entry, even if oddly formatted', async () => {
+    const raw = '{"hooks":{"Stop":[{"hooks":[{"type":"command","command":"/x/notify.sh"}]}]}}'
+    writeSettings(state.tmpProject, undefined, raw)
+    const mtime = ageFile(settingsPathOf(state.tmpProject))
+
+    const { removeLegacyGuardFromSettings } = await loadInstaller()
+    expect(removeLegacyGuardFromSettings(state.tmpProject)).toBe(false)
+
+    expect(readFileSync(settingsPathOf(state.tmpProject), 'utf-8')).toBe(raw)
+    expect(statSync(settingsPathOf(state.tmpProject)).mtimeMs).toBe(mtime)
+  })
+
+  it('ignores absent, malformed, and non-object settings files', async () => {
+    const { removeLegacyGuardFromSettings } = await loadInstaller()
+    expect(removeLegacyGuardFromSettings(state.tmpProject)).toBe(false)
+
+    writeSettings(state.tmpProject, undefined, '{ worktree-guard not json')
+    expect(removeLegacyGuardFromSettings(state.tmpProject)).toBe(false)
+
+    writeSettings(state.tmpProject, undefined, '["worktree-guard"]')
+    expect(removeLegacyGuardFromSettings(state.tmpProject)).toBe(false)
+  })
+
+  it('migrates existing worktrees in bulk and returns only the ones it changed', async () => {
+    const clean = mkdtempSync(join(tmpdir(), 'codex-clean-'))
+    const missing = join(state.tmpProject, 'does-not-exist')
+    try {
+      writeSettings(state.tmpProject, legacySettings())
+      writeSettings(clean, { hooks: { Stop: [] } })
+
+      const { migrateLegacyGuardHooks } = await loadInstaller()
+      const migrated = migrateLegacyGuardHooks([state.tmpProject, clean, missing, state.tmpProject])
+
+      expect(migrated).toEqual([state.tmpProject])
+      expect(readFileSync(settingsPathOf(state.tmpProject), 'utf-8')).not.toContain(
+        'worktree-guard'
+      )
+    } finally {
+      rmSync(clean, { recursive: true, force: true })
+    }
   })
 })
 
 describe('installRemoteHooks', () => {
-  it('merges a PreToolUse guard entry scoped to the remote worktree path', async () => {
+  const NOTIFY = '/home/dev/.config/pewpew/hooks/notify-v1.sh'
+
+  it('sends notify hooks only — no PreToolUse guard entry', async () => {
     let hooksJsonArg = ''
     const execRemote = vi.fn(async (argv: string[]) => {
       hooksJsonArg = argv[argv.length - 1]
@@ -135,21 +257,11 @@ describe('installRemoteHooks', () => {
     })
 
     const { installRemoteHooks } = await loadInstaller()
-    await installRemoteHooks(
-      execRemote,
-      '/home/dev/project/.claude/worktrees/wt1',
-      '/home/dev/.config/pewpew/hooks/notify-v1.sh',
-      '/home/dev/.config/pewpew/hooks/worktree-guard-v1.sh'
-    )
+    await installRemoteHooks(execRemote, '/home/dev/project/.claude/worktrees/wt1', NOTIFY)
 
-    const hooks = JSON.parse(hooksJsonArg) as {
-      PreToolUse: Array<{ matcher?: string; hooks: Array<{ command: string }> }>
-    }
-    expect(hooks.PreToolUse).toHaveLength(1)
-    expect(hooks.PreToolUse[0].matcher).toBe('Write|Edit|MultiEdit|NotebookEdit')
-    const command = hooks.PreToolUse[0].hooks[0].command
-    expect(command).toContain('/home/dev/.config/pewpew/hooks/worktree-guard-v1.sh')
-    expect(command).toContain('/home/dev/project/.claude/worktrees/wt1')
+    const hooks = JSON.parse(hooksJsonArg) as Record<string, unknown>
+    expect(hooks).not.toHaveProperty('PreToolUse')
+    expect(hooksJsonArg).not.toContain('worktree-guard')
   })
 
   it('throws when the remote merge command fails', async () => {
@@ -161,9 +273,96 @@ describe('installRemoteHooks', () => {
     }))
 
     const { installRemoteHooks } = await loadInstaller()
-    await expect(installRemoteHooks(execRemote, '/wt', '/notify.sh', '/guard.sh')).rejects.toThrow(
+    await expect(installRemoteHooks(execRemote, '/wt', '/notify.sh')).rejects.toThrow(
       'jq: command not found'
     )
+  })
+
+  describe('with the merge script executed by a local sh + jq', () => {
+    const execScript = async (argv: string[]) => {
+      try {
+        const stdout = execFileSync(argv[0], argv.slice(1), { encoding: 'utf-8' })
+        return { stdout, stderr: '', code: 0, timedOut: false }
+      } catch (err) {
+        const failure = err as { stderr?: Buffer | string; status?: number }
+        return {
+          stdout: '',
+          stderr: failure.stderr?.toString() ?? '',
+          code: failure.status ?? 1,
+          timedOut: false,
+        }
+      }
+    }
+
+    it('installs notify hooks into a fresh worktree', async () => {
+      const { installRemoteHooks } = await loadInstaller()
+      await installRemoteHooks(execScript, state.tmpProject, NOTIFY)
+
+      const raw = readFileSync(settingsPathOf(state.tmpProject), 'utf-8')
+      const json = JSON.parse(raw) as SettingsJson
+      expect(Object.keys(json.hooks).sort()).toEqual(
+        ['Notification', 'PostToolUse', 'SessionEnd', 'SessionStart', 'Stop'].sort()
+      )
+      expect(raw).not.toContain('worktree-guard')
+    })
+
+    it('strips a pre-existing guard, preserves other hooks, and is idempotent', async () => {
+      writeSettings(state.tmpProject, legacySettings())
+
+      const { installRemoteHooks } = await loadInstaller()
+      await installRemoteHooks(execScript, state.tmpProject, NOTIFY)
+
+      const raw = readFileSync(settingsPathOf(state.tmpProject), 'utf-8')
+      const json = JSON.parse(raw) as SettingsJson & { permissions: unknown }
+      expect(raw).not.toContain('worktree-guard')
+      expect(json.permissions).toEqual({ allow: ['Bash(ls)'] })
+      expect(json.hooks.PreToolUse).toEqual([USER_PRE_TOOL_GROUP])
+      const stopCommands = json.hooks.Stop.map((g) => g.hooks[0].command)
+      expect(stopCommands).toContain('/usr/local/bin/user-stop.sh')
+      expect(stopCommands.filter((c) => c === NOTIFY)).toHaveLength(1)
+      expect(stopCommands.filter((c) => c.endsWith('notify.sh'))).toHaveLength(0)
+
+      const mtime = ageFile(settingsPathOf(state.tmpProject))
+      await installRemoteHooks(execScript, state.tmpProject, NOTIFY)
+      expect(readFileSync(settingsPathOf(state.tmpProject), 'utf-8')).toBe(raw)
+      expect(statSync(settingsPathOf(state.tmpProject)).mtimeMs).toBe(mtime)
+      expect(existsSync(`${settingsPathOf(state.tmpProject)}.tmp`)).toBe(false)
+    })
+
+    it('drops the PreToolUse key when the guard was its only entry', async () => {
+      writeSettings(state.tmpProject, { hooks: { PreToolUse: [LEGACY_GUARD_GROUP] } })
+
+      const { installRemoteHooks } = await loadInstaller()
+      await installRemoteHooks(execScript, state.tmpProject, NOTIFY)
+
+      expect(readSettings(state.tmpProject).hooks).not.toHaveProperty('PreToolUse')
+    })
+
+    it('keeps a user handler that shares a matcher group with the guard', async () => {
+      writeSettings(state.tmpProject, {
+        hooks: {
+          PreToolUse: [
+            {
+              matcher: 'Write',
+              hooks: [
+                { type: 'command', command: LEGACY_GUARD_COMMAND },
+                { type: 'command', command: '/usr/local/bin/lint-write.sh' },
+              ],
+            },
+          ],
+        },
+      })
+
+      const { installRemoteHooks } = await loadInstaller()
+      await installRemoteHooks(execScript, state.tmpProject, NOTIFY)
+
+      expect(readSettings(state.tmpProject).hooks.PreToolUse).toEqual([
+        {
+          matcher: 'Write',
+          hooks: [{ type: 'command', command: '/usr/local/bin/lint-write.sh' }],
+        },
+      ])
+    })
   })
 })
 

@@ -18,7 +18,6 @@ import type { Host, ToastEvent } from '../shared/types'
 
 export interface PreparedRemoteHost {
   notifyScriptPath: string
-  guardScriptPath: string
   ompHookScriptPath: string
   remoteSocketPath: string
   sandboxAvailable: boolean
@@ -140,15 +139,13 @@ export function createRemoteHostRuntime(deps: RemoteHostRuntimeDeps): RemoteHost
           title: `${label}: sandbox unavailable`,
           detail:
             'bwrap is unavailable or unable to create the required sandbox on this ' +
-            'host, so sessions run without worktree containment for Bash commands. ' +
-            'Claude sessions still block file-tool writes outside the worktree via ' +
-            'the guard hook; Codex and omp sessions run without that guard.',
+            'host, so Codex and omp sessions run without worktree containment. ' +
+            'Claude sessions are governed by auto mode, not the sandbox.',
           hostLabel: label,
         })
       }
       return {
         notifyScriptPath: bootstrap.notifyScriptPath,
-        guardScriptPath: bootstrap.guardScriptPath,
         ompHookScriptPath: bootstrap.ompHookScriptPath,
         remoteSocketPath,
         sandboxAvailable: bootstrap.sandboxAvailable,

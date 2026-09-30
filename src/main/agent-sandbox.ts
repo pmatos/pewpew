@@ -4,8 +4,8 @@
 // and-sandbox / --auto-approve), so pewpew owns this write boundary itself at
 // the tmux spawn layer instead. claude does NOT go through this module — it
 // runs under --permission-mode=auto instead (see buildAgentArgs in
-// pty-manager.ts), relying on that mode's own approval gating plus the
-// worktree guard hook (host-bootstrap.ts) rather than an OS-level sandbox.
+// pty-manager.ts), relying on that mode's own approval gating rather than an
+// OS-level sandbox.
 // Kept free of fs/child_process so bind order (see below) can be asserted
 // directly in unit tests.
 //
@@ -71,9 +71,10 @@
 //   11. --bind <worktree> <worktree>       the session's own worktree, r/w
 //   12. --ro-bind-try <worktree>/.claude/settings.local.json  close the one
 //      file back up: without this, Bash inside the sandbox (which the worktree
-//      bind at step 11 left read-write) could overwrite its own guard-hook
-//      settings and disarm the PreToolUse guard for the next session. -try
-//      because the file may not exist yet on a session's first ever spawn.
+//      bind at step 11 left read-write) could plant hooks in the worktree's
+//      Claude settings that a later, unsandboxed Claude session would run.
+//      -try because the file may not exist yet on a session's first ever
+//      spawn.
 //   13. --chdir <worktree> --              land in the worktree; `--`
 //      separates bwrap's own options from the command to run inside it
 //

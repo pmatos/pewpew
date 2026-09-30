@@ -1,6 +1,6 @@
 import { app, BrowserWindow, ipcMain, shell, dialog } from 'electron'
 import { join, resolve } from 'path'
-import { copyFileSync, mkdirSync, chmodSync } from 'fs'
+import { copyFileSync, mkdirSync, chmodSync, rmSync } from 'fs'
 import { execFile } from 'child_process'
 import { promisify } from 'util'
 import {
@@ -15,7 +15,7 @@ import {
   type CanvasState,
 } from './config'
 import { scanProjects } from './project-scanner'
-import { installHooks, isSettingsGitignored } from './hook-installer'
+import { installHooks, isSettingsGitignored, migrateLegacyGuardHooks } from './hook-installer'
 import { startHookServer, stopHookServer } from './hook-server'
 import { createTray } from './tray'
 import { registerWindow, broadcastToAll, safeSend } from './window-registry'
@@ -170,12 +170,11 @@ app.commandLine.appendSwitch('force-device-scale-factor', uiScale.toString())
 function installBundledHookScripts(): void {
   const hooksDir = join(CONFIG_DIR, 'hooks')
   mkdirSync(hooksDir, { recursive: true })
-  for (const name of ['notify.sh', 'worktree-guard.sh']) {
-    const src = join(__dirname, '../../hooks', name)
-    const dest = join(hooksDir, name)
-    copyFileSync(src, dest)
-    chmodSync(dest, 0o755)
-  }
+  const notifySrc = join(__dirname, '../../hooks/notify.sh')
+  const notifyDest = join(hooksDir, 'notify.sh')
+  copyFileSync(notifySrc, notifyDest)
+  chmodSync(notifyDest, 0o755)
+  rmSync(join(hooksDir, 'worktree-guard.sh'), { force: true })
 
   // omp's hook bridge — see OMP_HOOK_SCRIPT in hook-installer.ts. Just a file
   // copy: omp loads it directly via `--hook <path>`, no settings merge needed.
@@ -827,6 +826,9 @@ app.whenReady().then(async () => {
   createTray()
   initPtyManager()
   restoreSessions()
+  migrateLegacyGuardHooks(
+    getSessions().flatMap((s) => (s.hostId ? [] : [s.worktreePath, s.projectPath]))
+  )
 
   // Periodic text thumbnail capture from tmux.
   // Also snapshots `lastKnownState` from every live PTY buffer (local + remote)
