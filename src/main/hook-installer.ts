@@ -98,10 +98,13 @@ function isExternalHook(entry: unknown): boolean {
 // worktree. It is gone, but already-installed settings files still reference
 // it, so every install strips those handlers. Matching is on the script name
 // only: other hooks, including user-added ones under the same event, survive.
-const LEGACY_GUARD_MARKER = 'worktree-guard'
+const LEGACY_GUARD_PATTERN = 'worktree-guard(-v[0-9]+)?\\.sh'
+const LEGACY_GUARD_RE = new RegExp(LEGACY_GUARD_PATTERN)
 
-const isLegacyGuardHandler = (handler: unknown): boolean =>
-  JSON.stringify(handler).includes(LEGACY_GUARD_MARKER)
+const isLegacyGuardHandler = (handler: unknown): boolean => {
+  const command = (handler as { command?: unknown } | null)?.command
+  return typeof command === 'string' && LEGACY_GUARD_RE.test(command)
+}
 
 function isMatcherGroup(group: unknown): group is { hooks: unknown[] } {
   return (
@@ -155,7 +158,7 @@ function readHooksObject(existing: Record<string, unknown>): Record<string, unkn
 export function removeLegacyGuardFromSettings(projectPath: string): boolean {
   const settingsPath = join(projectPath, '.claude', 'settings.local.json')
   const raw = tryReadFile(settingsPath)
-  if (raw === null || !raw.includes(LEGACY_GUARD_MARKER)) return false
+  if (raw === null || !LEGACY_GUARD_RE.test(raw)) return false
   let parsed: unknown
   try {
     parsed = JSON.parse(raw)
@@ -167,7 +170,7 @@ export function removeLegacyGuardFromSettings(projectPath: string): boolean {
   const { hooks, changed } = stripLegacyGuardHooks(readHooksObject(settings))
   if (!changed) return false
   settings.hooks = hooks
-  writeFileSync(settingsPath, JSON.stringify(settings, null, 2))
+  atomicWrite(settingsPath, JSON.stringify(settings, null, 2))
   return true
 }
 
@@ -206,7 +209,7 @@ export async function installHooks(
 
   existing.hooks = merged
   const next = JSON.stringify(existing, null, 2)
-  if (next !== raw) writeFileSync(settingsPath, next)
+  if (next !== raw) atomicWrite(settingsPath, next)
 
   if (!skipGitignore) {
     ensureGitignore(projectPath, '.claude/settings.local.json')
@@ -214,7 +217,7 @@ export async function installHooks(
 }
 
 const REMOTE_STRIP_LEGACY_GUARD_JQ =
-  '  def isguard: (tostring | contains("worktree-guard"));\n' +
+  `  def isguard: ((.command? // "") | tostring | test("${LEGACY_GUARD_PATTERN.replace(/\\/g, '\\\\')}"));\n` +
   '  def hasguard: (type == "object" and (.hooks | type) == "array" and (.hooks | map(isguard) | any));\n' +
   '  def stripgroup: if hasguard then (.hooks |= map(select(isguard | not))) | (if (.hooks | length) == 0 then empty else . end) else . end;\n' +
   '  def stripevent: if type == "array" and (map(hasguard) | any) then map(stripgroup) else . end;\n' +

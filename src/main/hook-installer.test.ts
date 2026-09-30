@@ -69,6 +69,10 @@ const LEGACY_GUARD_GROUP = {
   matcher: 'Write|Edit|MultiEdit|NotebookEdit',
   hooks: [{ type: 'command', command: LEGACY_GUARD_COMMAND }],
 }
+const LOOKALIKE_GROUP = {
+  matcher: 'Bash',
+  hooks: [{ type: 'command', command: 'cd ~/dev/worktree-guard && ./check.sh' }],
+}
 const USER_PRE_TOOL_GROUP = {
   matcher: 'Bash',
   hooks: [{ type: 'command', command: '/usr/local/bin/other-guard.sh' }],
@@ -170,6 +174,18 @@ describe('installHooks (Claude)', () => {
         hooks: [{ type: 'command', command: '/usr/local/bin/lint-write.sh' }],
       },
     ])
+  })
+
+  it('does not touch a user hook that merely mentions worktree-guard', async () => {
+    writeSettings(state.tmpProject, {
+      hooks: { PreToolUse: [LOOKALIKE_GROUP, LEGACY_GUARD_GROUP] },
+    })
+
+    const { installHooks } = await loadInstaller()
+    await installHooks(state.tmpProject, { skipGitignore: true })
+
+    expect(readSettings(state.tmpProject).hooks.PreToolUse).toEqual([LOOKALIKE_GROUP])
+    expect(existsSync(`${settingsPathOf(state.tmpProject)}.tmp`)).toBe(false)
   })
 
   it('is idempotent: a second install leaves the file untouched', async () => {
@@ -327,6 +343,17 @@ describe('installRemoteHooks', () => {
       expect(readFileSync(settingsPathOf(state.tmpProject), 'utf-8')).toBe(raw)
       expect(statSync(settingsPathOf(state.tmpProject)).mtimeMs).toBe(mtime)
       expect(existsSync(`${settingsPathOf(state.tmpProject)}.tmp`)).toBe(false)
+    })
+
+    it('does not touch a user hook that merely mentions worktree-guard', async () => {
+      writeSettings(state.tmpProject, {
+        hooks: { PreToolUse: [LOOKALIKE_GROUP, LEGACY_GUARD_GROUP] },
+      })
+
+      const { installRemoteHooks } = await loadInstaller()
+      await installRemoteHooks(execScript, state.tmpProject, NOTIFY)
+
+      expect(readSettings(state.tmpProject).hooks.PreToolUse).toEqual([LOOKALIKE_GROUP])
     })
 
     it('drops the PreToolUse key when the guard was its only entry', async () => {

@@ -174,7 +174,6 @@ function installBundledHookScripts(): void {
   const notifyDest = join(hooksDir, 'notify.sh')
   copyFileSync(notifySrc, notifyDest)
   chmodSync(notifyDest, 0o755)
-  rmSync(join(hooksDir, 'worktree-guard.sh'), { force: true })
 
   // omp's hook bridge — see OMP_HOOK_SCRIPT in hook-installer.ts. Just a file
   // copy: omp loads it directly via `--hook <path>`, no settings merge needed.
@@ -829,6 +828,7 @@ app.whenReady().then(async () => {
   migrateLegacyGuardHooks(
     getSessions().flatMap((s) => (s.hostId ? [] : [s.worktreePath, s.projectPath]))
   )
+  rmSync(join(CONFIG_DIR, 'hooks', 'worktree-guard.sh'), { force: true })
 
   // Periodic text thumbnail capture from tmux.
   // Also snapshots `lastKnownState` from every live PTY buffer (local + remote)
