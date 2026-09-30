@@ -20,8 +20,7 @@ export async function installRemoteAgentHooks(
   tool: AgentTool,
   host: Host,
   worktreePath: string,
-  notifyScriptPath: string,
-  guardScriptPath: string
+  notifyScriptPath: string
 ): Promise<void> {
   const remote = (argv: string[], opts?: { timeoutMs?: number }) => execRemote(host, argv, opts)
   if (tool === 'codex') {
@@ -41,7 +40,7 @@ export async function installRemoteAgentHooks(
     // no settings/hooks JSON to merge into the remote worktree here.
     return
   }
-  await installRemoteHooks(remote, worktreePath, notifyScriptPath, guardScriptPath)
+  await installRemoteHooks(remote, worktreePath, notifyScriptPath)
 }
 
 export interface SpawnRemoteAgentArgs {
@@ -80,13 +79,7 @@ export async function spawnRemoteAgent(
       )
     ).trim() || branchFallback
 
-  await installRemoteAgentHooks(
-    tool,
-    host,
-    worktreePath,
-    prepared.notifyScriptPath,
-    prepared.guardScriptPath
-  )
+  await installRemoteAgentHooks(tool, host, worktreePath, prepared.notifyScriptPath)
 
   const sandboxed = await createRemotePty(id, worktreePath, host, {
     tool,

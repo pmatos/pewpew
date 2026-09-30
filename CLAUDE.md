@@ -60,6 +60,10 @@ When debugging visual issues, **always drive the running app yourself first**: b
 
 The default tool is configurable via `defaultTool` in `~/.config/pewpew/config.json`. Per-session selection is exposed in the "New session" dialog. `claude`, `codex`, and `omp` must be in `PATH` (locally and on every remote host where the corresponding tool is selected).
 
+## Containment
+
+pewpew installs no write guard of its own. Claude Code is contained by `--permission-mode=auto` (never `--dangerously-skip-permissions`); Codex and omp are contained by pewpew's bwrap sandbox (`agent-sandbox.ts`). Hooks installed into worktrees are status/notification hooks only. Older versions installed a `worktree-guard.sh` PreToolUse hook; `hook-installer.ts` strips leftover entries on install and at startup.
+
 ## Implementation
 
 The project follows PLAN.md (v2). Terminals are embedded via xterm.js + node-pty + tmux (no external windows). Sessions persist across app restarts.

@@ -53,7 +53,6 @@ const host = { hostId: 'h1', alias: 'dev', label: 'Dev' } as unknown as Host
 
 const prepared = {
   notifyScriptPath: '/remote/notify.sh',
-  guardScriptPath: '/remote/guard.sh',
   ompHookScriptPath: '/remote/omp-notify-v1.ts',
   remoteSocketPath: '/tmp/remote.sock',
   sandboxAvailable: true,
@@ -126,12 +125,12 @@ describe('spawnRemoteAgent', () => {
 
 describe('installRemoteAgentHooks', () => {
   it('installs claude/default hooks via installRemoteHooks', async () => {
-    await installRemoteAgentHooks('claude', host, '/remote/wt', '/n.sh', '/g.sh')
+    await installRemoteAgentHooks('claude', host, '/remote/wt', '/n.sh')
     expect(calls).toContain('installRemoteHooks')
   })
 
   it('is a no-op for omp (hook bridge is a plain file installed elsewhere)', async () => {
-    await installRemoteAgentHooks('omp', host, '/remote/wt', '/n.sh', '/g.sh')
+    await installRemoteAgentHooks('omp', host, '/remote/wt', '/n.sh')
     expect(calls).not.toContain('installRemoteHooks')
     expect(calls).not.toContain('installRemoteCodexHooks')
   })
@@ -139,9 +138,9 @@ describe('installRemoteAgentHooks', () => {
   it('rolls back codex hooks when the feature-flag step fails', async () => {
     const { ensureRemoteCodexHooksFeatureFlag } = await import('./hook-installer')
     vi.mocked(ensureRemoteCodexHooksFeatureFlag).mockRejectedValueOnce(new Error('flag failed'))
-    await expect(
-      installRemoteAgentHooks('codex', host, '/remote/wt', '/n.sh', '/g.sh')
-    ).rejects.toThrow('flag failed')
+    await expect(installRemoteAgentHooks('codex', host, '/remote/wt', '/n.sh')).rejects.toThrow(
+      'flag failed'
+    )
     expect(calls).toContain('rollbackRemoteCodexHooks')
     expect(calls).not.toContain('commitRemoteCodexHooks')
   })

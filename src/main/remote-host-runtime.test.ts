@@ -25,7 +25,6 @@ function deps(): RemoteHostRuntimeDeps {
     startBootstrapWindow: vi.fn(() => vi.fn()),
     bootstrapHost: vi.fn(async () => ({
       notifyScriptPath: '/tmp/notify.sh',
-      guardScriptPath: '/tmp/worktree-guard.sh',
       ompHookScriptPath: '/tmp/omp-notify.ts',
       remoteSocketPath: '/tmp/remote.sock',
       sandboxAvailable: true,
@@ -45,7 +44,6 @@ describe('remote host runtime ownership', () => {
 
     const result = await runtime.withPreparedHost(host(), async (prepared) => {
       expect(prepared.notifyScriptPath).toBe('/tmp/notify.sh')
-      expect(prepared.guardScriptPath).toBe('/tmp/worktree-guard.sh')
       expect(prepared.ompHookScriptPath).toBe('/tmp/omp-notify.ts')
       expect(prepared.remoteSocketPath).toBe('/tmp/remote.sock')
       expect(prepared.sandboxAvailable).toBe(true)
@@ -81,7 +79,6 @@ describe('sandbox availability', () => {
     const fakes = deps()
     fakes.bootstrapHost = vi.fn(async () => ({
       notifyScriptPath: '/tmp/notify.sh',
-      guardScriptPath: '/tmp/worktree-guard.sh',
       ompHookScriptPath: '/tmp/omp-notify.ts',
       remoteSocketPath: '/tmp/remote.sock',
       sandboxAvailable: false,
@@ -101,7 +98,7 @@ describe('sandbox availability', () => {
       expect.objectContaining({
         severity: 'info',
         hostLabel: 'No Bwrap Box',
-        detail: expect.stringContaining('Claude sessions still block'),
+        detail: expect.stringContaining('Claude sessions are governed by auto mode'),
       })
     )
   })
@@ -110,7 +107,6 @@ describe('sandbox availability', () => {
     const fakes = deps()
     fakes.bootstrapHost = vi.fn(async () => ({
       notifyScriptPath: '/tmp/notify.sh',
-      guardScriptPath: '/tmp/worktree-guard.sh',
       ompHookScriptPath: '/tmp/omp-notify.ts',
       remoteSocketPath: '/tmp/remote.sock',
       sandboxAvailable: false,
