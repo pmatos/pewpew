@@ -32,6 +32,19 @@ contextBridge.exposeInMainWorld('api', {
     hostId?: string | null,
     options?: CreateSessionOptions
   ) => ipcRenderer.invoke('sessions:create-prs', projectPath, prNumbers, hostId ?? null, options),
+  createIssueSessions: (
+    projectPath: string,
+    issueNumbers: number[],
+    hostId?: string | null,
+    options?: CreateSessionOptions
+  ) =>
+    ipcRenderer.invoke(
+      'sessions:create-issues',
+      projectPath,
+      issueNumbers,
+      hostId ?? null,
+      options
+    ),
   openSessionsForOpenPrs: (
     projectPath: string,
     hostId?: string | null,

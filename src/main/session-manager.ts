@@ -1642,6 +1642,10 @@ export async function createPrSession(
   return session
 }
 
+function uniqueSorted(numbers: number[]): number[] {
+  return Array.from(new Set(numbers)).sort((a, b) => a - b)
+}
+
 export async function createPrSessions(
   projectPath: string,
   prNumbers: number[],
@@ -1649,13 +1653,29 @@ export async function createPrSessions(
   options: CreateSessionOptions = {},
   deps: { createPrSession?: CreateNumberedSession } = {}
 ): Promise<OpenSessionsSummary | string> {
-  const deduped = Array.from(new Set(prNumbers)).sort((a, b) => a - b)
   return createSessionsForNumbers(
     projectPath,
     hostId,
     'prNumber',
-    deduped,
+    uniqueSorted(prNumbers),
     deps.createPrSession ?? createPrSession,
+    options
+  )
+}
+
+export async function createIssueSessions(
+  projectPath: string,
+  issueNumbers: number[],
+  hostId: string | null = null,
+  options: CreateSessionOptions = {},
+  deps: { createIssueSession?: CreateNumberedSession } = {}
+): Promise<OpenSessionsSummary | string> {
+  return createSessionsForNumbers(
+    projectPath,
+    hostId,
+    'issueNumber',
+    uniqueSorted(issueNumbers),
+    deps.createIssueSession ?? createIssueSession,
     options
   )
 }

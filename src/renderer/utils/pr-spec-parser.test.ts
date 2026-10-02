@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest'
-import { parsePrSpec, MAX_PR_SPEC_NUMBERS } from './pr-spec-parser'
+import { parsePrSpec, parseIssueSpec, MAX_SPEC_NUMBERS } from './pr-spec-parser'
 
 describe('parsePrSpec', () => {
   describe('valid input', () => {
@@ -87,20 +87,20 @@ describe('parsePrSpec', () => {
     })
 
     it('rejects ranges that exceed the size cap', () => {
-      const result = parsePrSpec(`1-${MAX_PR_SPEC_NUMBERS + 1}`)
+      const result = parsePrSpec(`1-${MAX_SPEC_NUMBERS + 1}`)
       expect(result).toEqual({
-        error: `Range "1-${MAX_PR_SPEC_NUMBERS + 1}" is too large (max ${MAX_PR_SPEC_NUMBERS}).`,
+        error: `Range "1-${MAX_SPEC_NUMBERS + 1}" is too large (max ${MAX_SPEC_NUMBERS}).`,
       })
     })
 
     it('rejects total numbers exceeding the cap across multiple tokens', () => {
       // Two tokens within their own cap but combined exceed it.
-      const half = Math.floor(MAX_PR_SPEC_NUMBERS / 2)
+      const half = Math.floor(MAX_SPEC_NUMBERS / 2)
       const a = `1-${half + 1}` // half+1 numbers
       const b = `1000-${1000 + half + 1}` // half+2 numbers
       const result = parsePrSpec(`${a},${b}`)
       expect(result).toEqual({
-        error: `Too many PR numbers (max ${MAX_PR_SPEC_NUMBERS}).`,
+        error: `Too many PR numbers (max ${MAX_SPEC_NUMBERS}).`,
       })
     })
 
@@ -108,6 +108,22 @@ describe('parsePrSpec', () => {
       expect(parsePrSpec('99999999999999999')).toEqual({
         error: 'PR numbers must be 1 or greater.',
       })
+    })
+  })
+})
+
+describe('parseIssueSpec', () => {
+  it('parses mixed lists and ranges', () => {
+    expect(parseIssueSpec('2-5, 7')).toEqual({ numbers: [2, 3, 4, 5, 7] })
+    expect(parseIssueSpec('1, 2, 3')).toEqual({ numbers: [1, 2, 3] })
+  })
+
+  it('uses issue wording in errors', () => {
+    expect(parseIssueSpec('')).toEqual({ error: 'Enter at least one issue number.' })
+    expect(parseIssueSpec('abc')).toEqual({ error: 'Invalid issue spec: "abc".' })
+    expect(parseIssueSpec('0')).toEqual({ error: 'Issue numbers must be 1 or greater.' })
+    expect(parseIssueSpec(`1-${MAX_SPEC_NUMBERS + 1}`)).toEqual({
+      error: `Range "1-${MAX_SPEC_NUMBERS + 1}" is too large (max ${MAX_SPEC_NUMBERS}).`,
     })
   })
 })
