@@ -1660,6 +1660,24 @@ export async function createPrSessions(
   )
 }
 
+export async function createIssueSessions(
+  projectPath: string,
+  issueNumbers: number[],
+  hostId: string | null = null,
+  options: CreateSessionOptions = {},
+  deps: { createIssueSession?: CreateNumberedSession } = {}
+): Promise<OpenSessionsSummary | string> {
+  const deduped = Array.from(new Set(issueNumbers)).sort((a, b) => a - b)
+  return createSessionsForNumbers(
+    projectPath,
+    hostId,
+    'issueNumber',
+    deduped,
+    deps.createIssueSession ?? createIssueSession,
+    options
+  )
+}
+
 export async function createIssueSession(
   projectPath: string,
   issueNumber: number,

@@ -46,6 +46,12 @@ declare global {
         hostId?: string | null,
         options?: CreateSessionOptions
       ) => Promise<OpenSessionsSummary | string>
+      createIssueSessions: (
+        projectPath: string,
+        issueNumbers: number[],
+        hostId?: string | null,
+        options?: CreateSessionOptions
+      ) => Promise<OpenSessionsSummary | string>
       openSessionsForOpenPrs: (
         projectPath: string,
         hostId?: string | null,

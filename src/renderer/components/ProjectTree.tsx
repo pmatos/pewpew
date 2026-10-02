@@ -4,7 +4,7 @@ import { useSessionsStore } from '../stores/sessions'
 import { useHostsStore } from '../stores/hosts'
 import ContextMenu, { type MenuItem } from './ContextMenu'
 import type { AgentTool, OpenSessionsSummary, RepoChoices } from '../../shared/types'
-import { parsePrSpec } from '../utils/pr-spec-parser'
+import { parseIssueSpec, parsePrSpec } from '../utils/pr-spec-parser'
 
 interface MenuState {
   x: number
@@ -56,6 +56,11 @@ interface ProjectTreeUiState {
   pendingPrTool: AgentTool
   prNumberInput: string
   prError: string | null
+  pendingIssueSessionPath: string | null
+  pendingIssueSessionHostId: string | null
+  pendingIssueSessionTool: AgentTool
+  issueSpecInput: string
+  issueSpecError: string | null
   pendingOpenAllPrsPath: string | null
   pendingOpenAllPrsHostId: string | null
   pendingOpenAllPrsTool: AgentTool
@@ -144,6 +149,11 @@ function useProjectTreeElement({ onOpenSession }: TreeProps) {
     pendingPrTool: 'claude',
     prNumberInput: '',
     prError: null,
+    pendingIssueSessionPath: null,
+    pendingIssueSessionHostId: null,
+    pendingIssueSessionTool: 'claude',
+    issueSpecInput: '',
+    issueSpecError: null,
     pendingOpenAllPrsPath: null,
     pendingOpenAllPrsHostId: null,
     pendingOpenAllPrsTool: 'claude',
@@ -175,6 +185,11 @@ function useProjectTreeElement({ onOpenSession }: TreeProps) {
     pendingPrTool,
     prNumberInput,
     prError,
+    pendingIssueSessionPath,
+    pendingIssueSessionHostId,
+    pendingIssueSessionTool,
+    issueSpecInput,
+    issueSpecError,
     pendingOpenAllPrsPath,
     pendingOpenAllPrsHostId,
     pendingOpenAllPrsTool,
@@ -192,6 +207,7 @@ function useProjectTreeElement({ onOpenSession }: TreeProps) {
   } = ui
   const sessionNameInputRef = useRef<HTMLInputElement>(null)
   const prNumberInputRef = useRef<HTMLInputElement>(null)
+  const issueSpecInputRef = useRef<HTMLInputElement>(null)
   const bulkOpenPrsDialogRef = useRef<HTMLDivElement>(null)
   // Monotonic token: bumped whenever the issue dialog opens or closes so an
   // in-flight countOpenIssues can detect it was canceled/reopened mid-await.
@@ -326,6 +342,21 @@ function useProjectTreeElement({ onOpenSession }: TreeProps) {
     setTimeout(() => prNumberInputRef.current?.focus(), 0)
   }
 
+  const openIssueSessionDialog = (projectPath: string, hostId: string | null) => {
+    setUi({
+      pendingIssueSessionPath: projectPath,
+      pendingIssueSessionHostId: hostId,
+      pendingIssueSessionTool: defaultTool,
+      issueSpecInput: '',
+      issueSpecError: null,
+    })
+    setTimeout(() => issueSpecInputRef.current?.focus(), 0)
+  }
+
+  const closeIssueSessionDialog = () => {
+    setUi({ pendingIssueSessionPath: null, pendingIssueSessionHostId: null, issueSpecError: null })
+  }
+
   const describeCreateError = (err: unknown): string => {
     const message = err instanceof Error ? err.message : String(err)
     if (message.includes('no-origin-remote')) return 'This project has no origin remote.'
@@ -335,22 +366,22 @@ function useProjectTreeElement({ onOpenSession }: TreeProps) {
     return message.replace(/^Error:\s*/, '') || 'Failed to create session.'
   }
 
-  const formatPrSpecSummary = (result: OpenSessionsSummary): string => {
+  const formatSpecSummary = (result: OpenSessionsSummary, noun: 'PR' | 'issue'): string => {
     const parts: string[] = []
     if (result.created.length > 0) {
       parts.push(
-        `Opened ${result.created.length} PR session${result.created.length === 1 ? '' : 's'}`
+        `Opened ${result.created.length} ${noun} session${result.created.length === 1 ? '' : 's'}`
       )
     }
     if (result.reused.length > 0) parts.push(`linked ${result.reused.length} existing`)
     if (result.skipped.length > 0) parts.push(`skipped ${result.skipped.length}`)
     if (result.failed.length > 0) parts.push(`${result.failed.length} failed`)
-    return parts.length > 0 ? parts.join(', ') : 'No PR sessions created'
+    return parts.length > 0 ? parts.join(', ') : `No ${noun} sessions created`
   }
 
-  const formatPrSpecErrors = (result: OpenSessionsSummary): string => {
+  const formatSpecErrors = (result: OpenSessionsSummary, noun: 'PR' | 'issue'): string => {
     const lines = result.failed.map((f) => `#${f.number}: ${f.error}`)
-    return ['No PR sessions opened.', ...lines].join('\n')
+    return [`No ${noun} sessions opened.`, ...lines].join('\n')
   }
 
   const formatOpenAllSummary = (result: OpenSessionsSummary, label: 'PR' | 'issue'): string => {
@@ -558,6 +589,12 @@ function useProjectTreeElement({ onOpenSession }: TreeProps) {
         },
       })
       items.push({
+        label: 'New issue session…',
+        onClick: () => {
+          openIssueSessionDialog(projectPath, hostId)
+        },
+      })
+      items.push({
         label: 'Open sessions for all open PRs',
         disabled: creating,
         onClick: () => void openAllPrs(projectPath, hostId),
@@ -635,6 +672,12 @@ function useProjectTreeElement({ onOpenSession }: TreeProps) {
         label: 'New PR session…',
         onClick: () => {
           openPrSessionDialog(projectPath, null)
+        },
+      })
+      items.push({
+        label: 'New issue session…',
+        onClick: () => {
+          openIssueSessionDialog(projectPath, null)
         },
       })
       items.push({
@@ -773,13 +816,53 @@ function useProjectTreeElement({ onOpenSession }: TreeProps) {
       // Multiple PRs: if nothing was opened or linked, keep the dialog open and
       // surface the per-PR reasons instead of a fleeting count-only toast.
       if (result.created.length === 0 && result.reused.length === 0) {
-        setUi({ prError: formatPrSpecErrors(result) })
+        setUi({ prError: formatSpecErrors(result, 'PR') })
         return
       }
-      showToast(formatPrSpecSummary(result))
+      showToast(formatSpecSummary(result, 'PR'))
       setUi({ pendingPrPath: null, pendingPrHostId: null, prNumberInput: '' })
     } catch (err) {
       setUi({ prError: describeCreateError(err) })
+    } finally {
+      setUi({ creating: false })
+    }
+  }
+
+  const handleCreateIssueSession = async () => {
+    if (!pendingIssueSessionPath || creating) return
+    const parsed = parseIssueSpec(issueSpecInput)
+    if ('error' in parsed) {
+      setUi({ issueSpecError: parsed.error })
+      return
+    }
+    setUi({ creating: true, issueSpecError: null })
+    try {
+      const result = await window.api.createIssueSessions(
+        pendingIssueSessionPath,
+        parsed.numbers,
+        pendingIssueSessionHostId,
+        { tool: pendingIssueSessionTool }
+      )
+      if (typeof result === 'string') {
+        setUi({ issueSpecError: result })
+        return
+      }
+      if (result.created.length === 0 && result.reused.length === 0) {
+        const message =
+          result.failed.length > 0
+            ? formatSpecErrors(result, 'issue')
+            : `${parsed.numbers.length === 1 ? `Issue #${result.skipped[0]} already has` : 'All issues already have'} a session.`
+        setUi({ issueSpecError: message })
+        return
+      }
+      if (parsed.numbers.length > 1) showToast(formatSpecSummary(result, 'issue'))
+      setUi({
+        pendingIssueSessionPath: null,
+        pendingIssueSessionHostId: null,
+        issueSpecInput: '',
+      })
+    } catch (err) {
+      setUi({ issueSpecError: describeCreateError(err) })
     } finally {
       setUi({ creating: false })
     }
@@ -930,6 +1013,53 @@ function useProjectTreeElement({ onOpenSession }: TreeProps) {
                 setUi({ pendingPrPath: null, pendingPrHostId: null, prError: null })
               }}
             >
+              Cancel
+            </button>
+          </div>
+        </div>
+      )}
+      {pendingIssueSessionPath && (
+        <div className="session-name-dialog">
+          <div className="session-name-label">Issue number(s):</div>
+          <input
+            ref={issueSpecInputRef}
+            type="text"
+            className="create-input"
+            placeholder="e.g. 42 or 1,2,22-28"
+            value={issueSpecInput}
+            onChange={(e) => setUi({ issueSpecInput: e.target.value })}
+            onKeyDown={(e) => {
+              if (e.key === 'Enter') handleCreateIssueSession()
+              if (e.key === 'Escape') closeIssueSessionDialog()
+            }}
+          />
+          <div className="session-name-label">Tool:</div>
+          <div className="tool-picker">
+            {(
+              [
+                ['claude', 'Claude'],
+                ['codex', 'Codex'],
+                ['omp', 'oh-my-pi'],
+              ] as const
+            ).map(([tool, label]) => (
+              <label key={tool}>
+                <input
+                  type="radio"
+                  name="issue-tool"
+                  value={tool}
+                  checked={pendingIssueSessionTool === tool}
+                  onChange={() => setUi({ pendingIssueSessionTool: tool })}
+                />
+                {label}
+              </label>
+            ))}
+          </div>
+          {issueSpecError && <div className="pr-error">{issueSpecError}</div>}
+          <div className="create-actions">
+            <button className="create-btn" onClick={handleCreateIssueSession} disabled={creating}>
+              {creating ? 'Creating…' : 'Create'}
+            </button>
+            <button className="create-btn cancel" onClick={closeIssueSessionDialog}>
               Cancel
             </button>
           </div>

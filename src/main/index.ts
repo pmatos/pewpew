@@ -38,6 +38,7 @@ import {
   mirrorAllWorktrees,
   createPrSession,
   createPrSessions,
+  createIssueSessions,
   openSessionsForOpenPrs,
   openSessionsForOpenIssues,
   getSession,
@@ -409,6 +410,19 @@ app.whenReady().then(async () => {
       options?: CreateSessionOptions
     ) => {
       return createPrSessions(projectPath, prNumbers, hostId ?? null, options ?? {})
+    }
+  )
+
+  ipcMain.handle(
+    'sessions:create-issues',
+    async (
+      _event,
+      projectPath: string,
+      issueNumbers: number[],
+      hostId?: string | null,
+      options?: CreateSessionOptions
+    ) => {
+      return createIssueSessions(projectPath, issueNumbers, hostId ?? null, options ?? {})
     }
   )
 

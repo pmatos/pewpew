@@ -3428,6 +3428,49 @@ describe('createPrSession repo override (upstream)', () => {
   })
 })
 
+describe('createIssueSessions', () => {
+  it('dedupes, skips numbers that already have a session, and forwards the tool', async () => {
+    const sm = await loadSessionManager()
+    writeSessionsJson([
+      baseLocalSession({ id: 's-existing', issueNumber: 2, projectPath: '/proj' }),
+    ])
+    sm.restoreSessions()
+
+    const createIssueSession = vi.fn(
+      async (_projectPath: string, issueNumber: number, _hostId: string | null) =>
+        baseLocalSession({ id: `s-${issueNumber}`, issueNumber }) as Session | string
+    )
+
+    const result = await sm.createIssueSessions(
+      '/proj',
+      [3, 2, 3, 4],
+      null,
+      { tool: 'codex' },
+      { createIssueSession }
+    )
+    if (typeof result === 'string') throw new Error(result)
+
+    expect(result.skipped).toEqual([2])
+    expect(result.created.map((s) => s.issueNumber).sort()).toEqual([3, 4])
+    expect(createIssueSession).toHaveBeenCalledTimes(2)
+    expect(createIssueSession).toHaveBeenCalledWith('/proj', 3, null, { tool: 'codex' })
+    expect(createIssueSession).toHaveBeenCalledWith('/proj', 4, null, { tool: 'codex' })
+  })
+
+  it('aggregates per-number failures into the summary', async () => {
+    const sm = await loadSessionManager()
+    const createIssueSession = vi.fn(
+      async (_projectPath: string, issueNumber: number) =>
+        (issueNumber === 5 ? 'boom' : baseLocalSession({ id: `s-${issueNumber}`, issueNumber })) as
+          Session | string
+    )
+    const result = await sm.createIssueSessions('/proj', [4, 5], null, {}, { createIssueSession })
+    if (typeof result === 'string') throw new Error(result)
+    expect(result.created.map((s) => s.issueNumber)).toEqual([4])
+    expect(result.failed).toEqual([{ number: 5, error: 'boom' }])
+  })
+})
+
 describe('createPrSessions', () => {
   it('skips numbers that already have a session and creates the rest', async () => {
     const sm = await loadSessionManager()
