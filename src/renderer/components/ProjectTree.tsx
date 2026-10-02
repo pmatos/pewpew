@@ -47,6 +47,7 @@ interface ProjectTreeUiState {
   pendingSessionHostId: string | null
   sessionNameInput: string
   defaultTool: AgentTool
+  defaultSkipPermissions: boolean
   pendingTool: AgentTool
   creating: boolean
   baseFromOrigin: boolean
@@ -60,7 +61,7 @@ interface ProjectTreeUiState {
   pendingOpenAllPrsHostId: string | null
   pendingOpenAllPrsTool: AgentTool
   // Shared by the three tool-picker dialogs (only one is open at a time);
-  // reset to false whenever one opens. Applies to claude only.
+  // reset to defaultSkipPermissions whenever one opens. Applies to claude only.
   skipPermissions: boolean
   // The repos a PR/issue can be drawn from (origin + detected upstream parent),
   // and the currently-selected one. Shared across the PR, issue, and open-all
@@ -138,6 +139,7 @@ function useProjectTreeElement({ onOpenSession }: TreeProps) {
     pendingSessionHostId: null,
     sessionNameInput: '',
     defaultTool: 'claude',
+    defaultSkipPermissions: false,
     pendingTool: 'claude',
     creating: false,
     baseFromOrigin: false,
@@ -170,6 +172,7 @@ function useProjectTreeElement({ onOpenSession }: TreeProps) {
     pendingSessionHostId,
     sessionNameInput,
     defaultTool,
+    defaultSkipPermissions,
     pendingTool,
     creating,
     baseFromOrigin,
@@ -257,6 +260,10 @@ function useProjectTreeElement({ onOpenSession }: TreeProps) {
       // callback would race against any user toggle made between the click
       // and getDefaultTool resolving.
     })
+    window.api.getDefaultSkipPermissions().then((value) => {
+      if (cancelled) return
+      setUi({ defaultSkipPermissions: value })
+    })
     window.api.getBulkOpenConfirmThreshold().then((n) => {
       if (cancelled) return
       setUi({ bulkOpenConfirmThreshold: n })
@@ -306,7 +313,7 @@ function useProjectTreeElement({ onOpenSession }: TreeProps) {
       createError: null,
       sessionNameInput: '',
       pendingTool: defaultTool,
-      skipPermissions: false,
+      skipPermissions: defaultSkipPermissions,
       pendingSessionPath: projectPath,
       pendingSessionHostId: hostId,
     }
@@ -325,7 +332,7 @@ function useProjectTreeElement({ onOpenSession }: TreeProps) {
       pendingPrPath: projectPath,
       pendingPrHostId: hostId,
       pendingPrTool: defaultTool,
-      skipPermissions: false,
+      skipPermissions: defaultSkipPermissions,
       prNumberInput: '',
       prError: null,
     })
@@ -417,7 +424,7 @@ function useProjectTreeElement({ onOpenSession }: TreeProps) {
       pendingOpenAllPrsPath: projectPath,
       pendingOpenAllPrsHostId: hostId,
       pendingOpenAllPrsTool: tool,
-      skipPermissions: false,
+      skipPermissions: defaultSkipPermissions,
       repoChoices: resolvedChoices,
       selectedRepo: resolvedChoices?.current ?? '',
     })

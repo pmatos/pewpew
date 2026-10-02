@@ -370,6 +370,12 @@ interface InflightAdoption {
 }
 const inflightAdoptions = new Map<string, InflightAdoption>()
 
+// An explicit choice from a dialog wins; callers with no dialog (bulk issue
+// sessions, adoption) fall back to the configured default.
+function resolveSkipPermissions(explicit: boolean | undefined): boolean | undefined {
+  return explicit ?? getConfig().defaultSkipPermissions
+}
+
 export async function createSessionForWorktree(
   projectPath: string,
   worktreePath: string,
@@ -378,6 +384,7 @@ export async function createSessionForWorktree(
   skipPermissions?: boolean
 ): Promise<Session> {
   const effectiveTool: AgentTool = tool ?? getConfig().defaultTool
+  const effectiveSkipPermissions = resolveSkipPermissions(skipPermissions)
   const target = canonicalPath(worktreePath)
   const existing = findSessionOnCanonicalWorktree(allSessions(), worktreePath, canonicalPath)
   if (existing) {
@@ -395,7 +402,13 @@ export async function createSessionForWorktree(
     return inflight.promise
   }
 
-  const promise = adoptWorktree(projectPath, worktreePath, label, effectiveTool, skipPermissions)
+  const promise = adoptWorktree(
+    projectPath,
+    worktreePath,
+    label,
+    effectiveTool,
+    effectiveSkipPermissions
+  )
   inflightAdoptions.set(target, { promise, tool: effectiveTool })
   try {
     return await promise
@@ -588,6 +601,7 @@ async function adoptRemoteWorktree(
 ): Promise<Session> {
   const host = getRequiredHost(hostId)
   const remoteProject = getRemoteProject(hostId, projectPath)
+  const skipPermissions = resolveSkipPermissions(undefined)
   const worktreeName = label || posix.basename(worktreePath)
   const id = randomUUID().slice(0, 8)
 
@@ -614,6 +628,7 @@ async function adoptRemoteWorktree(
         id,
         host,
         tool,
+        skipPermissions,
         worktreePath,
         projectPath,
         agentPath,
@@ -632,6 +647,7 @@ async function adoptRemoteWorktree(
     worktreePath,
     branch,
     tool,
+    skipPermissions,
     sandboxed,
     now: Date.now(),
     issueNumber: parseIssueNumber(worktreeName, branch),
@@ -650,6 +666,7 @@ async function createRemoteSession(
   options: CreateSessionOptions = {}
 ): Promise<Session> {
   const effectiveTool: AgentTool = options.tool ?? getConfig().defaultTool
+  const skipPermissions = resolveSkipPermissions(options.skipPermissions)
   const host = getRequiredHost(hostId)
   const remoteProject = getRemoteProject(hostId, projectPath)
   const worktreeName = name || `session-${randomUUID().slice(0, 8)}`
@@ -734,7 +751,7 @@ async function createRemoteSession(
         id,
         host,
         tool: effectiveTool,
-        skipPermissions: options.skipPermissions,
+        skipPermissions,
         worktreePath,
         projectPath,
         agentPath,
@@ -753,7 +770,7 @@ async function createRemoteSession(
     worktreePath,
     branch,
     tool: effectiveTool,
-    skipPermissions: options.skipPermissions,
+    skipPermissions,
     sandboxed,
     now: Date.now(),
     issueNumber: parseIssueNumber(worktreeName, branch),
@@ -823,6 +840,8 @@ async function createRemotePrSession(
     const { branch, localBranch, isFork, forkFields, fetchRemote, fetchRefspec } = planResult.plan
 
     const effectiveTool: AgentTool = options.tool ?? getConfig().defaultTool
+
+    const skipPermissions = resolveSkipPermissions(options.skipPermissions)
     const agentPath = agentPaths[effectiveTool]
     if (!agentPath) {
       return `${effectiveTool} is not installed on host ${host.label || host.alias}.`
@@ -887,7 +906,7 @@ async function createRemotePrSession(
       id,
       host,
       tool: effectiveTool,
-      skipPermissions: options.skipPermissions,
+      skipPermissions,
       worktreePath,
       projectPath,
       agentPath,
@@ -904,7 +923,7 @@ async function createRemotePrSession(
       worktreePath,
       branch: resolvedBranch,
       tool: effectiveTool,
-      skipPermissions: options.skipPermissions,
+      skipPermissions,
       sandboxed,
       now: Date.now(),
       issueNumber: parseIssueNumber(worktreeName, resolvedBranch, prInfo.title),
@@ -1762,6 +1781,7 @@ async function createRemoteIssueSession(
 
   return remoteHostRuntime.withPreparedHost(host, async ({ agentPaths, ...prepared }) => {
     const effectiveTool: AgentTool = options.tool ?? getConfig().defaultTool
+    const skipPermissions = resolveSkipPermissions(options.skipPermissions)
     const agentPath = agentPaths[effectiveTool]
     if (!agentPath) {
       return `${effectiveTool} is not installed on host ${host.label || host.alias}.`
@@ -1816,7 +1836,7 @@ async function createRemoteIssueSession(
       id,
       host,
       tool: effectiveTool,
-      skipPermissions: options.skipPermissions,
+      skipPermissions,
       worktreePath,
       projectPath,
       agentPath,
@@ -1833,7 +1853,7 @@ async function createRemoteIssueSession(
       worktreePath,
       branch: resolvedBranch,
       tool: effectiveTool,
-      skipPermissions: options.skipPermissions,
+      skipPermissions,
       sandboxed,
       now: Date.now(),
       issueNumber,

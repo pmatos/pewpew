@@ -102,6 +102,7 @@ declare global {
       saveSidebarWidth: (width: number) => Promise<void>
       getUiScale: () => Promise<number>
       getDefaultTool: () => Promise<AgentTool>
+      getDefaultSkipPermissions: () => Promise<boolean>
       getBulkOpenConfirmThreshold: () => Promise<number>
       getWorktreeBase: () => Promise<WorktreeBase>
       getTheme: () => Promise<Theme>

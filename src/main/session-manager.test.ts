@@ -16,6 +16,7 @@ const state = vi.hoisted(() => ({
   remoteProjects: [] as RemoteProject[],
   worktreeBase: 'local' as WorktreeBase,
   defaultTool: 'claude' as AgentTool,
+  defaultSkipPermissions: false,
   runtimeStates: new Map<string, string>(),
   // Call logs for assertion.
   ensureHostConnectionCalls: [] as string[],
@@ -29,7 +30,7 @@ const state = vi.hoisted(() => ({
     remoteSocketPath?: string
   }[],
   reattachRemotePtyCalls: [] as { sessionId: string; hostId: string }[],
-  createPtyCalls: [] as { sessionId: string; cwd: string }[],
+  createPtyCalls: [] as { sessionId: string; cwd: string; skipPermissions?: boolean }[],
   reattachPtyCalls: [] as string[],
   detachPtyCalls: [] as string[],
   hasRemoteTmuxResult: new Map<string, boolean>(),
@@ -114,6 +115,7 @@ vi.mock('./config', () => ({
     hosts: state.hosts,
     remoteProjects: [],
     defaultTool: state.defaultTool,
+    defaultSkipPermissions: state.defaultSkipPermissions,
     worktreeBase: state.worktreeBase,
   }),
   getReconnectConfig: () => state.reconnectConfig,
@@ -223,8 +225,8 @@ vi.mock('./host-bootstrap', () => ({
 }))
 
 vi.mock('./pty-manager', () => ({
-  createPty: (sessionId: string, cwd: string) => {
-    state.createPtyCalls.push({ sessionId, cwd })
+  createPty: (sessionId: string, cwd: string, options?: { skipPermissions?: boolean }) => {
+    state.createPtyCalls.push({ sessionId, cwd, skipPermissions: options?.skipPermissions })
   },
   detachPty: (sessionId: string) => {
     state.detachPtyCalls.push(sessionId)
@@ -424,6 +426,7 @@ beforeEach(() => {
   state.remoteProjects = []
   state.worktreeBase = 'local'
   state.defaultTool = 'claude'
+  state.defaultSkipPermissions = false
   state.runtimeStates = new Map()
   state.ensureHostConnectionCalls = []
   state.createRemotePtyCalls = []
@@ -860,6 +863,32 @@ describe('createSession origin-default base', () => {
 
       const branch = git(session.worktreePath, ['rev-parse', '--abbrev-ref', 'HEAD']).trim()
       expect(branch).toBe(branchName)
+    } finally {
+      rmSync(root, { recursive: true, force: true })
+    }
+  })
+
+  gitIt('falls back to defaultSkipPermissions unless the caller chooses explicitly', async () => {
+    const root = mkdtempSync(join(tmpdir(), 'skip-perms-default-'))
+    try {
+      const project = createProjectWithUpdatedOrigin(root)
+      const sm = await loadSessionManager()
+
+      const plain = await sm.createSession(project, 'plain', null, {})
+      expect(plain.skipPermissions).toBeUndefined()
+
+      state.defaultSkipPermissions = true
+      const inherited = await sm.createSession(project, 'inherited', null, {})
+      expect(inherited.skipPermissions).toBe(true)
+      expect(state.createPtyCalls.at(-1)?.skipPermissions).toBe(true)
+
+      const overridden = await sm.createSession(project, 'overridden', null, {
+        skipPermissions: false,
+      })
+      expect(overridden.skipPermissions).toBeUndefined()
+
+      const notClaude = await sm.createSession(project, 'codex-one', null, { tool: 'codex' })
+      expect(notClaude.skipPermissions).toBeUndefined()
     } finally {
       rmSync(root, { recursive: true, force: true })
     }

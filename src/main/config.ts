@@ -53,6 +53,8 @@ export interface AppConfig {
   gitignoreWarned: string[]
   remoteProjects: RemoteProject[]
   defaultTool: AgentTool
+  // claude only: preselect --dangerously-skip-permissions for new sessions.
+  defaultSkipPermissions: boolean
   worktreeBase: WorktreeBase
   theme: Theme
   reduceAnimations: boolean
@@ -78,6 +80,7 @@ const DEFAULT_CONFIG: AppConfig = {
   gitignoreWarned: [],
   remoteProjects: [],
   defaultTool: 'claude',
+  defaultSkipPermissions: false,
   worktreeBase: 'local',
   theme: 'dark',
   reduceAnimations: false,
