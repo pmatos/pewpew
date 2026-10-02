@@ -62,7 +62,7 @@ The default tool is configurable via `defaultTool` in `~/.config/pewpew/config.j
 
 ## Containment
 
-pewpew installs no write guard of its own. Claude Code is contained by `--permission-mode=auto` (never `--dangerously-skip-permissions`); Codex and omp are contained by pewpew's bwrap sandbox (`agent-sandbox.ts`). Hooks installed into worktrees are status/notification hooks only. Older versions installed a `worktree-guard.sh` PreToolUse hook; `hook-installer.ts` strips leftover entries on install and at startup.
+pewpew installs no write guard of its own. Claude Code is contained by `--permission-mode=auto` by default; the session dialogs have an opt-in "Skip permission prompts" checkbox that runs it with `--dangerously-skip-permissions` instead (persisted as `Session.skipPermissions`, so resume keeps the mode); Codex and omp are contained by pewpew's bwrap sandbox (`agent-sandbox.ts`). Hooks installed into worktrees are status/notification hooks only. Older versions installed a `worktree-guard.sh` PreToolUse hook; `hook-installer.ts` strips leftover entries on install and at startup.
 
 ## Implementation
 

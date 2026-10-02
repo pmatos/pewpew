@@ -58,6 +58,23 @@ describe('buildSession — a local session', () => {
   })
 })
 
+describe('buildSession — skipPermissions', () => {
+  it('records skipPermissions for claude', () => {
+    expect(buildSession(base({ skipPermissions: true })).skipPermissions).toBe(true)
+  })
+
+  it('omits the field when unset or false', () => {
+    expect('skipPermissions' in buildSession(base())).toBe(false)
+    expect('skipPermissions' in buildSession(base({ skipPermissions: false }))).toBe(false)
+  })
+
+  it('drops it for non-claude tools', () => {
+    expect('skipPermissions' in buildSession(base({ tool: 'codex', skipPermissions: true }))).toBe(
+      false
+    )
+  })
+})
+
 describe('buildSession — a remote session', () => {
   it("is born connectionState 'live' whenever a hostId is present", () => {
     const session = buildSession(base({ hostId: 'host-1' }))

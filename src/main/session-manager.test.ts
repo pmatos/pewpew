@@ -2549,6 +2549,7 @@ describe('createIssueSession', () => {
       '/proj',
       '/proj/.claude/worktrees/issue-42',
       'issue-42',
+      undefined,
       undefined
     )
     expect(runGit).toHaveBeenCalledWith([
@@ -2560,6 +2561,43 @@ describe('createIssueSession', () => {
       'issue-42',
       'refs/remotes/origin/main',
     ])
+  })
+
+  it('forwards skipPermissions to the worktree adoption', async () => {
+    const sm = await loadSessionManager()
+    const runGit = vi.fn(async (argv: string[]) => {
+      const key = argv.join(' ')
+      if (key === 'remote get-url origin') return { stdout: 'git@example.com:org/repo.git\n' }
+      if (key === 'fetch origin --quiet') return { stdout: '' }
+      if (key === 'ls-remote --symref origin HEAD') {
+        return { stdout: 'ref: refs/heads/main\tHEAD\nabc123\tHEAD\n' }
+      }
+      if (key === 'symbolic-ref --short refs/remotes/origin/HEAD') {
+        return { stdout: 'origin/main\n' }
+      }
+      if (key === 'rev-parse --verify refs/remotes/origin/main') return { stdout: 'abc123\n' }
+      if (key.startsWith('worktree add')) return { stdout: '' }
+      throw new Error(`unexpected git ${key}`)
+    })
+    const createSessionForWorktree = vi.fn(async () =>
+      baseLocalSession({ id: 'issue-7', projectPath: '/proj', worktreeName: 'issue-7' })
+    )
+
+    await sm.createIssueSession(
+      '/proj',
+      7,
+      null,
+      { tool: 'claude', skipPermissions: true },
+      { runGit, createSessionForWorktree }
+    )
+
+    expect(createSessionForWorktree).toHaveBeenCalledWith(
+      '/proj',
+      '/proj/.claude/worktrees/issue-7',
+      'issue-7',
+      'claude',
+      true
+    )
   })
 
   it('returns a user-facing error string when origin default is missing', async () => {

@@ -374,7 +374,8 @@ export async function createSessionForWorktree(
   projectPath: string,
   worktreePath: string,
   label?: string,
-  tool?: AgentTool
+  tool?: AgentTool,
+  skipPermissions?: boolean
 ): Promise<Session> {
   const effectiveTool: AgentTool = tool ?? getConfig().defaultTool
   const target = canonicalPath(worktreePath)
@@ -394,7 +395,7 @@ export async function createSessionForWorktree(
     return inflight.promise
   }
 
-  const promise = adoptWorktree(projectPath, worktreePath, label, effectiveTool)
+  const promise = adoptWorktree(projectPath, worktreePath, label, effectiveTool, skipPermissions)
   inflightAdoptions.set(target, { promise, tool: effectiveTool })
   try {
     return await promise
@@ -407,7 +408,8 @@ async function adoptWorktree(
   projectPath: string,
   worktreePath: string,
   label: string | undefined,
-  tool: AgentTool
+  tool: AgentTool,
+  skipPermissions?: boolean
 ): Promise<Session> {
   if (!(await isGitWorktree(worktreePath))) {
     throw new Error(`${worktreePath} is not a valid git worktree`)
@@ -422,7 +424,7 @@ async function adoptWorktree(
   const branch = resolveBranchFromWorktree(worktreePath, worktreeName, projectName)
 
   await localAgentHooks.installBeforeSpawn(tool, worktreePath)
-  const sandboxed = createPty(id, worktreePath, { tool, projectPath })
+  const sandboxed = createPty(id, worktreePath, { tool, skipPermissions, projectPath })
 
   const session = buildSession({
     id,
@@ -433,6 +435,7 @@ async function adoptWorktree(
     worktreePath: canonical,
     branch,
     tool,
+    skipPermissions,
     sandboxed,
     now: Date.now(),
     issueNumber: parseIssueNumber(worktreeName, branch),
@@ -731,6 +734,7 @@ async function createRemoteSession(
         id,
         host,
         tool: effectiveTool,
+        skipPermissions: options.skipPermissions,
         worktreePath,
         projectPath,
         agentPath,
@@ -749,6 +753,7 @@ async function createRemoteSession(
     worktreePath,
     branch,
     tool: effectiveTool,
+    skipPermissions: options.skipPermissions,
     sandboxed,
     now: Date.now(),
     issueNumber: parseIssueNumber(worktreeName, branch),
@@ -882,6 +887,7 @@ async function createRemotePrSession(
       id,
       host,
       tool: effectiveTool,
+      skipPermissions: options.skipPermissions,
       worktreePath,
       projectPath,
       agentPath,
@@ -898,6 +904,7 @@ async function createRemotePrSession(
       worktreePath,
       branch: resolvedBranch,
       tool: effectiveTool,
+      skipPermissions: options.skipPermissions,
       sandboxed,
       now: Date.now(),
       issueNumber: parseIssueNumber(worktreeName, resolvedBranch, prInfo.title),
@@ -970,7 +977,13 @@ export async function createSession(
     }
   }
 
-  return createSessionForWorktree(projectPath, worktreePath, worktreeName, options.tool)
+  return createSessionForWorktree(
+    projectPath,
+    worktreePath,
+    worktreeName,
+    options.tool,
+    options.skipPermissions
+  )
 }
 
 function realizeIntent(intent: SideEffectIntent): void {
@@ -1130,6 +1143,7 @@ export async function reviveSession(id: string): Promise<void> {
             session.sandboxed = await createRemotePty(id, session.worktreePath, host, {
               continueSession: canResume,
               tool: session.tool,
+              skipPermissions: session.skipPermissions,
               agentSessionId: session.agentSessionId,
               agentPath,
               projectPath: session.projectPath,
@@ -1181,6 +1195,7 @@ export async function reviveSession(id: string): Promise<void> {
     session.sandboxed = createPty(id, session.worktreePath, {
       continueSession: canResume,
       tool: session.tool,
+      skipPermissions: session.skipPermissions,
       agentSessionId: session.agentSessionId,
       projectPath: session.projectPath,
     })
@@ -1225,6 +1240,7 @@ export async function attachLocalSession(id: string): Promise<void> {
       session.sandboxed = createPty(id, session.worktreePath, {
         continueSession: canResume,
         tool: session.tool,
+        skipPermissions: session.skipPermissions,
         agentSessionId: session.agentSessionId,
         projectPath: session.projectPath,
       })
@@ -1434,7 +1450,8 @@ interface CreateIssueSessionDeps {
     projectPath: string,
     worktreePath: string,
     label?: string,
-    tool?: AgentTool
+    tool?: AgentTool,
+    skipPermissions?: boolean
   ) => Promise<Session>
 }
 
@@ -1445,7 +1462,8 @@ interface CreatePrSessionDeps {
     projectPath: string,
     worktreePath: string,
     label?: string,
-    tool?: AgentTool
+    tool?: AgentTool,
+    skipPermissions?: boolean
   ) => Promise<Session>
 }
 
@@ -1628,7 +1646,13 @@ export async function createPrSession(
     }
   }
 
-  const session = await adopt(projectPath, worktreePath, worktreeName, options.tool)
+  const session = await adopt(
+    projectPath,
+    worktreePath,
+    worktreeName,
+    options.tool,
+    options.skipPermissions
+  )
   // We already know the PR number; set it directly so it shows immediately
   // (the async lookup fired by adoptWorktree will no-op since prNumber is set).
   session.prNumber = prNumber
@@ -1709,7 +1733,13 @@ export async function createIssueSession(
   })
   if (!adoption.ok) return worktreeCreationError(branch, adoption.cause)
 
-  const session = await adopt(projectPath, worktreePath, worktreeName, options.tool)
+  const session = await adopt(
+    projectPath,
+    worktreePath,
+    worktreeName,
+    options.tool,
+    options.skipPermissions
+  )
   session.issueNumber = issueNumber
   onSessionsChanged()
   return session
@@ -1786,6 +1816,7 @@ async function createRemoteIssueSession(
       id,
       host,
       tool: effectiveTool,
+      skipPermissions: options.skipPermissions,
       worktreePath,
       projectPath,
       agentPath,
@@ -1802,6 +1833,7 @@ async function createRemoteIssueSession(
       worktreePath,
       branch: resolvedBranch,
       tool: effectiveTool,
+      skipPermissions: options.skipPermissions,
       sandboxed,
       now: Date.now(),
       issueNumber,
@@ -1885,7 +1917,11 @@ export async function relocateProject(
     if (hasPty(s.id)) {
       destroyPty(s.id)
       if (existsSync(s.worktreePath)) {
-        s.sandboxed = createPty(s.id, s.worktreePath, { tool: s.tool, projectPath: s.projectPath })
+        s.sandboxed = createPty(s.id, s.worktreePath, {
+          tool: s.tool,
+          skipPermissions: s.skipPermissions,
+          projectPath: s.projectPath,
+        })
         s.status = 'idle'
       } else {
         s.status = 'dead'

@@ -230,6 +230,26 @@ describe('buildAgentArgs', () => {
     ])
   })
 
+  it('claude with skipPermissions uses --dangerously-skip-permissions', () => {
+    expect(buildAgentArgs({ tool: 'claude', skipPermissions: true })).toEqual([
+      'claude',
+      '--dangerously-skip-permissions',
+    ])
+  })
+
+  it('claude with skipPermissions and continueSession keeps both', () => {
+    expect(
+      buildAgentArgs({ tool: 'claude', skipPermissions: true, continueSession: true })
+    ).toEqual(['claude', '--dangerously-skip-permissions', '--continue'])
+  })
+
+  it('codex ignores skipPermissions', () => {
+    expect(buildAgentArgs({ tool: 'codex', skipPermissions: true })).toEqual([
+      'codex',
+      '--dangerously-bypass-approvals-and-sandbox',
+    ])
+  })
+
   it('codex without resume uses bypass flag only', () => {
     expect(buildAgentArgs({ tool: 'codex' })).toEqual([
       'codex',

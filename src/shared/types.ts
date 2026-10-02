@@ -52,6 +52,9 @@ export interface Session {
   repoFingerprint?: string
   lastKnownState?: LastKnownState
   tool: AgentTool
+  // claude only: spawned with --dangerously-skip-permissions instead of
+  // --permission-mode auto. Persisted so resume keeps the same mode.
+  skipPermissions?: boolean
   agentSessionId?: string
   // Whether this session's agent process is running inside the bwrap
   // sandbox (see agent-sandbox.ts) — undefined for sessions created before
@@ -174,6 +177,8 @@ export type WorktreeBase = 'local' | 'origin-default'
 export interface CreateSessionOptions {
   baseRef?: WorktreeBase
   tool?: AgentTool
+  // claude only; ignored for other tools.
+  skipPermissions?: boolean
   // The repo a PR belongs to, as "owner/name". Set only when it differs from
   // the project's origin (e.g. opening a session for a PR that lives in the
   // fork's upstream parent). The PR head is then fetched from this repo rather

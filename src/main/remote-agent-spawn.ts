@@ -8,6 +8,7 @@ export interface SpawnRemoteAgentArgs {
   id: string
   host: Host
   tool: AgentTool
+  skipPermissions?: boolean
   worktreePath: string
   projectPath: string
   // Resolved (and error-checked) by the caller: the missing-agent error mode is
@@ -29,7 +30,17 @@ export interface SpawnRemoteAgentArgs {
 export async function spawnRemoteAgent(
   args: SpawnRemoteAgentArgs
 ): Promise<{ branch: string; sandboxed: boolean }> {
-  const { id, host, tool, worktreePath, projectPath, agentPath, branchFallback, prepared } = args
+  const {
+    id,
+    host,
+    tool,
+    skipPermissions,
+    worktreePath,
+    projectPath,
+    agentPath,
+    branchFallback,
+    prepared,
+  } = args
 
   const branch =
     (
@@ -48,6 +59,7 @@ export async function spawnRemoteAgent(
 
   const sandboxed = await createRemotePty(id, worktreePath, host, {
     tool,
+    skipPermissions,
     agentPath,
     projectPath,
     notifyHookPath: prepared.ompHookScriptPath,
