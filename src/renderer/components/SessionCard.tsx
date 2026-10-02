@@ -22,6 +22,16 @@ function timeAgo(ts: number): string {
   return `${Math.floor(diff / 86400)}d ago`
 }
 
+function sandboxBadgeTitle(session: Session): string {
+  if (session.sandboxed) return 'Sandboxed — Bash commands are confined to this worktree'
+  if (session.tool !== 'claude') {
+    return 'Not sandboxed — bwrap is unavailable, so this tool runs without worktree containment'
+  }
+  return session.skipPermissions
+    ? 'Not sandboxed — claude runs with --dangerously-skip-permissions'
+    : 'Not sandboxed — claude runs under --permission-mode=auto instead'
+}
+
 interface Props {
   session: Session
   thumbnail?: string
@@ -256,15 +266,7 @@ export default function SessionCard({ session, thumbnail, style, onOpenSession, 
           {session.sandboxed !== undefined && (
             <span
               className={`sandbox-badge ${session.sandboxed ? 'sandbox-on' : 'sandbox-off'}`}
-              title={
-                session.sandboxed
-                  ? 'Sandboxed — Bash commands are confined to this worktree'
-                  : session.tool === 'claude'
-                    ? session.skipPermissions
-                      ? 'Not sandboxed — claude runs with --dangerously-skip-permissions'
-                      : 'Not sandboxed — claude runs under --permission-mode=auto instead'
-                    : 'Not sandboxed — bwrap is unavailable, so this tool runs without worktree containment'
-              }
+              title={sandboxBadgeTitle(session)}
             >
               sandbox
             </span>
