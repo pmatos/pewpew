@@ -47,6 +47,7 @@ interface ProjectTreeUiState {
   pendingSessionHostId: string | null
   sessionNameInput: string
   defaultTool: AgentTool
+  defaultSkipPermissions: boolean
   pendingTool: AgentTool
   creating: boolean
   baseFromOrigin: boolean
@@ -60,6 +61,9 @@ interface ProjectTreeUiState {
   pendingOpenAllPrsPath: string | null
   pendingOpenAllPrsHostId: string | null
   pendingOpenAllPrsTool: AgentTool
+  // Shared by the three tool-picker dialogs (only one is open at a time);
+  // reset to defaultSkipPermissions whenever one opens. Applies to claude only.
+  skipPermissions: boolean
   // The repos a PR/issue can be drawn from (origin + detected upstream parent),
   // and the currently-selected one. Shared across the PR, issue, and open-all
   // dialogs since only one is open at a time. null until resolved / when the
@@ -87,6 +91,32 @@ function projectTreeUiReducer(
 // Repository picker for the PR/issue/open-all dialogs, shown only when origin is
 // a fork (a parent was detected). A component (rather than an inline render
 // helper) so its onChange is a normal event-handler prop.
+function SkipPermissionsCheckbox({
+  tool,
+  checked,
+  onChange,
+}: {
+  tool: AgentTool
+  checked: boolean
+  onChange: (checked: boolean) => void
+}) {
+  if (tool !== 'claude') return null
+  return (
+    <label
+      className="session-base-checkbox"
+      title="Runs claude with --dangerously-skip-permissions instead of --permission-mode auto. Claude is not sandboxed."
+    >
+      <input type="checkbox" checked={checked} onChange={(e) => onChange(e.target.checked)} />
+      <span>Skip permission prompts (--dangerously-skip-permissions)</span>
+    </label>
+  )
+}
+
+// The flag only applies to claude; never send it for other tools.
+function skipPermissionsFor(tool: AgentTool, checked: boolean): boolean {
+  return tool === 'claude' && checked
+}
+
 function RepoPicker({
   choices,
   value,
@@ -311,6 +341,7 @@ function useProjectTreeElement({ onOpenSession }: TreeProps) {
     pendingSessionHostId: null,
     sessionNameInput: '',
     defaultTool: 'claude',
+    defaultSkipPermissions: false,
     pendingTool: 'claude',
     creating: false,
     baseFromOrigin: false,
@@ -324,6 +355,7 @@ function useProjectTreeElement({ onOpenSession }: TreeProps) {
     pendingOpenAllPrsPath: null,
     pendingOpenAllPrsHostId: null,
     pendingOpenAllPrsTool: 'claude',
+    skipPermissions: false,
     repoChoices: null,
     selectedRepo: '',
     pendingIssuePath: null,
@@ -343,6 +375,7 @@ function useProjectTreeElement({ onOpenSession }: TreeProps) {
     pendingSessionHostId,
     sessionNameInput,
     defaultTool,
+    defaultSkipPermissions,
     pendingTool,
     creating,
     baseFromOrigin,
@@ -356,6 +389,7 @@ function useProjectTreeElement({ onOpenSession }: TreeProps) {
     pendingOpenAllPrsPath,
     pendingOpenAllPrsHostId,
     pendingOpenAllPrsTool,
+    skipPermissions,
     repoChoices,
     selectedRepo,
     pendingIssuePath,
@@ -421,18 +455,21 @@ function useProjectTreeElement({ onOpenSession }: TreeProps) {
 
   useEffect(() => {
     let cancelled = false
-    window.api.getDefaultTool().then((tool) => {
+    Promise.all([
+      window.api.getDefaultTool(),
+      window.api.getDefaultSkipPermissions(),
+      window.api.getBulkOpenConfirmThreshold(),
+    ]).then(([tool, skipPermissionsDefault, bulkOpenConfirmThreshold]) => {
       if (cancelled) return
-      setUi({ defaultTool: tool })
-      // Don't touch pendingTool here — the New Session menu-item handler is
-      // the only path that opens the dialog and it re-seeds pendingTool from
-      // defaultTool at click time. Mutating pendingTool from this async
-      // callback would race against any user toggle made between the click
-      // and getDefaultTool resolving.
-    })
-    window.api.getBulkOpenConfirmThreshold().then((n) => {
-      if (cancelled) return
-      setUi({ bulkOpenConfirmThreshold: n })
+      // Don't touch pendingTool or skipPermissions here — the dialog-opening
+      // handlers re-seed them from these defaults at click time. Mutating them
+      // from this async callback would race against any user toggle made
+      // between the click and the defaults resolving.
+      setUi({
+        defaultTool: tool,
+        defaultSkipPermissions: skipPermissionsDefault,
+        bulkOpenConfirmThreshold,
+      })
     })
     return () => {
       cancelled = true
@@ -479,6 +516,7 @@ function useProjectTreeElement({ onOpenSession }: TreeProps) {
       createError: null,
       sessionNameInput: '',
       pendingTool: defaultTool,
+      skipPermissions: defaultSkipPermissions,
       pendingSessionPath: projectPath,
       pendingSessionHostId: hostId,
     }
@@ -498,6 +536,7 @@ function useProjectTreeElement({ onOpenSession }: TreeProps) {
       pendingPrPath: projectPath,
       pendingPrHostId: hostId,
       pendingPrTool: defaultTool,
+      skipPermissions: defaultSkipPermissions,
       prNumberInput: '',
       prError: null,
     })
@@ -535,13 +574,15 @@ function useProjectTreeElement({ onOpenSession }: TreeProps) {
     projectPath: string,
     hostId: string | null,
     repo: string | undefined,
-    tool: AgentTool
+    tool: AgentTool,
+    skipPermissions: boolean
   ) => {
     if (creating) return
     setUi({ creating: true })
     try {
       const result = await window.api.openSessionsForOpenPrs(projectPath, hostId, {
         tool,
+        skipPermissions: skipPermissionsFor(tool, skipPermissions),
         ...(repo ? { repo } : {}),
       })
       showToast(typeof result === 'string' ? result : formatOpenAllSummary(result, 'PR'))
@@ -569,6 +610,7 @@ function useProjectTreeElement({ onOpenSession }: TreeProps) {
       pendingOpenAllPrsPath: projectPath,
       pendingOpenAllPrsHostId: hostId,
       pendingOpenAllPrsTool: tool,
+      skipPermissions: defaultSkipPermissions,
       repoChoices: resolvedChoices,
       selectedRepo: resolvedChoices?.current ?? '',
     })
@@ -580,7 +622,7 @@ function useProjectTreeElement({ onOpenSession }: TreeProps) {
     const hostId = pendingOpenAllPrsHostId
     const repo = repoOverride()
     setUi({ pendingOpenAllPrsPath: null, pendingOpenAllPrsHostId: null })
-    await handleOpenAllPrs(projectPath, hostId, repo, pendingOpenAllPrsTool)
+    await handleOpenAllPrs(projectPath, hostId, repo, pendingOpenAllPrsTool, skipPermissions)
   }
 
   // Load the label filter list for a repo (origin, or a fork's upstream). Bumps
@@ -902,6 +944,7 @@ function useProjectTreeElement({ onOpenSession }: TreeProps) {
       const name = sessionNameInput.trim() || undefined
       await window.api.createSession(pendingSessionPath, name, pendingSessionHostId, {
         tool: pendingTool,
+        skipPermissions: skipPermissionsFor(pendingTool, skipPermissions),
         baseRef: baseFromOrigin ? 'origin-default' : 'local',
       })
       setUi({ pendingSessionPath: null, pendingSessionHostId: null, sessionNameInput: '' })
@@ -925,7 +968,11 @@ function useProjectTreeElement({ onOpenSession }: TreeProps) {
         pendingPrPath,
         parsed.numbers,
         pendingPrHostId,
-        { tool: pendingPrTool, repo: repoOverride() }
+        {
+          tool: pendingPrTool,
+          skipPermissions: skipPermissionsFor(pendingPrTool, skipPermissions),
+          repo: repoOverride(),
+        }
       )
       if (typeof result === 'string') {
         setUi({ prError: result })
@@ -1010,6 +1057,11 @@ function useProjectTreeElement({ onOpenSession }: TreeProps) {
               oh-my-pi
             </label>
           </div>
+          <SkipPermissionsCheckbox
+            tool={pendingTool}
+            checked={skipPermissions}
+            onChange={(checked) => setUi({ skipPermissions: checked })}
+          />
           <label className="session-base-checkbox">
             <input
               type="checkbox"
@@ -1092,6 +1144,11 @@ function useProjectTreeElement({ onOpenSession }: TreeProps) {
               oh-my-pi
             </label>
           </div>
+          <SkipPermissionsCheckbox
+            tool={pendingPrTool}
+            checked={skipPermissions}
+            onChange={(checked) => setUi({ skipPermissions: checked })}
+          />
           {prError && <div className="pr-error">{prError}</div>}
           <div className="create-actions">
             <button className="create-btn" onClick={handleCreatePrSession} disabled={creating}>
@@ -1159,6 +1216,11 @@ function useProjectTreeElement({ onOpenSession }: TreeProps) {
               oh-my-pi
             </label>
           </div>
+          <SkipPermissionsCheckbox
+            tool={pendingOpenAllPrsTool}
+            checked={skipPermissions}
+            onChange={(checked) => setUi({ skipPermissions: checked })}
+          />
           <div className="create-actions">
             <button
               type="button"

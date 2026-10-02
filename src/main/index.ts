@@ -727,6 +727,10 @@ app.whenReady().then(async () => {
     return getConfig().defaultTool
   })
 
+  ipcMain.handle('config:get-default-skip-permissions', () => {
+    return getConfig().defaultSkipPermissions === true
+  })
+
   ipcMain.handle('config:get-bulk-open-confirm-threshold', () => {
     return getConfig().bulkOpenConfirmThreshold
   })

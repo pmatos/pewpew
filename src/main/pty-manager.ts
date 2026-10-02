@@ -35,6 +35,9 @@ import type { AgentTool, Host } from '../shared/types'
 interface SpawnOptions {
   continueSession?: boolean
   tool?: AgentTool
+  // claude only: pass --dangerously-skip-permissions instead of
+  // --permission-mode auto. Ignored for codex/omp.
+  skipPermissions?: boolean
   agentSessionId?: string
   // Absolute path to the agent binary on the target host. Required for remote
   // sessions because non-interactive ssh PATH excludes user-bin dirs like
@@ -78,7 +81,9 @@ export function buildAgentArgs(options?: SpawnOptions): string[] {
     if (options?.continueSession) args.push('--continue')
     return args
   }
-  const args = [cmd, '--permission-mode', 'auto']
+  const args = options?.skipPermissions
+    ? [cmd, '--dangerously-skip-permissions']
+    : [cmd, '--permission-mode', 'auto']
   if (options?.continueSession) args.push('--continue')
   return args
 }
@@ -344,7 +349,8 @@ export function isSandboxAvailable(): boolean {
 // future session across every project loads.
 //
 // claude is never sandboxed (see buildAgentArgs / buildLocalSandboxPrefix —
-// it runs under --permission-mode=auto instead), so this function is only
+// it runs under --permission-mode=auto, or skips permissions when the
+// session opted in, instead), so this function is only
 // called for claude to locate — and mkdir ahead of first run — the
 // per-worktree resume-history marker dir that hasClaudeConversationHistory
 // (session-manager.ts) checks.
@@ -469,7 +475,7 @@ function buildLocalSandboxPrefix(
   // regardless of whether this tool ends up sandboxed below.
   const stateDir = agentStateDir(tool, cwd)
   mkdirSync(stateDir, { recursive: true })
-  // claude relies on --permission-mode=auto (see buildAgentArgs) instead of
+  // claude relies on its own permission mode (see buildAgentArgs) instead of
   // pewpew's own bwrap boundary — no sandbox prefix for it.
   if (tool !== 'codex' && tool !== 'omp') return []
   const sandboxConfig = getSandboxConfig()
@@ -633,8 +639,8 @@ export async function createRemotePty(
         options.projectPath
       )
     }
-    // claude is never sandboxed (see buildAgentArgs — it runs under
-    // --permission-mode=auto instead), so only codex/omp reach the bwrap
+    // claude is never sandboxed (see buildAgentArgs — it runs under its own
+    // permission mode instead), so only codex/omp reach the bwrap
     // wiring below.
     if (options.tool === 'codex' || options.tool === 'omp') {
       const tool = options.tool

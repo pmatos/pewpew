@@ -16,6 +16,7 @@ const state = vi.hoisted(() => ({
   remoteProjects: [] as RemoteProject[],
   worktreeBase: 'local' as WorktreeBase,
   defaultTool: 'claude' as AgentTool,
+  defaultSkipPermissions: false,
   runtimeStates: new Map<string, string>(),
   // Call logs for assertion.
   ensureHostConnectionCalls: [] as string[],
@@ -29,7 +30,7 @@ const state = vi.hoisted(() => ({
     remoteSocketPath?: string
   }[],
   reattachRemotePtyCalls: [] as { sessionId: string; hostId: string }[],
-  createPtyCalls: [] as { sessionId: string; cwd: string }[],
+  createPtyCalls: [] as { sessionId: string; cwd: string; skipPermissions?: boolean }[],
   reattachPtyCalls: [] as string[],
   detachPtyCalls: [] as string[],
   hasRemoteTmuxResult: new Map<string, boolean>(),
@@ -114,6 +115,7 @@ vi.mock('./config', () => ({
     hosts: state.hosts,
     remoteProjects: [],
     defaultTool: state.defaultTool,
+    defaultSkipPermissions: state.defaultSkipPermissions,
     worktreeBase: state.worktreeBase,
   }),
   getReconnectConfig: () => state.reconnectConfig,
@@ -223,8 +225,8 @@ vi.mock('./host-bootstrap', () => ({
 }))
 
 vi.mock('./pty-manager', () => ({
-  createPty: (sessionId: string, cwd: string) => {
-    state.createPtyCalls.push({ sessionId, cwd })
+  createPty: (sessionId: string, cwd: string, options?: { skipPermissions?: boolean }) => {
+    state.createPtyCalls.push({ sessionId, cwd, skipPermissions: options?.skipPermissions })
   },
   detachPty: (sessionId: string) => {
     state.detachPtyCalls.push(sessionId)
@@ -424,6 +426,7 @@ beforeEach(() => {
   state.remoteProjects = []
   state.worktreeBase = 'local'
   state.defaultTool = 'claude'
+  state.defaultSkipPermissions = false
   state.runtimeStates = new Map()
   state.ensureHostConnectionCalls = []
   state.createRemotePtyCalls = []
@@ -860,6 +863,32 @@ describe('createSession origin-default base', () => {
 
       const branch = git(session.worktreePath, ['rev-parse', '--abbrev-ref', 'HEAD']).trim()
       expect(branch).toBe(branchName)
+    } finally {
+      rmSync(root, { recursive: true, force: true })
+    }
+  })
+
+  gitIt('falls back to defaultSkipPermissions unless the caller chooses explicitly', async () => {
+    const root = mkdtempSync(join(tmpdir(), 'skip-perms-default-'))
+    try {
+      const project = createProjectWithUpdatedOrigin(root)
+      const sm = await loadSessionManager()
+
+      const plain = await sm.createSession(project, 'plain', null, {})
+      expect(plain.skipPermissions).toBeUndefined()
+
+      state.defaultSkipPermissions = true
+      const inherited = await sm.createSession(project, 'inherited', null, {})
+      expect(inherited.skipPermissions).toBe(true)
+      expect(state.createPtyCalls.at(-1)?.skipPermissions).toBe(true)
+
+      const overridden = await sm.createSession(project, 'overridden', null, {
+        skipPermissions: false,
+      })
+      expect(overridden.skipPermissions).toBeUndefined()
+
+      const notClaude = await sm.createSession(project, 'codex-one', null, { tool: 'codex' })
+      expect(notClaude.skipPermissions).toBeUndefined()
     } finally {
       rmSync(root, { recursive: true, force: true })
     }
@@ -2549,6 +2578,7 @@ describe('createIssueSession', () => {
       '/proj',
       '/proj/.claude/worktrees/issue-42',
       'issue-42',
+      undefined,
       undefined
     )
     expect(runGit).toHaveBeenCalledWith([
@@ -2560,6 +2590,43 @@ describe('createIssueSession', () => {
       'issue-42',
       'refs/remotes/origin/main',
     ])
+  })
+
+  it('forwards skipPermissions to the worktree adoption', async () => {
+    const sm = await loadSessionManager()
+    const runGit = vi.fn(async (argv: string[]) => {
+      const key = argv.join(' ')
+      if (key === 'remote get-url origin') return { stdout: 'git@example.com:org/repo.git\n' }
+      if (key === 'fetch origin --quiet') return { stdout: '' }
+      if (key === 'ls-remote --symref origin HEAD') {
+        return { stdout: 'ref: refs/heads/main\tHEAD\nabc123\tHEAD\n' }
+      }
+      if (key === 'symbolic-ref --short refs/remotes/origin/HEAD') {
+        return { stdout: 'origin/main\n' }
+      }
+      if (key === 'rev-parse --verify refs/remotes/origin/main') return { stdout: 'abc123\n' }
+      if (key.startsWith('worktree add')) return { stdout: '' }
+      throw new Error(`unexpected git ${key}`)
+    })
+    const createSessionForWorktree = vi.fn(async () =>
+      baseLocalSession({ id: 'issue-7', projectPath: '/proj', worktreeName: 'issue-7' })
+    )
+
+    await sm.createIssueSession(
+      '/proj',
+      7,
+      null,
+      { tool: 'claude', skipPermissions: true },
+      { runGit, createSessionForWorktree }
+    )
+
+    expect(createSessionForWorktree).toHaveBeenCalledWith(
+      '/proj',
+      '/proj/.claude/worktrees/issue-7',
+      'issue-7',
+      'claude',
+      true
+    )
   })
 
   it('returns a user-facing error string when origin default is missing', async () => {

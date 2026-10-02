@@ -115,6 +115,8 @@ contextBridge.exposeInMainWorld('api', {
   saveSidebarWidth: (width: number) => ipcRenderer.invoke('config:save-sidebar-width', width),
   getUiScale: () => ipcRenderer.invoke('config:get-ui-scale'),
   getDefaultTool: () => ipcRenderer.invoke('config:get-default-tool') as Promise<AgentTool>,
+  getDefaultSkipPermissions: () =>
+    ipcRenderer.invoke('config:get-default-skip-permissions') as Promise<boolean>,
   getBulkOpenConfirmThreshold: () =>
     ipcRenderer.invoke('config:get-bulk-open-confirm-threshold') as Promise<number>,
   getWorktreeBase: () => ipcRenderer.invoke('config:get-worktree-base'),

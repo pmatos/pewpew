@@ -12,6 +12,7 @@ export interface SessionRecordInput {
   worktreePath: string
   branch: string
   tool: AgentTool
+  skipPermissions?: boolean
   sandboxed: boolean
   now: number
   issueNumber?: number
@@ -52,6 +53,7 @@ export function buildSession(input: SessionRecordInput): Session {
   }
   // A remote session opens with a live SSH connection; a local one has no
   // connection state at all. Deriving the key from hostId is the invariant.
+  if (input.skipPermissions && input.tool === 'claude') session.skipPermissions = true
   if (input.hostId !== null) session.connectionState = 'live'
   if (input.repoFingerprint) session.repoFingerprint = input.repoFingerprint
   if (input.prNumber !== undefined) session.prNumber = input.prNumber

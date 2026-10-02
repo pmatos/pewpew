@@ -3,9 +3,9 @@
 // with their own approval checks bypassed (--dangerously-bypass-approvals-
 // and-sandbox / --auto-approve), so pewpew owns this write boundary itself at
 // the tmux spawn layer instead. claude does NOT go through this module — it
-// runs under --permission-mode=auto instead (see buildAgentArgs in
-// pty-manager.ts), relying on that mode's own approval gating rather than an
-// OS-level sandbox.
+// runs under --permission-mode=auto (or --dangerously-skip-permissions when
+// the session opts in) instead (see buildAgentArgs in pty-manager.ts) rather
+// than an OS-level sandbox.
 // Kept free of fs/child_process so bind order (see below) can be asserted
 // directly in unit tests.
 //
