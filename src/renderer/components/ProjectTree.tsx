@@ -1,4 +1,4 @@
-import { useEffect, useReducer, useRef } from 'react'
+import { useEffect, useId, useReducer, useRef, useState } from 'react'
 import { useProjectsStore, remoteWorktreeKey } from '../stores/projects'
 import { useSessionsStore } from '../stores/sessions'
 import { useHostsStore } from '../stores/hosts'
@@ -56,12 +56,7 @@ interface ProjectTreeUiState {
   pendingPrTool: AgentTool
   prNumberInput: string
   prError: string | null
-  pendingIssueSessionPath: string | null
-  pendingIssueSessionHostId: string | null
-  pendingIssueSessionTool: AgentTool
-  issueSpecInput: string
-  issueSpecError: string | null
-  issueSpecConfirmCount: number | null
+  pendingIssueSession: { path: string; hostId: string | null } | null
   pendingOpenAllPrsPath: string | null
   pendingOpenAllPrsHostId: string | null
   pendingOpenAllPrsTool: AgentTool
@@ -121,6 +116,181 @@ function RepoPicker({
   )
 }
 
+function describeCreateError(err: unknown): string {
+  const message = err instanceof Error ? err.message : String(err)
+  if (message.includes('no-origin-remote')) return 'This project has no origin remote.'
+  if (message.includes('no-origin-default-branch')) {
+    return "Could not determine origin's default branch."
+  }
+  return message.replace(/^Error:\s*/, '') || 'Failed to create session.'
+}
+
+function formatSpecSummary(result: OpenSessionsSummary, noun: SpecNoun): string {
+  const parts: string[] = []
+  if (result.created.length > 0) {
+    parts.push(
+      `Opened ${result.created.length} ${noun} session${result.created.length === 1 ? '' : 's'}`
+    )
+  }
+  if (result.reused.length > 0) parts.push(`linked ${result.reused.length} existing`)
+  if (result.skipped.length > 0) parts.push(`skipped ${result.skipped.length}`)
+  if (result.failed.length > 0) parts.push(`${result.failed.length} failed`)
+  return parts.length > 0 ? parts.join(', ') : `No ${noun} sessions created`
+}
+
+function formatSpecFailures(result: OpenSessionsSummary): string[] {
+  return result.failed.map((f) => `#${f.number}: ${f.error}`)
+}
+
+function formatSpecErrors(result: OpenSessionsSummary, noun: SpecNoun): string {
+  return [`No ${noun} sessions opened.`, ...formatSpecFailures(result)].join('\n')
+}
+
+const TOOL_OPTIONS = [
+  ['claude', 'Claude'],
+  ['codex', 'Codex'],
+  ['omp', 'oh-my-pi'],
+] as const
+
+interface IssueSessionDialogProps {
+  path: string
+  hostId: string | null
+  defaultTool: AgentTool
+  confirmThreshold: number
+  onClose: () => void
+  onToast: (msg: string) => void
+}
+
+function IssueSessionDialog({
+  path,
+  hostId,
+  defaultTool,
+  confirmThreshold,
+  onClose,
+  onToast,
+}: IssueSessionDialogProps) {
+  const inputId = useId()
+  const inputRef = useRef<HTMLInputElement>(null)
+  const [spec, setSpec] = useState('')
+  const [tool, setTool] = useState<AgentTool>(defaultTool)
+  const [error, setError] = useState<string | null>(null)
+  const [confirmCount, setConfirmCount] = useState<number | null>(null)
+  const [creating, setCreating] = useState(false)
+
+  useEffect(() => {
+    inputRef.current?.focus()
+  }, [])
+
+  const submit = async () => {
+    if (creating) return
+    const parsed = parseIssueSpec(spec)
+    if ('error' in parsed) {
+      setError(parsed.error)
+      setConfirmCount(null)
+      return
+    }
+    if (confirmCount === null && parsed.numbers.length > confirmThreshold) {
+      setConfirmCount(parsed.numbers.length)
+      setError(null)
+      return
+    }
+    setCreating(true)
+    setError(null)
+    setConfirmCount(null)
+    try {
+      const result = await window.api.createIssueSessions(path, parsed.numbers, hostId, { tool })
+      if (typeof result === 'string') {
+        setError(result)
+        return
+      }
+      const opened = result.created.length + result.reused.length
+      if (parsed.numbers.length === 1) {
+        if (result.failed.length === 1) {
+          setError(result.failed[0].error)
+          return
+        }
+        if (result.skipped.length === 1) {
+          setError(`Issue #${result.skipped[0]} already has a session.`)
+          return
+        }
+      } else if (opened === 0) {
+        setError(formatSpecErrors(result, 'issue'))
+        return
+      } else if (result.failed.length > 0) {
+        setSpec(result.failed.map((f) => f.number).join(', '))
+        setError([formatSpecSummary(result, 'issue'), ...formatSpecFailures(result)].join('\n'))
+        return
+      } else {
+        onToast(formatSpecSummary(result, 'issue'))
+      }
+      onClose()
+    } catch (err) {
+      setError(describeCreateError(err))
+    } finally {
+      setCreating(false)
+    }
+  }
+
+  const submitLabel = creating
+    ? 'Creating…'
+    : confirmCount !== null
+      ? `Open ${confirmCount}`
+      : 'Create'
+
+  return (
+    <div className="session-name-dialog">
+      <label className="session-name-label" htmlFor={inputId}>
+        Issue number(s):
+      </label>
+      <input
+        id={inputId}
+        ref={inputRef}
+        type="text"
+        className="create-input"
+        placeholder="e.g. 42 or 1,2,22-28"
+        value={spec}
+        onChange={(e) => {
+          setSpec(e.target.value)
+          setConfirmCount(null)
+        }}
+        onKeyDown={(e) => {
+          if (e.key === 'Enter') void submit()
+          if (e.key === 'Escape') onClose()
+        }}
+      />
+      <div className="session-name-label">Tool:</div>
+      <div className="tool-picker">
+        {TOOL_OPTIONS.map(([value, label]) => (
+          <label key={value}>
+            <input
+              type="radio"
+              name="issue-tool"
+              value={value}
+              checked={tool === value}
+              onChange={() => setTool(value)}
+            />
+            {label}
+          </label>
+        ))}
+      </div>
+      {error && <div className="pr-error">{error}</div>}
+      {confirmCount !== null && (
+        <div className="pr-error">
+          This will open {confirmCount} issue sessions. Click again to confirm.
+        </div>
+      )}
+      <div className="create-actions">
+        <button className="create-btn" onClick={() => void submit()} disabled={creating}>
+          {submitLabel}
+        </button>
+        <button className="create-btn cancel" onClick={onClose}>
+          Cancel
+        </button>
+      </div>
+    </div>
+  )
+}
+
 export default function ProjectTree(props: TreeProps) {
   return useProjectTreeElement(props)
 }
@@ -150,12 +320,7 @@ function useProjectTreeElement({ onOpenSession }: TreeProps) {
     pendingPrTool: 'claude',
     prNumberInput: '',
     prError: null,
-    pendingIssueSessionPath: null,
-    pendingIssueSessionHostId: null,
-    pendingIssueSessionTool: 'claude',
-    issueSpecInput: '',
-    issueSpecError: null,
-    issueSpecConfirmCount: null,
+    pendingIssueSession: null,
     pendingOpenAllPrsPath: null,
     pendingOpenAllPrsHostId: null,
     pendingOpenAllPrsTool: 'claude',
@@ -187,12 +352,7 @@ function useProjectTreeElement({ onOpenSession }: TreeProps) {
     pendingPrTool,
     prNumberInput,
     prError,
-    pendingIssueSessionPath,
-    pendingIssueSessionHostId,
-    pendingIssueSessionTool,
-    issueSpecInput,
-    issueSpecError,
-    issueSpecConfirmCount,
+    pendingIssueSession,
     pendingOpenAllPrsPath,
     pendingOpenAllPrsHostId,
     pendingOpenAllPrsTool,
@@ -210,7 +370,6 @@ function useProjectTreeElement({ onOpenSession }: TreeProps) {
   } = ui
   const sessionNameInputRef = useRef<HTMLInputElement>(null)
   const prNumberInputRef = useRef<HTMLInputElement>(null)
-  const issueSpecInputRef = useRef<HTMLInputElement>(null)
   const bulkOpenPrsDialogRef = useRef<HTMLDivElement>(null)
   // Monotonic token: bumped whenever the issue dialog opens or closes so an
   // in-flight countOpenIssues can detect it was canceled/reopened mid-await.
@@ -335,8 +494,7 @@ function useProjectTreeElement({ onOpenSession }: TreeProps) {
 
   const openPrSessionDialog = (projectPath: string, hostId: string | null) => {
     setUi({
-      pendingIssueSessionPath: null,
-      pendingIssueSessionHostId: null,
+      pendingIssueSession: null,
       pendingPrPath: projectPath,
       pendingPrHostId: hostId,
       pendingPrTool: defaultTool,
@@ -352,52 +510,8 @@ function useProjectTreeElement({ onOpenSession }: TreeProps) {
       pendingPrPath: null,
       pendingPrHostId: null,
       prError: null,
-      pendingIssueSessionPath: projectPath,
-      pendingIssueSessionHostId: hostId,
-      pendingIssueSessionTool: defaultTool,
-      issueSpecInput: '',
-      issueSpecError: null,
-      issueSpecConfirmCount: null,
+      pendingIssueSession: { path: projectPath, hostId },
     })
-    setTimeout(() => issueSpecInputRef.current?.focus(), 0)
-  }
-
-  const closeIssueSessionDialog = () => {
-    setUi({
-      pendingIssueSessionPath: null,
-      pendingIssueSessionHostId: null,
-      issueSpecError: null,
-      issueSpecConfirmCount: null,
-    })
-  }
-
-  const describeCreateError = (err: unknown): string => {
-    const message = err instanceof Error ? err.message : String(err)
-    if (message.includes('no-origin-remote')) return 'This project has no origin remote.'
-    if (message.includes('no-origin-default-branch')) {
-      return "Could not determine origin's default branch."
-    }
-    return message.replace(/^Error:\s*/, '') || 'Failed to create session.'
-  }
-
-  const formatSpecSummary = (result: OpenSessionsSummary, noun: SpecNoun): string => {
-    const parts: string[] = []
-    if (result.created.length > 0) {
-      parts.push(
-        `Opened ${result.created.length} ${noun} session${result.created.length === 1 ? '' : 's'}`
-      )
-    }
-    if (result.reused.length > 0) parts.push(`linked ${result.reused.length} existing`)
-    if (result.skipped.length > 0) parts.push(`skipped ${result.skipped.length}`)
-    if (result.failed.length > 0) parts.push(`${result.failed.length} failed`)
-    return parts.length > 0 ? parts.join(', ') : `No ${noun} sessions created`
-  }
-
-  const formatSpecFailures = (result: OpenSessionsSummary): string[] =>
-    result.failed.map((f) => `#${f.number}: ${f.error}`)
-
-  const formatSpecErrors = (result: OpenSessionsSummary, noun: SpecNoun): string => {
-    return [`No ${noun} sessions opened.`, ...formatSpecFailures(result)].join('\n')
   }
 
   const formatOpenAllSummary = (result: OpenSessionsSummary, label: 'PR' | 'issue'): string => {
@@ -844,72 +958,6 @@ function useProjectTreeElement({ onOpenSession }: TreeProps) {
     }
   }
 
-  const issueSubmitLabel = creating
-    ? 'Creating…'
-    : issueSpecConfirmCount !== null
-      ? `Open ${issueSpecConfirmCount}`
-      : 'Create'
-
-  const handleCreateIssueSession = async () => {
-    if (!pendingIssueSessionPath || creating) return
-    const confirmed = issueSpecConfirmCount !== null
-    const parsed = parseIssueSpec(issueSpecInput)
-    if ('error' in parsed) {
-      setUi({ issueSpecError: parsed.error, issueSpecConfirmCount: null })
-      return
-    }
-    if (!confirmed && parsed.numbers.length > bulkOpenConfirmThreshold) {
-      setUi({ issueSpecConfirmCount: parsed.numbers.length, issueSpecError: null })
-      return
-    }
-    setUi({ creating: true, issueSpecError: null, issueSpecConfirmCount: null })
-    try {
-      const result = await window.api.createIssueSessions(
-        pendingIssueSessionPath,
-        parsed.numbers,
-        pendingIssueSessionHostId,
-        { tool: pendingIssueSessionTool }
-      )
-      if (typeof result === 'string') {
-        setUi({ issueSpecError: result })
-        return
-      }
-      const opened = result.created.length + result.reused.length
-      if (parsed.numbers.length === 1) {
-        if (result.failed.length === 1) {
-          setUi({ issueSpecError: result.failed[0].error })
-          return
-        }
-        if (result.skipped.length === 1) {
-          setUi({ issueSpecError: `Issue #${result.skipped[0]} already has a session.` })
-          return
-        }
-      } else if (opened === 0) {
-        setUi({ issueSpecError: formatSpecErrors(result, 'issue') })
-        return
-      } else if (result.failed.length > 0) {
-        setUi({
-          issueSpecInput: result.failed.map((f) => f.number).join(', '),
-          issueSpecError: [formatSpecSummary(result, 'issue'), ...formatSpecFailures(result)].join(
-            '\n'
-          ),
-        })
-        return
-      } else {
-        showToast(formatSpecSummary(result, 'issue'))
-      }
-      setUi({
-        pendingIssueSessionPath: null,
-        pendingIssueSessionHostId: null,
-        issueSpecInput: '',
-      })
-    } catch (err) {
-      setUi({ issueSpecError: describeCreateError(err) })
-    } finally {
-      setUi({ creating: false })
-    }
-  }
-
   return (
     <div className="project-tree">
       {pendingSessionPath && (
@@ -1060,61 +1108,15 @@ function useProjectTreeElement({ onOpenSession }: TreeProps) {
           </div>
         </div>
       )}
-      {pendingIssueSessionPath && (
-        <div className="session-name-dialog">
-          <div className="session-name-label">Issue number(s):</div>
-          <input
-            ref={issueSpecInputRef}
-            type="text"
-            className="create-input"
-            placeholder="e.g. 42 or 1,2,22-28"
-            value={issueSpecInput}
-            onChange={(e) => setUi({ issueSpecInput: e.target.value, issueSpecConfirmCount: null })}
-            onKeyDown={(e) => {
-              if (e.key === 'Enter') void handleCreateIssueSession()
-              if (e.key === 'Escape') closeIssueSessionDialog()
-            }}
-          />
-          <div className="session-name-label">Tool:</div>
-          <div className="tool-picker">
-            {(
-              [
-                ['claude', 'Claude'],
-                ['codex', 'Codex'],
-                ['omp', 'oh-my-pi'],
-              ] as const
-            ).map(([tool, label]) => (
-              <label key={tool}>
-                <input
-                  type="radio"
-                  name="issue-tool"
-                  value={tool}
-                  checked={pendingIssueSessionTool === tool}
-                  onChange={() => setUi({ pendingIssueSessionTool: tool })}
-                />
-                {label}
-              </label>
-            ))}
-          </div>
-          {issueSpecError && <div className="pr-error">{issueSpecError}</div>}
-          {issueSpecConfirmCount !== null && (
-            <div className="pr-error">
-              This will open {issueSpecConfirmCount} issue sessions. Click again to confirm.
-            </div>
-          )}
-          <div className="create-actions">
-            <button
-              className="create-btn"
-              onClick={() => void handleCreateIssueSession()}
-              disabled={creating}
-            >
-              {issueSubmitLabel}
-            </button>
-            <button className="create-btn cancel" onClick={closeIssueSessionDialog}>
-              Cancel
-            </button>
-          </div>
-        </div>
+      {pendingIssueSession && (
+        <IssueSessionDialog
+          path={pendingIssueSession.path}
+          hostId={pendingIssueSession.hostId}
+          defaultTool={defaultTool}
+          confirmThreshold={bulkOpenConfirmThreshold}
+          onClose={() => setUi({ pendingIssueSession: null })}
+          onToast={showToast}
+        />
       )}
       {pendingOpenAllPrsPath && (
         <div ref={bulkOpenPrsDialogRef} className="session-name-dialog">
