@@ -4,7 +4,7 @@ import { useSessionsStore } from '../stores/sessions'
 import { useHostsStore } from '../stores/hosts'
 import ContextMenu, { type MenuItem } from './ContextMenu'
 import type { AgentTool, OpenSessionsSummary, RepoChoices } from '../../shared/types'
-import { parseIssueSpec, parsePrSpec } from '../utils/pr-spec-parser'
+import { parseIssueSpec, parsePrSpec, type SpecNoun } from '../utils/pr-spec-parser'
 
 interface MenuState {
   x: number
@@ -380,7 +380,7 @@ function useProjectTreeElement({ onOpenSession }: TreeProps) {
     return message.replace(/^Error:\s*/, '') || 'Failed to create session.'
   }
 
-  const formatSpecSummary = (result: OpenSessionsSummary, noun: 'PR' | 'issue'): string => {
+  const formatSpecSummary = (result: OpenSessionsSummary, noun: SpecNoun): string => {
     const parts: string[] = []
     if (result.created.length > 0) {
       parts.push(
@@ -393,9 +393,11 @@ function useProjectTreeElement({ onOpenSession }: TreeProps) {
     return parts.length > 0 ? parts.join(', ') : `No ${noun} sessions created`
   }
 
-  const formatSpecErrors = (result: OpenSessionsSummary, noun: 'PR' | 'issue'): string => {
-    const lines = result.failed.map((f) => `#${f.number}: ${f.error}`)
-    return [`No ${noun} sessions opened.`, ...lines].join('\n')
+  const formatSpecFailures = (result: OpenSessionsSummary): string[] =>
+    result.failed.map((f) => `#${f.number}: ${f.error}`)
+
+  const formatSpecErrors = (result: OpenSessionsSummary, noun: SpecNoun): string => {
+    return [`No ${noun} sessions opened.`, ...formatSpecFailures(result)].join('\n')
   }
 
   const formatOpenAllSummary = (result: OpenSessionsSummary, label: 'PR' | 'issue'): string => {
@@ -842,8 +844,15 @@ function useProjectTreeElement({ onOpenSession }: TreeProps) {
     }
   }
 
-  const handleCreateIssueSession = async (confirmed = false) => {
+  const issueSubmitLabel = creating
+    ? 'Creating…'
+    : issueSpecConfirmCount !== null
+      ? `Open ${issueSpecConfirmCount}`
+      : 'Create'
+
+  const handleCreateIssueSession = async () => {
     if (!pendingIssueSessionPath || creating) return
+    const confirmed = issueSpecConfirmCount !== null
     const parsed = parseIssueSpec(issueSpecInput)
     if ('error' in parsed) {
       setUi({ issueSpecError: parsed.error, issueSpecConfirmCount: null })
@@ -879,10 +888,11 @@ function useProjectTreeElement({ onOpenSession }: TreeProps) {
         setUi({ issueSpecError: formatSpecErrors(result, 'issue') })
         return
       } else if (result.failed.length > 0) {
-        const lines = result.failed.map((f) => `#${f.number}: ${f.error}`)
         setUi({
           issueSpecInput: result.failed.map((f) => f.number).join(', '),
-          issueSpecError: [formatSpecSummary(result, 'issue'), ...lines].join('\n'),
+          issueSpecError: [formatSpecSummary(result, 'issue'), ...formatSpecFailures(result)].join(
+            '\n'
+          ),
         })
         return
       } else {
@@ -1061,7 +1071,7 @@ function useProjectTreeElement({ onOpenSession }: TreeProps) {
             value={issueSpecInput}
             onChange={(e) => setUi({ issueSpecInput: e.target.value, issueSpecConfirmCount: null })}
             onKeyDown={(e) => {
-              if (e.key === 'Enter') void handleCreateIssueSession(issueSpecConfirmCount !== null)
+              if (e.key === 'Enter') void handleCreateIssueSession()
               if (e.key === 'Escape') closeIssueSessionDialog()
             }}
           />
@@ -1095,14 +1105,10 @@ function useProjectTreeElement({ onOpenSession }: TreeProps) {
           <div className="create-actions">
             <button
               className="create-btn"
-              onClick={() => void handleCreateIssueSession(issueSpecConfirmCount !== null)}
+              onClick={() => void handleCreateIssueSession()}
               disabled={creating}
             >
-              {creating
-                ? 'Creating…'
-                : issueSpecConfirmCount !== null
-                  ? `Open ${issueSpecConfirmCount}`
-                  : 'Create'}
+              {issueSubmitLabel}
             </button>
             <button className="create-btn cancel" onClick={closeIssueSessionDialog}>
               Cancel
