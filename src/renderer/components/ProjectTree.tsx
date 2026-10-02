@@ -61,6 +61,7 @@ interface ProjectTreeUiState {
   pendingIssueSessionTool: AgentTool
   issueSpecInput: string
   issueSpecError: string | null
+  issueSpecConfirmCount: number | null
   pendingOpenAllPrsPath: string | null
   pendingOpenAllPrsHostId: string | null
   pendingOpenAllPrsTool: AgentTool
@@ -154,6 +155,7 @@ function useProjectTreeElement({ onOpenSession }: TreeProps) {
     pendingIssueSessionTool: 'claude',
     issueSpecInput: '',
     issueSpecError: null,
+    issueSpecConfirmCount: null,
     pendingOpenAllPrsPath: null,
     pendingOpenAllPrsHostId: null,
     pendingOpenAllPrsTool: 'claude',
@@ -190,6 +192,7 @@ function useProjectTreeElement({ onOpenSession }: TreeProps) {
     pendingIssueSessionTool,
     issueSpecInput,
     issueSpecError,
+    issueSpecConfirmCount,
     pendingOpenAllPrsPath,
     pendingOpenAllPrsHostId,
     pendingOpenAllPrsTool,
@@ -332,6 +335,8 @@ function useProjectTreeElement({ onOpenSession }: TreeProps) {
 
   const openPrSessionDialog = (projectPath: string, hostId: string | null) => {
     setUi({
+      pendingIssueSessionPath: null,
+      pendingIssueSessionHostId: null,
       pendingPrPath: projectPath,
       pendingPrHostId: hostId,
       pendingPrTool: defaultTool,
@@ -344,17 +349,26 @@ function useProjectTreeElement({ onOpenSession }: TreeProps) {
 
   const openIssueSessionDialog = (projectPath: string, hostId: string | null) => {
     setUi({
+      pendingPrPath: null,
+      pendingPrHostId: null,
+      prError: null,
       pendingIssueSessionPath: projectPath,
       pendingIssueSessionHostId: hostId,
       pendingIssueSessionTool: defaultTool,
       issueSpecInput: '',
       issueSpecError: null,
+      issueSpecConfirmCount: null,
     })
     setTimeout(() => issueSpecInputRef.current?.focus(), 0)
   }
 
   const closeIssueSessionDialog = () => {
-    setUi({ pendingIssueSessionPath: null, pendingIssueSessionHostId: null, issueSpecError: null })
+    setUi({
+      pendingIssueSessionPath: null,
+      pendingIssueSessionHostId: null,
+      issueSpecError: null,
+      issueSpecConfirmCount: null,
+    })
   }
 
   const describeCreateError = (err: unknown): string => {
@@ -828,14 +842,18 @@ function useProjectTreeElement({ onOpenSession }: TreeProps) {
     }
   }
 
-  const handleCreateIssueSession = async () => {
+  const handleCreateIssueSession = async (confirmed = false) => {
     if (!pendingIssueSessionPath || creating) return
     const parsed = parseIssueSpec(issueSpecInput)
     if ('error' in parsed) {
-      setUi({ issueSpecError: parsed.error })
+      setUi({ issueSpecError: parsed.error, issueSpecConfirmCount: null })
       return
     }
-    setUi({ creating: true, issueSpecError: null })
+    if (!confirmed && parsed.numbers.length > bulkOpenConfirmThreshold) {
+      setUi({ issueSpecConfirmCount: parsed.numbers.length, issueSpecError: null })
+      return
+    }
+    setUi({ creating: true, issueSpecError: null, issueSpecConfirmCount: null })
     try {
       const result = await window.api.createIssueSessions(
         pendingIssueSessionPath,
@@ -847,15 +865,29 @@ function useProjectTreeElement({ onOpenSession }: TreeProps) {
         setUi({ issueSpecError: result })
         return
       }
-      if (result.created.length === 0 && result.reused.length === 0) {
-        const message =
-          result.failed.length > 0
-            ? formatSpecErrors(result, 'issue')
-            : `${parsed.numbers.length === 1 ? `Issue #${result.skipped[0]} already has` : 'All issues already have'} a session.`
-        setUi({ issueSpecError: message })
+      const opened = result.created.length + result.reused.length
+      if (parsed.numbers.length === 1) {
+        if (result.failed.length === 1) {
+          setUi({ issueSpecError: result.failed[0].error })
+          return
+        }
+        if (result.skipped.length === 1) {
+          setUi({ issueSpecError: `Issue #${result.skipped[0]} already has a session.` })
+          return
+        }
+      } else if (opened === 0) {
+        setUi({ issueSpecError: formatSpecErrors(result, 'issue') })
         return
+      } else if (result.failed.length > 0) {
+        const lines = result.failed.map((f) => `#${f.number}: ${f.error}`)
+        setUi({
+          issueSpecInput: result.failed.map((f) => f.number).join(', '),
+          issueSpecError: [formatSpecSummary(result, 'issue'), ...lines].join('\n'),
+        })
+        return
+      } else {
+        showToast(formatSpecSummary(result, 'issue'))
       }
-      if (parsed.numbers.length > 1) showToast(formatSpecSummary(result, 'issue'))
       setUi({
         pendingIssueSessionPath: null,
         pendingIssueSessionHostId: null,
@@ -1027,9 +1059,9 @@ function useProjectTreeElement({ onOpenSession }: TreeProps) {
             className="create-input"
             placeholder="e.g. 42 or 1,2,22-28"
             value={issueSpecInput}
-            onChange={(e) => setUi({ issueSpecInput: e.target.value })}
+            onChange={(e) => setUi({ issueSpecInput: e.target.value, issueSpecConfirmCount: null })}
             onKeyDown={(e) => {
-              if (e.key === 'Enter') handleCreateIssueSession()
+              if (e.key === 'Enter') void handleCreateIssueSession(issueSpecConfirmCount !== null)
               if (e.key === 'Escape') closeIssueSessionDialog()
             }}
           />
@@ -1055,9 +1087,22 @@ function useProjectTreeElement({ onOpenSession }: TreeProps) {
             ))}
           </div>
           {issueSpecError && <div className="pr-error">{issueSpecError}</div>}
+          {issueSpecConfirmCount !== null && (
+            <div className="pr-error">
+              This will open {issueSpecConfirmCount} issue sessions. Click again to confirm.
+            </div>
+          )}
           <div className="create-actions">
-            <button className="create-btn" onClick={handleCreateIssueSession} disabled={creating}>
-              {creating ? 'Creating…' : 'Create'}
+            <button
+              className="create-btn"
+              onClick={() => void handleCreateIssueSession(issueSpecConfirmCount !== null)}
+              disabled={creating}
+            >
+              {creating
+                ? 'Creating…'
+                : issueSpecConfirmCount !== null
+                  ? `Open ${issueSpecConfirmCount}`
+                  : 'Create'}
             </button>
             <button className="create-btn cancel" onClick={closeIssueSessionDialog}>
               Cancel
