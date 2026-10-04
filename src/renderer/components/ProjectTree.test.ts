@@ -1,24 +1,28 @@
 import { describe, expect, it, vi } from 'vitest'
-import { resolveBulkPrDialogDefaults } from './ProjectTree'
+import { resolveSessionDialogDefaults } from './SessionDialogs'
 
-describe('bulk PR dialog defaults', () => {
-  it('reads the configured tool when opening instead of using a stale render default', async () => {
-    let resolveRepoChoices: ((value: { current: string; parent: null }) => void) | undefined
-    const getRepoChoices = vi.fn(
-      () =>
-        new Promise<{ current: string; parent: null }>((resolve) => {
-          resolveRepoChoices = resolve
-        })
-    )
-    const getDefaultTool = vi.fn().mockResolvedValue('codex')
+describe('session dialog defaults', () => {
+  it('reads the configured defaults when opening instead of using stale render defaults', async () => {
+    const api = {
+      getDefaultTool: vi.fn().mockResolvedValue('codex'),
+      getDefaultSkipPermissions: vi.fn().mockResolvedValue(true),
+      getWorktreeBase: vi.fn().mockResolvedValue('origin-default'),
+    }
 
-    const resolution = resolveBulkPrDialogDefaults({ getRepoChoices, getDefaultTool }, 'claude')
+    await expect(
+      resolveSessionDialogDefaults(api, { tool: 'claude', skipPermissions: false })
+    ).resolves.toEqual({ tool: 'codex', skipPermissions: true, baseFromOrigin: true })
+  })
 
-    expect(getDefaultTool).toHaveBeenCalledOnce()
-    resolveRepoChoices?.({ current: 'owner/repo', parent: null })
-    await expect(resolution).resolves.toEqual({
-      repoChoices: { current: 'owner/repo', parent: null },
-      tool: 'codex',
-    })
+  it('falls back per-field when a lookup fails', async () => {
+    const api = {
+      getDefaultTool: vi.fn().mockRejectedValue(new Error('nope')),
+      getDefaultSkipPermissions: vi.fn().mockResolvedValue(true),
+      getWorktreeBase: vi.fn().mockRejectedValue(new Error('nope')),
+    }
+
+    await expect(
+      resolveSessionDialogDefaults(api, { tool: 'omp', skipPermissions: false })
+    ).resolves.toEqual({ tool: 'omp', skipPermissions: true, baseFromOrigin: false })
   })
 })

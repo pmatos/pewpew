@@ -440,13 +440,13 @@ app.whenReady().then(async () => {
       projectPath: string,
       hostId?: string | null,
       label?: string | null,
-      repo?: string | null
+      options?: CreateSessionOptions
     ) => {
       return openSessionsForOpenIssues(
         projectPath,
         hostId ?? null,
         label ?? undefined,
-        repo ?? null
+        options ?? {}
       )
     }
   )

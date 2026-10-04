@@ -61,7 +61,7 @@ declare global {
         projectPath: string,
         hostId?: string | null,
         label?: string | null,
-        repo?: string | null
+        options?: CreateSessionOptions
       ) => Promise<OpenSessionsSummary | string>
       countOpenIssues: (
         projectPath: string,

@@ -1,10 +1,15 @@
-import { useEffect, useId, useReducer, useRef, useState } from 'react'
+import { useCallback, useEffect, useReducer, useRef } from 'react'
 import { useProjectsStore, remoteWorktreeKey } from '../stores/projects'
 import { useSessionsStore } from '../stores/sessions'
 import { useHostsStore } from '../stores/hosts'
 import ContextMenu, { type MenuItem } from './ContextMenu'
-import type { AgentTool, OpenSessionsSummary, RepoChoices } from '../../shared/types'
-import { parseIssueSpec, parsePrSpec, type SpecNoun } from '../utils/pr-spec-parser'
+import type { AgentTool } from '../../shared/types'
+import {
+  SessionDialog,
+  resolveSessionDialogDefaults,
+  type SessionDialogDefaults,
+  type SessionDialogKind,
+} from './SessionDialogs'
 
 interface MenuState {
   x: number
@@ -23,60 +28,23 @@ interface TreeProps {
   onOpenSession?: (id: string, name: string) => void
 }
 
-export async function resolveBulkPrDialogDefaults(
-  api: {
-    getRepoChoices: () => Promise<RepoChoices | string>
-    getDefaultTool: () => Promise<AgentTool>
-  },
-  fallbackTool: AgentTool
-): Promise<{ repoChoices: RepoChoices | null; tool: AgentTool }> {
-  const [choices, tool] = await Promise.all([
-    api.getRepoChoices().catch(() => null),
-    api.getDefaultTool().catch(() => fallbackTool),
-  ])
-  return {
-    repoChoices: choices && typeof choices !== 'string' ? choices : null,
-    tool,
-  }
+interface OpenDialog {
+  // Distinguishes consecutive opens of the same kind so the dialog remounts
+  // with fresh state instead of keeping the previous project's input.
+  id: number
+  kind: SessionDialogKind
+  path: string
+  hostId: string | null
+  defaults: SessionDialogDefaults
 }
 
 interface ProjectTreeUiState {
   expanded: Set<string>
   menu: MenuState | null
-  pendingSessionPath: string | null
-  pendingSessionHostId: string | null
-  sessionNameInput: string
   defaultTool: AgentTool
   defaultSkipPermissions: boolean
-  pendingTool: AgentTool
   creating: boolean
-  baseFromOrigin: boolean
-  createError: string | null
-  pendingPrPath: string | null
-  pendingPrHostId: string | null
-  pendingPrTool: AgentTool
-  prNumberInput: string
-  prError: string | null
-  pendingIssueSession: { path: string; hostId: string | null } | null
-  pendingOpenAllPrsPath: string | null
-  pendingOpenAllPrsHostId: string | null
-  pendingOpenAllPrsTool: AgentTool
-  // Shared by the three tool-picker dialogs (only one is open at a time);
-  // reset to defaultSkipPermissions whenever one opens. Applies to claude only.
-  skipPermissions: boolean
-  // The repos a PR/issue can be drawn from (origin + detected upstream parent),
-  // and the currently-selected one. Shared across the PR, issue, and open-all
-  // dialogs since only one is open at a time. null until resolved / when the
-  // project isn't a fork.
-  repoChoices: RepoChoices | null
-  selectedRepo: string
-  pendingIssuePath: string | null
-  pendingIssueHostId: string | null
-  issueLabels: string[] | null
-  issueLabelsError: string | null
-  selectedIssueLabel: string
-  issueConfirmCount: number | null
-  issueError: string | null
+  dialog: OpenDialog | null
   bulkOpenConfirmThreshold: number
   toast: string | null
 }
@@ -86,239 +54,6 @@ function projectTreeUiReducer(
   update: Partial<ProjectTreeUiState>
 ): ProjectTreeUiState {
   return { ...state, ...update }
-}
-
-// Repository picker for the PR/issue/open-all dialogs, shown only when origin is
-// a fork (a parent was detected). A component (rather than an inline render
-// helper) so its onChange is a normal event-handler prop.
-function SkipPermissionsCheckbox({
-  tool,
-  checked,
-  onChange,
-}: {
-  tool: AgentTool
-  checked: boolean
-  onChange: (checked: boolean) => void
-}) {
-  if (tool !== 'claude') return null
-  return (
-    <label
-      className="session-base-checkbox"
-      title="Runs claude with --dangerously-skip-permissions instead of --permission-mode auto. Claude is not sandboxed."
-    >
-      <input type="checkbox" checked={checked} onChange={(e) => onChange(e.target.checked)} />
-      <span>Skip permission prompts (--dangerously-skip-permissions)</span>
-    </label>
-  )
-}
-
-// The flag only applies to claude; never send it for other tools.
-function skipPermissionsFor(tool: AgentTool, checked: boolean): boolean {
-  return tool === 'claude' && checked
-}
-
-function RepoPicker({
-  choices,
-  value,
-  disabled,
-  onChange,
-}: {
-  choices: RepoChoices | null
-  value: string
-  disabled: boolean
-  onChange: (repo: string) => void
-}) {
-  if (!choices?.parent) return null
-  return (
-    <>
-      <div className="session-name-label">Repository:</div>
-      <select
-        className="create-input"
-        aria-label="Repository"
-        value={value}
-        disabled={disabled}
-        onChange={(e) => onChange(e.target.value)}
-      >
-        <option value={choices.current}>{choices.current} (this repo)</option>
-        <option value={choices.parent}>{choices.parent} (upstream)</option>
-      </select>
-    </>
-  )
-}
-
-function describeCreateError(err: unknown): string {
-  const message = err instanceof Error ? err.message : String(err)
-  if (message.includes('no-origin-remote')) return 'This project has no origin remote.'
-  if (message.includes('no-origin-default-branch')) {
-    return "Could not determine origin's default branch."
-  }
-  return message.replace(/^Error:\s*/, '') || 'Failed to create session.'
-}
-
-function formatSpecSummary(result: OpenSessionsSummary, noun: SpecNoun): string {
-  const parts: string[] = []
-  if (result.created.length > 0) {
-    parts.push(
-      `Opened ${result.created.length} ${noun} session${result.created.length === 1 ? '' : 's'}`
-    )
-  }
-  if (result.reused.length > 0) parts.push(`linked ${result.reused.length} existing`)
-  if (result.skipped.length > 0) parts.push(`skipped ${result.skipped.length}`)
-  if (result.failed.length > 0) parts.push(`${result.failed.length} failed`)
-  return parts.length > 0 ? parts.join(', ') : `No ${noun} sessions created`
-}
-
-function formatSpecFailures(result: OpenSessionsSummary): string[] {
-  return result.failed.map((f) => `#${f.number}: ${f.error}`)
-}
-
-function formatSpecErrors(result: OpenSessionsSummary, noun: SpecNoun): string {
-  return [`No ${noun} sessions opened.`, ...formatSpecFailures(result)].join('\n')
-}
-
-const TOOL_OPTIONS = [
-  ['claude', 'Claude'],
-  ['codex', 'Codex'],
-  ['omp', 'oh-my-pi'],
-] as const
-
-interface IssueSessionDialogProps {
-  path: string
-  hostId: string | null
-  defaultTool: AgentTool
-  confirmThreshold: number
-  onClose: () => void
-  onToast: (msg: string) => void
-}
-
-function IssueSessionDialog({
-  path,
-  hostId,
-  defaultTool,
-  confirmThreshold,
-  onClose,
-  onToast,
-}: IssueSessionDialogProps) {
-  const inputId = useId()
-  const inputRef = useRef<HTMLInputElement>(null)
-  const [spec, setSpec] = useState('')
-  const [tool, setTool] = useState<AgentTool>(defaultTool)
-  const [error, setError] = useState<string | null>(null)
-  const [confirmCount, setConfirmCount] = useState<number | null>(null)
-  const [creating, setCreating] = useState(false)
-
-  useEffect(() => {
-    inputRef.current?.focus()
-  }, [])
-
-  const submit = async () => {
-    if (creating) return
-    const parsed = parseIssueSpec(spec)
-    if ('error' in parsed) {
-      setError(parsed.error)
-      setConfirmCount(null)
-      return
-    }
-    if (confirmCount === null && parsed.numbers.length > confirmThreshold) {
-      setConfirmCount(parsed.numbers.length)
-      setError(null)
-      return
-    }
-    setCreating(true)
-    setError(null)
-    setConfirmCount(null)
-    try {
-      const result = await window.api.createIssueSessions(path, parsed.numbers, hostId, { tool })
-      if (typeof result === 'string') {
-        setError(result)
-        return
-      }
-      const opened = result.created.length + result.reused.length
-      if (parsed.numbers.length === 1) {
-        if (result.failed.length === 1) {
-          setError(result.failed[0].error)
-          return
-        }
-        if (result.skipped.length === 1) {
-          setError(`Issue #${result.skipped[0]} already has a session.`)
-          return
-        }
-      } else if (opened === 0) {
-        setError(formatSpecErrors(result, 'issue'))
-        return
-      } else if (result.failed.length > 0) {
-        setSpec(result.failed.map((f) => f.number).join(', '))
-        setError([formatSpecSummary(result, 'issue'), ...formatSpecFailures(result)].join('\n'))
-        return
-      } else {
-        onToast(formatSpecSummary(result, 'issue'))
-      }
-      onClose()
-    } catch (err) {
-      setError(describeCreateError(err))
-    } finally {
-      setCreating(false)
-    }
-  }
-
-  const submitLabel = creating
-    ? 'Creating…'
-    : confirmCount !== null
-      ? `Open ${confirmCount}`
-      : 'Create'
-
-  return (
-    <div className="session-name-dialog">
-      <label className="session-name-label" htmlFor={inputId}>
-        Issue number(s):
-      </label>
-      <input
-        id={inputId}
-        ref={inputRef}
-        type="text"
-        className="create-input"
-        placeholder="e.g. 42 or 1,2,22-28"
-        value={spec}
-        onChange={(e) => {
-          setSpec(e.target.value)
-          setConfirmCount(null)
-        }}
-        onKeyDown={(e) => {
-          if (e.key === 'Enter') void submit()
-          if (e.key === 'Escape') onClose()
-        }}
-      />
-      <div className="session-name-label">Tool:</div>
-      <div className="tool-picker">
-        {TOOL_OPTIONS.map(([value, label]) => (
-          <label key={value}>
-            <input
-              type="radio"
-              name="issue-tool"
-              value={value}
-              checked={tool === value}
-              onChange={() => setTool(value)}
-            />
-            {label}
-          </label>
-        ))}
-      </div>
-      {error && <div className="pr-error">{error}</div>}
-      {confirmCount !== null && (
-        <div className="pr-error">
-          This will open {confirmCount} issue sessions. Click again to confirm.
-        </div>
-      )}
-      <div className="create-actions">
-        <button className="create-btn" onClick={() => void submit()} disabled={creating}>
-          {submitLabel}
-        </button>
-        <button className="create-btn cancel" onClick={onClose}>
-          Cancel
-        </button>
-      </div>
-    </div>
-  )
 }
 
 export default function ProjectTree(props: TreeProps) {
@@ -337,106 +72,27 @@ function useProjectTreeElement({ onOpenSession }: TreeProps) {
   const [ui, setUi] = useReducer(projectTreeUiReducer, {
     expanded: new Set<string>(),
     menu: null,
-    pendingSessionPath: null,
-    pendingSessionHostId: null,
-    sessionNameInput: '',
     defaultTool: 'claude',
     defaultSkipPermissions: false,
-    pendingTool: 'claude',
     creating: false,
-    baseFromOrigin: false,
-    createError: null,
-    pendingPrPath: null,
-    pendingPrHostId: null,
-    pendingPrTool: 'claude',
-    prNumberInput: '',
-    prError: null,
-    pendingIssueSession: null,
-    pendingOpenAllPrsPath: null,
-    pendingOpenAllPrsHostId: null,
-    pendingOpenAllPrsTool: 'claude',
-    skipPermissions: false,
-    repoChoices: null,
-    selectedRepo: '',
-    pendingIssuePath: null,
-    pendingIssueHostId: null,
-    issueLabels: null,
-    issueLabelsError: null,
-    selectedIssueLabel: '',
-    issueConfirmCount: null,
-    issueError: null,
+    dialog: null,
     bulkOpenConfirmThreshold: 20,
     toast: null,
   })
   const {
     expanded,
     menu,
-    pendingSessionPath,
-    pendingSessionHostId,
-    sessionNameInput,
     defaultTool,
     defaultSkipPermissions,
-    pendingTool,
     creating,
-    baseFromOrigin,
-    createError,
-    pendingPrPath,
-    pendingPrHostId,
-    pendingPrTool,
-    prNumberInput,
-    prError,
-    pendingIssueSession,
-    pendingOpenAllPrsPath,
-    pendingOpenAllPrsHostId,
-    pendingOpenAllPrsTool,
-    skipPermissions,
-    repoChoices,
-    selectedRepo,
-    pendingIssuePath,
-    pendingIssueHostId,
-    issueLabels,
-    issueLabelsError,
-    selectedIssueLabel,
-    issueConfirmCount,
-    issueError,
+    dialog,
     bulkOpenConfirmThreshold,
     toast,
   } = ui
-  const sessionNameInputRef = useRef<HTMLInputElement>(null)
-  const prNumberInputRef = useRef<HTMLInputElement>(null)
-  const bulkOpenPrsDialogRef = useRef<HTMLDivElement>(null)
-  // Monotonic token: bumped whenever the issue dialog opens or closes so an
-  // in-flight countOpenIssues can detect it was canceled/reopened mid-await.
-  const issueRequestRef = useRef(0)
-  // Monotonic token for in-flight getRepoChoices, so a slow response for a
-  // closed/reopened dialog can't clobber current state.
-  const repoRequestRef = useRef(0)
+  // Monotonic token so a slow defaults lookup for a superseded open can't win.
+  const dialogRequestRef = useRef(0)
 
-  // Fetch the repo choices (origin + upstream parent) for a dialog. Any failure
-  // (or a non-fork repo) leaves repoChoices null so the picker stays hidden and
-  // the default origin behavior is used.
-  const loadRepoChoices = (projectPath: string, hostId: string | null) => {
-    const token = (repoRequestRef.current += 1)
-    setUi({ repoChoices: null, selectedRepo: '' })
-    window.api
-      .getRepoChoices(projectPath, hostId)
-      .then((result) => {
-        if (repoRequestRef.current !== token) return
-        if (typeof result === 'string') {
-          setUi({ repoChoices: null })
-        } else {
-          setUi({ repoChoices: result, selectedRepo: result.current })
-        }
-      })
-      .catch(() => {
-        if (repoRequestRef.current === token) setUi({ repoChoices: null })
-      })
-  }
-
-  // The repo to pass as an override: only when the user picked a repo other than
-  // origin (the fork's upstream). Otherwise undefined = default origin behavior.
-  const repoOverride = (): string | undefined =>
-    repoChoices && selectedRepo && selectedRepo !== repoChoices.current ? selectedRepo : undefined
+  const handleBusyChange = useCallback((busy: boolean) => setUi({ creating: busy }), [])
 
   const showToast = (msg: string) => {
     setUi({ toast: msg })
@@ -446,12 +102,6 @@ function useProjectTreeElement({ onOpenSession }: TreeProps) {
   useEffect(() => {
     scanProjects()
   }, [scanProjects])
-
-  useEffect(() => {
-    if (pendingOpenAllPrsPath) {
-      bulkOpenPrsDialogRef.current?.scrollIntoView({ block: 'nearest' })
-    }
-  }, [pendingOpenAllPrsPath])
 
   useEffect(() => {
     let cancelled = false
@@ -511,233 +161,18 @@ function useProjectTreeElement({ onOpenSession }: TreeProps) {
     })
   }
 
-  const openNewSessionDialog = async (projectPath: string, hostId: string | null) => {
-    const update: Partial<ProjectTreeUiState> = {
-      createError: null,
-      sessionNameInput: '',
-      pendingTool: defaultTool,
-      skipPermissions: defaultSkipPermissions,
-      pendingSessionPath: projectPath,
-      pendingSessionHostId: hostId,
-    }
-    try {
-      const worktreeBase = await window.api.getWorktreeBase()
-      update.baseFromOrigin = worktreeBase === 'origin-default'
-    } catch {
-      update.baseFromOrigin = false
-    }
-    setUi(update)
-    setTimeout(() => sessionNameInputRef.current?.focus(), 0)
-  }
-
-  const openPrSessionDialog = (projectPath: string, hostId: string | null) => {
-    setUi({
-      pendingIssueSession: null,
-      pendingPrPath: projectPath,
-      pendingPrHostId: hostId,
-      pendingPrTool: defaultTool,
-      skipPermissions: defaultSkipPermissions,
-      prNumberInput: '',
-      prError: null,
-    })
-    loadRepoChoices(projectPath, hostId)
-    setTimeout(() => prNumberInputRef.current?.focus(), 0)
-  }
-
-  const openIssueSessionDialog = (projectPath: string, hostId: string | null) => {
-    setUi({
-      pendingPrPath: null,
-      pendingPrHostId: null,
-      prError: null,
-      pendingIssueSession: { path: projectPath, hostId },
-    })
-  }
-
-  const formatOpenAllSummary = (result: OpenSessionsSummary, label: 'PR' | 'issue'): string => {
-    const parts: string[] = []
-    const sessionLabel = label === 'PR' ? 'PR session' : 'issue session'
-    const itemLabel = label === 'PR' ? 'PR' : 'issue'
-    if (result.created.length > 0) {
-      parts.push(
-        `Opened ${result.created.length} ${sessionLabel}${result.created.length === 1 ? '' : 's'}`
-      )
-    }
-    if (result.reused.length > 0) parts.push(`linked ${result.reused.length} existing`)
-    if (result.skipped.length > 0) parts.push(`skipped ${result.skipped.length}`)
-    if (result.failed.length > 0) parts.push(`${result.failed.length} failed`)
-    return parts.length > 0
-      ? parts.join(', ')
-      : `No open ${itemLabel === 'PR' ? 'PRs' : 'issues'} to open`
-  }
-
-  const handleOpenAllPrs = async (
+  const openDialog = async (
+    kind: SessionDialogKind,
     projectPath: string,
-    hostId: string | null,
-    repo: string | undefined,
-    tool: AgentTool,
-    skipPermissions: boolean
+    hostId: string | null
   ) => {
-    if (creating) return
-    setUi({ creating: true })
-    try {
-      const result = await window.api.openSessionsForOpenPrs(projectPath, hostId, {
-        tool,
-        skipPermissions: skipPermissionsFor(tool, skipPermissions),
-        ...(repo ? { repo } : {}),
-      })
-      showToast(typeof result === 'string' ? result : formatOpenAllSummary(result, 'PR'))
-    } catch (err) {
-      showToast(`Failed to open PR sessions: ${String(err)}`)
-    } finally {
-      setUi({ creating: false })
-    }
-  }
-
-  // Resolve the optional upstream repo before showing the bulk-open dialog so a
-  // fast confirmation can never bypass the repository choice for a fork.
-  const openAllPrs = async (projectPath: string, hostId: string | null) => {
-    if (creating) return
-    const token = (repoRequestRef.current += 1)
-    const { repoChoices: resolvedChoices, tool } = await resolveBulkPrDialogDefaults(
-      {
-        getRepoChoices: () => window.api.getRepoChoices(projectPath, hostId),
-        getDefaultTool: () => window.api.getDefaultTool(),
-      },
-      defaultTool
-    )
-    if (repoRequestRef.current !== token) return
-    setUi({
-      pendingOpenAllPrsPath: projectPath,
-      pendingOpenAllPrsHostId: hostId,
-      pendingOpenAllPrsTool: tool,
+    const token = (dialogRequestRef.current += 1)
+    const defaults = await resolveSessionDialogDefaults(window.api, {
+      tool: defaultTool,
       skipPermissions: defaultSkipPermissions,
-      repoChoices: resolvedChoices,
-      selectedRepo: resolvedChoices?.current ?? '',
     })
-  }
-
-  const confirmOpenAllPrs = async () => {
-    if (!pendingOpenAllPrsPath) return
-    const projectPath = pendingOpenAllPrsPath
-    const hostId = pendingOpenAllPrsHostId
-    const repo = repoOverride()
-    setUi({ pendingOpenAllPrsPath: null, pendingOpenAllPrsHostId: null })
-    await handleOpenAllPrs(projectPath, hostId, repo, pendingOpenAllPrsTool, skipPermissions)
-  }
-
-  // Load the label filter list for a repo (origin, or a fork's upstream). Bumps
-  // the shared issue token so a stale response can't overwrite a newer one.
-  const loadIssueLabels = (projectPath: string, hostId: string | null, repo: string | null) => {
-    const token = (issueRequestRef.current += 1)
-    setUi({
-      issueLabels: null,
-      issueLabelsError: null,
-      selectedIssueLabel: '',
-      issueConfirmCount: null,
-    })
-    window.api
-      .listRepoLabels(projectPath, hostId, repo)
-      .then((result) => {
-        // Discard a response that resolved after the dialog was canceled or
-        // reopened (possibly for a different project or repo).
-        if (issueRequestRef.current !== token) return
-        if (typeof result === 'string') {
-          setUi({ issueLabels: [], issueLabelsError: result })
-        } else {
-          setUi({ issueLabels: result })
-        }
-      })
-      .catch((err) => {
-        if (issueRequestRef.current !== token) return
-        setUi({ issueLabels: [], issueLabelsError: String(err) })
-      })
-  }
-
-  const openIssuesDialog = (projectPath: string, hostId: string | null) => {
-    setUi({ pendingIssuePath: projectPath, pendingIssueHostId: hostId, issueError: null })
-    loadRepoChoices(projectPath, hostId)
-    loadIssueLabels(projectPath, hostId, null)
-  }
-
-  const closeIssuesDialog = () => {
-    // Bump the token first so any in-flight count bails instead of opening
-    // sessions, and clear `creating` so the menu isn't stuck disabled.
-    issueRequestRef.current += 1
-    setUi({
-      pendingIssuePath: null,
-      pendingIssueHostId: null,
-      issueLabels: null,
-      issueLabelsError: null,
-      selectedIssueLabel: '',
-      issueConfirmCount: null,
-      issueError: null,
-      creating: false,
-    })
-  }
-
-  const proceedOpenIssues = async (projectPath: string, hostId: string | null, label: string) => {
-    if (creating) return
-    setUi({ creating: true, issueError: null })
-    try {
-      const result = await window.api.openSessionsForOpenIssues(
-        projectPath,
-        hostId,
-        label || null,
-        repoOverride() ?? null
-      )
-      showToast(typeof result === 'string' ? result : formatOpenAllSummary(result, 'issue'))
-      closeIssuesDialog()
-    } catch (err) {
-      setUi({ issueError: `Failed to open issue sessions: ${String(err)}` })
-    } finally {
-      setUi({ creating: false })
-    }
-  }
-
-  const handleSubmitIssues = async () => {
-    if (!pendingIssuePath || creating) return
-    const projectPath = pendingIssuePath
-    const hostId = pendingIssueHostId
-    const label = selectedIssueLabel
-    const token = issueRequestRef.current
-    setUi({ creating: true, issueError: null })
-    let count: number | string
-    try {
-      count = await window.api.countOpenIssues(
-        projectPath,
-        hostId,
-        label || null,
-        repoOverride() ?? null
-      )
-    } catch (err) {
-      if (issueRequestRef.current !== token) {
-        setUi({ creating: false })
-        return
-      }
-      setUi({ creating: false, issueError: `Failed to count open issues: ${String(err)}` })
-      return
-    }
-    // The dialog was canceled or reopened while the count was in flight —
-    // discard the result so we never open sessions for a dismissed dialog.
-    if (issueRequestRef.current !== token) {
-      setUi({ creating: false })
-      return
-    }
-    setUi({ creating: false })
-    if (typeof count === 'string') {
-      setUi({ issueError: count })
-      return
-    }
-    if (count === 0) {
-      showToast(label ? `No open issues match "${label}"` : 'No open issues to open')
-      closeIssuesDialog()
-      return
-    }
-    if (count > bulkOpenConfirmThreshold) {
-      setUi({ issueConfirmCount: count })
-      return
-    }
-    await proceedOpenIssues(projectPath, hostId, label)
+    if (dialogRequestRef.current !== token) return
+    setUi({ dialog: { id: token, kind, path: projectPath, hostId, defaults } })
   }
 
   const getMenuItems = (
@@ -751,30 +186,30 @@ function useProjectTreeElement({ onOpenSession }: TreeProps) {
       items.push({
         label: 'New session…',
         onClick: async () => {
-          await openNewSessionDialog(projectPath, hostId)
+          await openDialog('session', projectPath, hostId)
         },
       })
       items.push({
         label: 'New PR session…',
         onClick: () => {
-          openPrSessionDialog(projectPath, hostId)
+          void openDialog('pr', projectPath, hostId)
         },
       })
       items.push({
         label: 'New issue session…',
         onClick: () => {
-          openIssueSessionDialog(projectPath, hostId)
+          void openDialog('issue', projectPath, hostId)
         },
       })
       items.push({
         label: 'Open sessions for all open PRs',
         disabled: creating,
-        onClick: () => void openAllPrs(projectPath, hostId),
+        onClick: () => void openDialog('open-all-prs', projectPath, hostId),
       })
       items.push({
         label: 'Open sessions for all open issues…',
         disabled: creating,
-        onClick: () => openIssuesDialog(projectPath, hostId),
+        onClick: () => void openDialog('open-all-issues', projectPath, hostId),
       })
       const remoteWts = remoteWorktreesCache[remoteWorktreeKey(hostId, projectPath)] ?? []
       const remoteUnmirrored = remoteWts.filter(
@@ -837,30 +272,30 @@ function useProjectTreeElement({ onOpenSession }: TreeProps) {
       items.push({
         label: 'New session…',
         onClick: async () => {
-          await openNewSessionDialog(projectPath, null)
+          await openDialog('session', projectPath, null)
         },
       })
       items.push({
         label: 'New PR session…',
         onClick: () => {
-          openPrSessionDialog(projectPath, null)
+          void openDialog('pr', projectPath, null)
         },
       })
       items.push({
         label: 'New issue session…',
         onClick: () => {
-          openIssueSessionDialog(projectPath, null)
+          void openDialog('issue', projectPath, null)
         },
       })
       items.push({
         label: 'Open sessions for all open PRs',
         disabled: creating,
-        onClick: () => void openAllPrs(projectPath, null),
+        onClick: () => void openDialog('open-all-prs', projectPath, null),
       })
       items.push({
         label: 'Open sessions for all open issues…',
         disabled: creating,
-        onClick: () => openIssuesDialog(projectPath, null),
+        onClick: () => void openDialog('open-all-issues', projectPath, null),
       })
 
       const project = projects.find((p) => p.path === projectPath)
@@ -937,388 +372,20 @@ function useProjectTreeElement({ onOpenSession }: TreeProps) {
     )
   }
 
-  const handleCreateSession = async () => {
-    if (!pendingSessionPath || creating) return
-    setUi({ creating: true, createError: null })
-    try {
-      const name = sessionNameInput.trim() || undefined
-      await window.api.createSession(pendingSessionPath, name, pendingSessionHostId, {
-        tool: pendingTool,
-        skipPermissions: skipPermissionsFor(pendingTool, skipPermissions),
-        baseRef: baseFromOrigin ? 'origin-default' : 'local',
-      })
-      setUi({ pendingSessionPath: null, pendingSessionHostId: null, sessionNameInput: '' })
-    } catch (err) {
-      setUi({ createError: describeCreateError(err) })
-    } finally {
-      setUi({ creating: false })
-    }
-  }
-
-  const handleCreatePrSession = async () => {
-    if (!pendingPrPath || creating) return
-    const parsed = parsePrSpec(prNumberInput)
-    if ('error' in parsed) {
-      setUi({ prError: parsed.error })
-      return
-    }
-    setUi({ creating: true, prError: null })
-    try {
-      const result = await window.api.createPrSessions(
-        pendingPrPath,
-        parsed.numbers,
-        pendingPrHostId,
-        {
-          tool: pendingPrTool,
-          skipPermissions: skipPermissionsFor(pendingPrTool, skipPermissions),
-          repo: repoOverride(),
-        }
-      )
-      if (typeof result === 'string') {
-        setUi({ prError: result })
-        return
-      }
-      if (parsed.numbers.length === 1) {
-        if (result.failed.length === 1) {
-          setUi({ prError: result.failed[0].error })
-          return
-        }
-        if (result.skipped.length === 1) {
-          setUi({ prError: `PR #${result.skipped[0]} already has a session.` })
-          return
-        }
-        setUi({ pendingPrPath: null, pendingPrHostId: null, prNumberInput: '' })
-        return
-      }
-      // Multiple PRs: if nothing was opened or linked, keep the dialog open and
-      // surface the per-PR reasons instead of a fleeting count-only toast.
-      if (result.created.length === 0 && result.reused.length === 0) {
-        setUi({ prError: formatSpecErrors(result, 'PR') })
-        return
-      }
-      showToast(formatSpecSummary(result, 'PR'))
-      setUi({ pendingPrPath: null, pendingPrHostId: null, prNumberInput: '' })
-    } catch (err) {
-      setUi({ prError: describeCreateError(err) })
-    } finally {
-      setUi({ creating: false })
-    }
-  }
-
   return (
     <div className="project-tree">
-      {pendingSessionPath && (
-        <div className="session-name-dialog">
-          <div className="session-name-label">Session name (optional):</div>
-          <input
-            ref={sessionNameInputRef}
-            type="text"
-            className="create-input"
-            placeholder="Leave empty for auto-name…"
-            value={sessionNameInput}
-            onChange={(e) => setUi({ sessionNameInput: e.target.value })}
-            onKeyDown={(e) => {
-              if (e.key === 'Enter') handleCreateSession()
-              if (e.key === 'Escape') {
-                setUi({ pendingSessionPath: null, pendingSessionHostId: null, createError: null })
-              }
-            }}
-          />
-          <div className="session-name-label">Tool:</div>
-          <div className="tool-picker">
-            <label>
-              <input
-                type="radio"
-                name="tool"
-                value="claude"
-                checked={pendingTool === 'claude'}
-                onChange={() => setUi({ pendingTool: 'claude' })}
-              />
-              Claude
-            </label>
-            <label>
-              <input
-                type="radio"
-                name="tool"
-                value="codex"
-                checked={pendingTool === 'codex'}
-                onChange={() => setUi({ pendingTool: 'codex' })}
-              />
-              Codex
-            </label>
-            <label>
-              <input
-                type="radio"
-                name="tool"
-                value="omp"
-                checked={pendingTool === 'omp'}
-                onChange={() => setUi({ pendingTool: 'omp' })}
-              />
-              oh-my-pi
-            </label>
-          </div>
-          <SkipPermissionsCheckbox
-            tool={pendingTool}
-            checked={skipPermissions}
-            onChange={(checked) => setUi({ skipPermissions: checked })}
-          />
-          <label className="session-base-checkbox">
-            <input
-              type="checkbox"
-              checked={baseFromOrigin}
-              onChange={(e) => {
-                setUi({ baseFromOrigin: e.target.checked, createError: null })
-              }}
-            />
-            <span>Branch from origin/&lt;default&gt;</span>
-          </label>
-          {createError && <div className="pr-error">{createError}</div>}
-          <div className="create-actions">
-            <button className="create-btn" onClick={handleCreateSession} disabled={creating}>
-              {creating ? 'Creating…' : 'Create'}
-            </button>
-            <button
-              className="create-btn cancel"
-              onClick={() => {
-                setUi({ pendingSessionPath: null, pendingSessionHostId: null, createError: null })
-              }}
-            >
-              Cancel
-            </button>
-          </div>
-        </div>
-      )}
-      {pendingPrPath && (
-        <div className="session-name-dialog">
-          <RepoPicker
-            choices={repoChoices}
-            value={selectedRepo}
-            disabled={creating}
-            onChange={(repo) => setUi({ selectedRepo: repo })}
-          />
-          <div className="session-name-label">PR number(s):</div>
-          <input
-            ref={prNumberInputRef}
-            type="text"
-            className="create-input"
-            placeholder="e.g. 42 or 1,2,22-28"
-            value={prNumberInput}
-            onChange={(e) => setUi({ prNumberInput: e.target.value })}
-            onKeyDown={(e) => {
-              if (e.key === 'Enter') handleCreatePrSession()
-              if (e.key === 'Escape') {
-                setUi({ pendingPrPath: null, pendingPrHostId: null, prError: null })
-              }
-            }}
-          />
-          <div className="session-name-label">Tool:</div>
-          <div className="tool-picker">
-            <label>
-              <input
-                type="radio"
-                name="pr-tool"
-                value="claude"
-                checked={pendingPrTool === 'claude'}
-                onChange={() => setUi({ pendingPrTool: 'claude' })}
-              />
-              Claude
-            </label>
-            <label>
-              <input
-                type="radio"
-                name="pr-tool"
-                value="codex"
-                checked={pendingPrTool === 'codex'}
-                onChange={() => setUi({ pendingPrTool: 'codex' })}
-              />
-              Codex
-            </label>
-            <label>
-              <input
-                type="radio"
-                name="pr-tool"
-                value="omp"
-                checked={pendingPrTool === 'omp'}
-                onChange={() => setUi({ pendingPrTool: 'omp' })}
-              />
-              oh-my-pi
-            </label>
-          </div>
-          <SkipPermissionsCheckbox
-            tool={pendingPrTool}
-            checked={skipPermissions}
-            onChange={(checked) => setUi({ skipPermissions: checked })}
-          />
-          {prError && <div className="pr-error">{prError}</div>}
-          <div className="create-actions">
-            <button className="create-btn" onClick={handleCreatePrSession} disabled={creating}>
-              {creating ? 'Creating…' : 'Create'}
-            </button>
-            <button
-              className="create-btn cancel"
-              onClick={() => {
-                setUi({ pendingPrPath: null, pendingPrHostId: null, prError: null })
-              }}
-            >
-              Cancel
-            </button>
-          </div>
-        </div>
-      )}
-      {pendingIssueSession && (
-        <IssueSessionDialog
-          path={pendingIssueSession.path}
-          hostId={pendingIssueSession.hostId}
-          defaultTool={defaultTool}
+      {dialog && (
+        <SessionDialog
+          key={dialog.id}
+          kind={dialog.kind}
+          path={dialog.path}
+          hostId={dialog.hostId}
+          defaults={dialog.defaults}
           confirmThreshold={bulkOpenConfirmThreshold}
-          onClose={() => setUi({ pendingIssueSession: null })}
+          onClose={() => setUi({ dialog: null, creating: false })}
           onToast={showToast}
+          onBusyChange={handleBusyChange}
         />
-      )}
-      {pendingOpenAllPrsPath && (
-        <div ref={bulkOpenPrsDialogRef} className="session-name-dialog">
-          <RepoPicker
-            choices={repoChoices}
-            value={selectedRepo}
-            disabled={creating}
-            onChange={(repo) => setUi({ selectedRepo: repo })}
-          />
-          <div className="session-name-label">Tool:</div>
-          <div className="tool-picker">
-            <label>
-              <input
-                type="radio"
-                name="bulk-pr-tool"
-                value="claude"
-                checked={pendingOpenAllPrsTool === 'claude'}
-                onChange={() => setUi({ pendingOpenAllPrsTool: 'claude' })}
-              />
-              Claude
-            </label>
-            <label>
-              <input
-                type="radio"
-                name="bulk-pr-tool"
-                value="codex"
-                checked={pendingOpenAllPrsTool === 'codex'}
-                onChange={() => setUi({ pendingOpenAllPrsTool: 'codex' })}
-              />
-              Codex
-            </label>
-            <label>
-              <input
-                type="radio"
-                name="bulk-pr-tool"
-                value="omp"
-                checked={pendingOpenAllPrsTool === 'omp'}
-                onChange={() => setUi({ pendingOpenAllPrsTool: 'omp' })}
-              />
-              oh-my-pi
-            </label>
-          </div>
-          <SkipPermissionsCheckbox
-            tool={pendingOpenAllPrsTool}
-            checked={skipPermissions}
-            onChange={(checked) => setUi({ skipPermissions: checked })}
-          />
-          <div className="create-actions">
-            <button
-              type="button"
-              className="create-btn"
-              onClick={confirmOpenAllPrs}
-              disabled={creating}
-            >
-              {creating ? 'Opening…' : 'Open all open PRs'}
-            </button>
-            <button
-              type="button"
-              className="create-btn cancel"
-              onClick={() => setUi({ pendingOpenAllPrsPath: null, pendingOpenAllPrsHostId: null })}
-            >
-              Cancel
-            </button>
-          </div>
-        </div>
-      )}
-      {pendingIssuePath && (
-        <div className="session-name-dialog">
-          {issueConfirmCount === null ? (
-            <>
-              <RepoPicker
-                choices={repoChoices}
-                value={selectedRepo}
-                disabled={creating}
-                onChange={(repo) => {
-                  setUi({ selectedRepo: repo })
-                  loadIssueLabels(
-                    pendingIssuePath,
-                    pendingIssueHostId,
-                    repo === repoChoices?.current ? null : repo
-                  )
-                }}
-              />
-              <div className="session-name-label">Label filter:</div>
-              {issueLabels === null ? (
-                <div className="session-name-label">Loading labels…</div>
-              ) : (
-                <select
-                  className="create-input"
-                  value={selectedIssueLabel}
-                  disabled={creating}
-                  onChange={(e) => setUi({ selectedIssueLabel: e.target.value })}
-                >
-                  <option value="">All open issues</option>
-                  {issueLabels.map((name) => (
-                    <option key={name} value={name}>
-                      {name}
-                    </option>
-                  ))}
-                </select>
-              )}
-              {issueLabelsError && (
-                <div className="pr-error">Could not load labels: {issueLabelsError}</div>
-              )}
-              {issueError && <div className="pr-error">{issueError}</div>}
-              <div className="create-actions">
-                <button
-                  type="button"
-                  className="create-btn"
-                  onClick={handleSubmitIssues}
-                  disabled={creating || issueLabels === null}
-                >
-                  {creating ? 'Working…' : 'Open sessions'}
-                </button>
-                <button type="button" className="create-btn cancel" onClick={closeIssuesDialog}>
-                  Cancel
-                </button>
-              </div>
-            </>
-          ) : (
-            <>
-              <div className="session-name-label">
-                This will open up to {issueConfirmCount} issue session
-                {issueConfirmCount === 1 ? '' : 's'}
-                {selectedIssueLabel ? ` labelled "${selectedIssueLabel}"` : ''}. Continue?
-              </div>
-              {issueError && <div className="pr-error">{issueError}</div>}
-              <div className="create-actions">
-                <button
-                  type="button"
-                  className="create-btn"
-                  onClick={() =>
-                    void proceedOpenIssues(pendingIssuePath, pendingIssueHostId, selectedIssueLabel)
-                  }
-                  disabled={creating}
-                >
-                  {creating ? 'Opening…' : `Open ${issueConfirmCount}`}
-                </button>
-                <button type="button" className="create-btn cancel" onClick={closeIssuesDialog}>
-                  Cancel
-                </button>
-              </div>
-            </>
-          )}
-        </div>
       )}
       {displayProjects.map((project) => {
         const isExpanded = expanded.has(expansionKey(project.hostId, project.path))

@@ -54,14 +54,14 @@ contextBridge.exposeInMainWorld('api', {
     projectPath: string,
     hostId?: string | null,
     label?: string | null,
-    repo?: string | null
+    options?: CreateSessionOptions
   ) =>
     ipcRenderer.invoke(
       'sessions:open-all-issues',
       projectPath,
       hostId ?? null,
       label ?? null,
-      repo ?? null
+      options ?? {}
     ),
   countOpenIssues: (
     projectPath: string,
