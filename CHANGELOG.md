@@ -1,3 +1,16 @@
+# [0.12.0](https://github.com/pmatos/pewpew/compare/v0.11.1...v0.12.0) (2026-10-04)
+
+
+### Bug Fixes
+
+* pin tmux detach-on-destroy on for every pewpew session ([#339](https://github.com/pmatos/pewpew/issues/339)) ([3859e88](https://github.com/pmatos/pewpew/commit/3859e88a3d214f42534c836ee3f7c561f5361325))
+
+
+### Features
+
+* create issue sessions from a number spec ([#343](https://github.com/pmatos/pewpew/issues/343)) ([faea571](https://github.com/pmatos/pewpew/commit/faea57142f1bb71e26fb93b31289b63c0979fe4c))
+* opt-in --dangerously-skip-permissions for claude sessions ([#344](https://github.com/pmatos/pewpew/issues/344)) ([81bd7e1](https://github.com/pmatos/pewpew/commit/81bd7e124ba238f6c09d9ffead2c1e41b6db8cc5))
+
 ## [0.11.1](https://github.com/pmatos/pewpew/compare/v0.11.0...v0.11.1) (2026-09-20)
 
 
