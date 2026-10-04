@@ -22,21 +22,6 @@ export function findSessionOnWorktree(
   return undefined
 }
 
-// Canonical, un-scoped occupancy: matches any session (local or remote) whose
-// worktree path resolves to the same location. Used by the local adopt path,
-// where a symlinked worktree must resolve to the single session that owns it.
-export function findSessionOnCanonicalWorktree(
-  sessions: Iterable<Session>,
-  worktreePath: string,
-  canonicalize: Canonicalize
-): Session | undefined {
-  const target = canonicalize(worktreePath)
-  for (const session of sessions) {
-    if (canonicalize(session.worktreePath) === target) return session
-  }
-  return undefined
-}
-
 // Guards the "one agent tool per worktree" invariant. Throws when the session
 // already living on a worktree uses a different tool than the one requested.
 export function assertToolCompatible(existing: Session, tool: AgentTool): void {
