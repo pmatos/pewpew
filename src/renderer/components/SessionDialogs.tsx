@@ -156,11 +156,13 @@ function RepoPicker({
 function DialogActions({
   primaryLabel,
   disabled,
+  busy = false,
   onPrimary,
   onCancel,
 }: {
   primaryLabel: string
   disabled: boolean
+  busy?: boolean
   onPrimary: () => void
   onCancel: () => void
 }) {
@@ -169,7 +171,7 @@ function DialogActions({
       <button type="button" className="create-btn" onClick={onPrimary} disabled={disabled}>
         {primaryLabel}
       </button>
-      <button type="button" className="create-btn cancel" onClick={onCancel}>
+      <button type="button" className="create-btn cancel" onClick={onCancel} disabled={busy}>
         Cancel
       </button>
     </div>
@@ -225,7 +227,7 @@ function NewSessionDialog({ path, hostId, defaults, onClose, onBusyChange }: Dia
         onChange={(e) => setName(e.target.value)}
         onKeyDown={(e) => {
           if (e.key === 'Enter') void submit()
-          if (e.key === 'Escape') onClose()
+          if (e.key === 'Escape' && !creating) onClose()
         }}
       />
       <SessionOptionsFields options={options} />
@@ -243,6 +245,7 @@ function NewSessionDialog({ path, hostId, defaults, onClose, onBusyChange }: Dia
       {error && <div className="pr-error">{error}</div>}
       <DialogActions
         primaryLabel={creating ? 'Creating…' : 'Create'}
+        busy={creating}
         disabled={creating}
         onPrimary={() => void submit()}
         onCancel={onClose}
@@ -358,7 +361,7 @@ function NumberedSessionDialog({
         }}
         onKeyDown={(e) => {
           if (e.key === 'Enter') void submit()
-          if (e.key === 'Escape') onClose()
+          if (e.key === 'Escape' && !creating) onClose()
         }}
       />
       <SessionOptionsFields options={options} />
@@ -370,6 +373,7 @@ function NumberedSessionDialog({
       )}
       <DialogActions
         primaryLabel={submitLabel}
+        busy={creating}
         disabled={creating || !repo.ready}
         onPrimary={() => void submit()}
         onCancel={onClose}
@@ -414,6 +418,7 @@ function OpenAllPrsDialog({ path, hostId, defaults, onClose, onToast, onBusyChan
       <SessionOptionsFields options={options} />
       <DialogActions
         primaryLabel={creating ? 'Opening…' : 'Open all open PRs'}
+        busy={creating}
         disabled={creating || !repo.ready}
         onPrimary={() => void submit()}
         onCancel={onClose}
@@ -536,6 +541,7 @@ function OpenAllIssuesDialog({
         {error && <div className="pr-error">{error}</div>}
         <DialogActions
           primaryLabel={creating ? 'Opening…' : `Open ${confirmCount}`}
+          busy={creating}
           disabled={creating}
           onPrimary={() => void openAll()}
           onCancel={onClose}
@@ -579,6 +585,7 @@ function OpenAllIssuesDialog({
       {error && <div className="pr-error">{error}</div>}
       <DialogActions
         primaryLabel={creating ? 'Working…' : 'Open sessions'}
+        busy={creating}
         disabled={creating || labels === null || !repo.ready}
         onPrimary={() => void submit()}
         onCancel={onClose}

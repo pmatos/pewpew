@@ -3,7 +3,6 @@ import { useProjectsStore, remoteWorktreeKey } from '../stores/projects'
 import { useSessionsStore } from '../stores/sessions'
 import { useHostsStore } from '../stores/hosts'
 import ContextMenu, { type MenuItem } from './ContextMenu'
-import type { AgentTool } from '../../shared/types'
 import {
   SessionDialog,
   resolveSessionDialogDefaults,
@@ -41,8 +40,6 @@ interface OpenDialog {
 interface ProjectTreeUiState {
   expanded: Set<string>
   menu: MenuState | null
-  defaultTool: AgentTool
-  defaultSkipPermissions: boolean
   creating: boolean
   dialog: OpenDialog | null
   bulkOpenConfirmThreshold: number
@@ -72,27 +69,30 @@ function useProjectTreeElement({ onOpenSession }: TreeProps) {
   const [ui, setUi] = useReducer(projectTreeUiReducer, {
     expanded: new Set<string>(),
     menu: null,
-    defaultTool: 'claude',
-    defaultSkipPermissions: false,
     creating: false,
     dialog: null,
     bulkOpenConfirmThreshold: 20,
     toast: null,
   })
-  const {
-    expanded,
-    menu,
-    defaultTool,
-    defaultSkipPermissions,
-    creating,
-    dialog,
-    bulkOpenConfirmThreshold,
-    toast,
-  } = ui
-  // Monotonic token so a slow defaults lookup for a superseded open can't win.
+  const { expanded, menu, creating, dialog, bulkOpenConfirmThreshold, toast } = ui
+  // Monotonic token: bumped on every open and close, so a slow defaults lookup
+  // for a superseded open can't win, and callbacks from a dialog that has since
+  // been replaced or closed can't touch the current one.
   const dialogRequestRef = useRef(0)
+  const dialogId = dialog?.id
 
-  const handleBusyChange = useCallback((busy: boolean) => setUi({ creating: busy }), [])
+  const closeDialog = useCallback(() => {
+    if (dialogRequestRef.current !== dialogId) return
+    dialogRequestRef.current += 1
+    setUi({ dialog: null, creating: false })
+  }, [dialogId])
+
+  const handleBusyChange = useCallback(
+    (busy: boolean) => {
+      if (dialogRequestRef.current === dialogId) setUi({ creating: busy })
+    },
+    [dialogId]
+  )
 
   const showToast = (msg: string) => {
     setUi({ toast: msg })
@@ -105,21 +105,9 @@ function useProjectTreeElement({ onOpenSession }: TreeProps) {
 
   useEffect(() => {
     let cancelled = false
-    Promise.all([
-      window.api.getDefaultTool(),
-      window.api.getDefaultSkipPermissions(),
-      window.api.getBulkOpenConfirmThreshold(),
-    ]).then(([tool, skipPermissionsDefault, bulkOpenConfirmThreshold]) => {
+    window.api.getBulkOpenConfirmThreshold().then((bulkOpenConfirmThreshold) => {
       if (cancelled) return
-      // Don't touch pendingTool or skipPermissions here — the dialog-opening
-      // handlers re-seed them from these defaults at click time. Mutating them
-      // from this async callback would race against any user toggle made
-      // between the click and the defaults resolving.
-      setUi({
-        defaultTool: tool,
-        defaultSkipPermissions: skipPermissionsDefault,
-        bulkOpenConfirmThreshold,
-      })
+      setUi({ bulkOpenConfirmThreshold })
     })
     return () => {
       cancelled = true
@@ -166,10 +154,11 @@ function useProjectTreeElement({ onOpenSession }: TreeProps) {
     projectPath: string,
     hostId: string | null
   ) => {
+    if (creating) return
     const token = (dialogRequestRef.current += 1)
     const defaults = await resolveSessionDialogDefaults(window.api, {
-      tool: defaultTool,
-      skipPermissions: defaultSkipPermissions,
+      tool: 'claude',
+      skipPermissions: false,
     })
     if (dialogRequestRef.current !== token) return
     setUi({ dialog: { id: token, kind, path: projectPath, hostId, defaults } })
@@ -356,13 +345,13 @@ function useProjectTreeElement({ onOpenSession }: TreeProps) {
     return items
   }
 
-  if (loading) {
+  if (loading && !dialog) {
     return <div className="project-loading">Scanning…</div>
   }
 
   const displayProjects = filterReady ? projects.filter((p) => p.setupState === 'ready') : projects
 
-  if (displayProjects.length === 0) {
+  if (displayProjects.length === 0 && !dialog) {
     return (
       <div className="project-empty">
         {filterReady
@@ -382,7 +371,7 @@ function useProjectTreeElement({ onOpenSession }: TreeProps) {
           hostId={dialog.hostId}
           defaults={dialog.defaults}
           confirmThreshold={bulkOpenConfirmThreshold}
-          onClose={() => setUi({ dialog: null, creating: false })}
+          onClose={closeDialog}
           onToast={showToast}
           onBusyChange={handleBusyChange}
         />
