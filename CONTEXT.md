@@ -38,6 +38,16 @@ local session holds no lease. A lease that is never handed back keeps the host's
 ControlMaster alive forever, with no error anywhere — which is why placement,
 not a remembered line of code, decides whether one is taken.
 
+## Session creation
+
+**Adoption gate** — the process-local owner of “one Session and one agent tool
+per worktree” while an existing worktree is adopted. It reuses a compatible
+Session, coalesces concurrent same-tool adoption, and rejects mixed-tool
+requests. Local identity uses the canonical worktree path; remote identity uses
+the Host plus its opaque worktree path. Worktree validation, Agent hook
+lifecycle, PTY creation, and Session construction remain outside the gate.
+Expressed as `SessionAdoptionGate` in `src/main/session-adoption-gate.ts`.
+
 ## Agent integration
 
 **Agent hook lifecycle** — the per-tool preparation performed before a fresh

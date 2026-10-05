@@ -58,6 +58,7 @@ import { createSessionStore } from './session-store'
 import { createRemoteReconnectCoordinator } from './remote-reconnect'
 import { planIssueWorktree } from './worktree-plan'
 import { createOrAdoptWorktree, worktreeCreationError } from './worktree-adoption'
+import { createSessionAdoptionGate } from './session-adoption-gate'
 import { planRelocation } from './relocation-plan'
 import {
   PR_VIEW_FIELDS,
@@ -83,10 +84,8 @@ import {
 } from './numbered-session-plan'
 import {
   assertNoConflictingToolOnWorktree,
-  assertToolCompatible,
   findSessionByBranch,
   findSessionByPrNumber,
-  findSessionOnCanonicalWorktree,
   findSessionOnWorktree,
   occupiedWorktreePaths,
   worktreePathsForHost,
@@ -156,6 +155,11 @@ const store = createSessionStore({
 function allSessions(): Iterable<Session> {
   return store.values()
 }
+
+const sessionAdoptionGate = createSessionAdoptionGate({
+  sessions: allSessions,
+  canonicalizePath: canonicalPath,
+})
 
 function getRemoteProject(hostId: string, projectPath: string): RemoteProject {
   const project = listRemoteProjects().find((p) => p.hostId === hostId && p.path === projectPath)
@@ -358,18 +362,6 @@ async function isGitWorktree(worktreePath: string): Promise<boolean> {
   }
 }
 
-// In-flight adoption promises keyed by canonical worktree path. Serializes
-// concurrent mirror requests for the same path (e.g. double-click on + Mirror,
-// racing against mirrorAllWorktrees) so only one session/PTY is created.
-// Tracks the tool the in-flight adoption is using so a concurrent call with a
-// different tool gets a mixed-tool error rather than silently sharing the
-// wrong agent's session.
-interface InflightAdoption {
-  promise: Promise<Session>
-  tool: AgentTool
-}
-const inflightAdoptions = new Map<string, InflightAdoption>()
-
 // An explicit choice from a dialog wins; callers with no dialog (bulk issue
 // sessions, adoption) fall back to the configured default.
 function resolveSkipPermissions(explicit: boolean | undefined): boolean | undefined {
@@ -385,36 +377,10 @@ export async function createSessionForWorktree(
 ): Promise<Session> {
   const effectiveTool: AgentTool = tool ?? getConfig().defaultTool
   const effectiveSkipPermissions = resolveSkipPermissions(skipPermissions)
-  const target = canonicalPath(worktreePath)
-  const existing = findSessionOnCanonicalWorktree(allSessions(), worktreePath, canonicalPath)
-  if (existing) {
-    assertToolCompatible(existing, effectiveTool)
-    return existing
-  }
 
-  const inflight = inflightAdoptions.get(target)
-  if (inflight) {
-    if (inflight.tool !== effectiveTool) {
-      throw new Error(
-        `Worktree already has a ${inflight.tool} session in-flight; mixed tools per worktree are not supported`
-      )
-    }
-    return inflight.promise
-  }
-
-  const promise = adoptWorktree(
-    projectPath,
-    worktreePath,
-    label,
-    effectiveTool,
-    effectiveSkipPermissions
+  return sessionAdoptionGate.adopt({ placement: 'local', worktreePath }, effectiveTool, () =>
+    adoptWorktree(projectPath, worktreePath, label, effectiveTool, effectiveSkipPermissions)
   )
-  inflightAdoptions.set(target, { promise, tool: effectiveTool })
-  try {
-    return await promise
-  } finally {
-    inflightAdoptions.delete(target)
-  }
 }
 
 async function adoptWorktree(
@@ -549,11 +515,6 @@ async function mirrorAllRemoteWorktrees(
   return adoptTargets(targets, adopt, serialize)
 }
 
-// In-flight adoptions for remote worktrees, keyed by `${hostId} ${worktreePath}`.
-// Mirrors `inflightAdoptions` (local) so a double-click or a concurrent
-// mirror-all only creates one session/PTY per remote worktree.
-const inflightRemoteAdoptions = new Map<string, InflightAdoption>()
-
 // Adopts an EXISTING remote worktree as a pewpew session: it installs hooks and
 // attaches a PTY but never runs `git worktree add`. This is the remote analogue
 // of createSessionForWorktree/adoptWorktree.
@@ -566,30 +527,11 @@ export async function createRemoteSessionForWorktree(
 ): Promise<Session> {
   const effectiveTool: AgentTool = tool ?? getConfig().defaultTool
 
-  const existing = findSessionOnWorktree(allSessions(), hostId, worktreePath)
-  if (existing) {
-    assertToolCompatible(existing, effectiveTool)
-    return existing
-  }
-
-  const key = `${hostId} ${worktreePath}`
-  const inflight = inflightRemoteAdoptions.get(key)
-  if (inflight) {
-    if (inflight.tool !== effectiveTool) {
-      throw new Error(
-        `Worktree already has a ${inflight.tool} session in-flight; mixed tools per worktree are not supported`
-      )
-    }
-    return inflight.promise
-  }
-
-  const promise = adoptRemoteWorktree(hostId, projectPath, worktreePath, label, effectiveTool)
-  inflightRemoteAdoptions.set(key, { promise, tool: effectiveTool })
-  try {
-    return await promise
-  } finally {
-    inflightRemoteAdoptions.delete(key)
-  }
+  return sessionAdoptionGate.adopt(
+    { placement: 'remote', hostId, worktreePath },
+    effectiveTool,
+    () => adoptRemoteWorktree(hostId, projectPath, worktreePath, label, effectiveTool)
+  )
 }
 
 async function adoptRemoteWorktree(

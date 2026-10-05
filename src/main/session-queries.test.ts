@@ -5,7 +5,6 @@ import {
   assertToolCompatible,
   findSessionByBranch,
   findSessionByPrNumber,
-  findSessionOnCanonicalWorktree,
   findSessionOnWorktree,
   occupiedWorktreePaths,
   worktreePathsForHost,
@@ -64,46 +63,6 @@ describe('findSessionOnWorktree (exact, host-scoped)', () => {
       makeSession({ id: 'second', hostId: 'h1', worktreePath: '/r/x' }),
     ]
     expect(findSessionOnWorktree(sessions, 'h1', '/r/x')?.id).toBe('first')
-  })
-})
-
-describe('findSessionOnCanonicalWorktree (canonical, un-scoped)', () => {
-  const canonicalize = (p: string) => (p === '/symlink/wt' ? '/canonical/wt' : p)
-
-  it('matches when both paths canonicalize to the same location', () => {
-    const sessions = [makeSession({ id: 'a', hostId: null, worktreePath: '/canonical/wt' })]
-    expect(findSessionOnCanonicalWorktree(sessions, '/symlink/wt', canonicalize)?.id).toBe('a')
-  })
-
-  it('matches irrespective of hostId (no host scoping)', () => {
-    const sessions = [makeSession({ id: 'remote', hostId: 'h1', worktreePath: '/canonical/wt' })]
-    expect(findSessionOnCanonicalWorktree(sessions, '/symlink/wt', canonicalize)?.id).toBe('remote')
-  })
-
-  it('returns undefined when no canonical path matches', () => {
-    const sessions = [makeSession({ id: 'a', worktreePath: '/other' })]
-    expect(findSessionOnCanonicalWorktree(sessions, '/symlink/wt', canonicalize)).toBeUndefined()
-  })
-
-  it('canonicalizes the stored session path too', () => {
-    const sessions = [makeSession({ id: 'a', hostId: null, worktreePath: '/symlink/wt' })]
-    expect(findSessionOnCanonicalWorktree(sessions, '/canonical/wt', canonicalize)?.id).toBe('a')
-  })
-})
-
-describe('canonical-vs-exact inconsistency is preserved', () => {
-  // The local worktree-adopt path canonicalizes both sides; the local
-  // issue/PR-lookup path compares raw strings. This pins that difference so a
-  // future unification is a deliberate, separately-reviewed change.
-  const canonicalize = (p: string) => (p === '/symlink/wt' ? '/canonical/wt' : p)
-  const sessions = [makeSession({ id: 'a', hostId: null, worktreePath: '/canonical/wt' })]
-
-  it('canonical lookup matches the symlinked spelling', () => {
-    expect(findSessionOnCanonicalWorktree(sessions, '/symlink/wt', canonicalize)?.id).toBe('a')
-  })
-
-  it('exact lookup misses the symlinked spelling', () => {
-    expect(findSessionOnWorktree(sessions, null, '/symlink/wt')).toBeUndefined()
   })
 })
 
