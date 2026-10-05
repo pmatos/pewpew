@@ -1848,7 +1848,7 @@ export async function openSessionsForOpenIssues(
   projectPath: string,
   hostId: string | null = null,
   label?: string,
-  repo: string | null = null,
+  options: CreateSessionOptions = {},
   deps: OpenSessionsDeps = {}
 ): Promise<OpenSessionsSummary | string> {
   return openSessionsForNumberedItems(
@@ -1857,7 +1857,7 @@ export async function openSessionsForOpenIssues(
     'issueNumber',
     deps.listIssues ?? ((p, h, r) => listOpenIssues(p, h, label, r)),
     deps.createIssueSession ?? createIssueSession,
-    repo ? { repo } : {}
+    options
   )
 }
 

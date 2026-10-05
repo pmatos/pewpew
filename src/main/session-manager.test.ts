@@ -2808,10 +2808,16 @@ describe('openSessionsForOpenIssues', () => {
         baseLocalSession({ id: `s-${issueNumber}`, issueNumber }) as Session | string
     )
 
-    const result = await sm.openSessionsForOpenIssues('/proj', null, undefined, null, {
-      listIssues,
-      createIssueSession,
-    })
+    const result = await sm.openSessionsForOpenIssues(
+      '/proj',
+      null,
+      undefined,
+      {},
+      {
+        listIssues,
+        createIssueSession,
+      }
+    )
     expect(typeof result).not.toBe('string')
     if (typeof result === 'string') throw new Error(result)
 
@@ -2825,10 +2831,16 @@ describe('openSessionsForOpenIssues', () => {
 
   it('records per-issue create failures in the summary', async () => {
     const sm = await loadSessionManager()
-    const result = await sm.openSessionsForOpenIssues('/proj', null, undefined, null, {
-      listIssues: async () => [{ number: 5 }],
-      createIssueSession: async () => 'boom',
-    })
+    const result = await sm.openSessionsForOpenIssues(
+      '/proj',
+      null,
+      undefined,
+      {},
+      {
+        listIssues: async () => [{ number: 5 }],
+        createIssueSession: async () => 'boom',
+      }
+    )
     expect(typeof result).not.toBe('string')
     if (typeof result === 'string') throw new Error(result)
     expect(result.created).toEqual([])
@@ -2844,10 +2856,16 @@ describe('openSessionsForOpenIssues', () => {
         baseLocalSession({ id: `s-${issueNumber}`, issueNumber }) as Session | string
     )
 
-    const result = await sm.openSessionsForOpenIssues('/proj', null, 'bug', null, {
-      listIssues,
-      createIssueSession,
-    })
+    const result = await sm.openSessionsForOpenIssues(
+      '/proj',
+      null,
+      'bug',
+      {},
+      {
+        listIssues,
+        createIssueSession,
+      }
+    )
     expect(typeof result).not.toBe('string')
     if (typeof result === 'string') throw new Error(result)
     expect(result.created.map((s) => s.issueNumber)).toEqual([7])
@@ -2860,13 +2878,38 @@ describe('openSessionsForOpenIssues', () => {
       async (_projectPath: string, issueNumber: number) =>
         baseLocalSession({ id: `s-${issueNumber}`, issueNumber }) as Session | string
     )
-    const result = await sm.openSessionsForOpenIssues('/proj', null, 'bug', 'up/stream', {
-      listIssues,
-      createIssueSession,
-    })
+    const result = await sm.openSessionsForOpenIssues(
+      '/proj',
+      null,
+      'bug',
+      { repo: 'up/stream' },
+      {
+        listIssues,
+        createIssueSession,
+      }
+    )
     expect(typeof result).not.toBe('string')
     expect(listIssues).toHaveBeenCalledWith('/proj', null, 'up/stream')
     expect(createIssueSession).toHaveBeenCalledWith('/proj', 4, null, { repo: 'up/stream' })
+  })
+
+  it('forwards tool and skipPermissions to each created issue session', async () => {
+    const sm = await loadSessionManager()
+    const createIssueSession = vi.fn(
+      async (_projectPath: string, issueNumber: number) =>
+        baseLocalSession({ id: `s-${issueNumber}`, issueNumber }) as Session | string
+    )
+    await sm.openSessionsForOpenIssues(
+      '/proj',
+      null,
+      undefined,
+      { tool: 'claude', skipPermissions: true },
+      { listIssues: async () => [{ number: 9 }], createIssueSession }
+    )
+    expect(createIssueSession).toHaveBeenCalledWith('/proj', 9, null, {
+      tool: 'claude',
+      skipPermissions: true,
+    })
   })
 })
 
