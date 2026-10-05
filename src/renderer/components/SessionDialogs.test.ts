@@ -9,9 +9,24 @@ describe('session dialog defaults', () => {
       getWorktreeBase: vi.fn().mockResolvedValue('origin-default'),
     }
 
-    await expect(
-      resolveSessionDialogDefaults(api, { tool: 'claude', skipPermissions: false })
-    ).resolves.toEqual({ tool: 'codex', skipPermissions: true, baseFromOrigin: true })
+    await expect(resolveSessionDialogDefaults(api, 'session')).resolves.toEqual({
+      tool: 'codex',
+      skipPermissions: true,
+      baseFromOrigin: true,
+    })
+  })
+
+  it('only looks up the worktree base for the new-session dialog', async () => {
+    const api = {
+      getDefaultTool: vi.fn().mockResolvedValue('claude'),
+      getDefaultSkipPermissions: vi.fn().mockResolvedValue(false),
+      getWorktreeBase: vi.fn().mockResolvedValue('origin-default'),
+    }
+
+    await expect(resolveSessionDialogDefaults(api, 'pr')).resolves.toMatchObject({
+      baseFromOrigin: false,
+    })
+    expect(api.getWorktreeBase).not.toHaveBeenCalled()
   })
 
   it('falls back per-field when a lookup fails', async () => {
@@ -21,8 +36,10 @@ describe('session dialog defaults', () => {
       getWorktreeBase: vi.fn().mockRejectedValue(new Error('nope')),
     }
 
-    await expect(
-      resolveSessionDialogDefaults(api, { tool: 'omp', skipPermissions: false })
-    ).resolves.toEqual({ tool: 'omp', skipPermissions: true, baseFromOrigin: false })
+    await expect(resolveSessionDialogDefaults(api, 'session')).resolves.toEqual({
+      tool: 'claude',
+      skipPermissions: true,
+      baseFromOrigin: false,
+    })
   })
 })

@@ -1,5 +1,5 @@
 import { useEffect, useId, useRef, useState } from 'react'
-import type { AgentTool, OpenSessionsSummary, RepoChoices } from '../../shared/types'
+import type { AgentTool, OpenSessionsSummary, RepoChoices, WorktreeBase } from '../../shared/types'
 import { parseIssueSpec, parsePrSpec, type SpecNoun } from '../utils/pr-spec-parser'
 import { SessionOptionsFields, useSessionOptions } from './SessionOptionsFields'
 
@@ -11,18 +11,21 @@ export interface SessionDialogDefaults {
   baseFromOrigin: boolean
 }
 
+const FALLBACK_TOOL: AgentTool = 'claude'
+
 export async function resolveSessionDialogDefaults(
   api: {
     getDefaultTool: () => Promise<AgentTool>
     getDefaultSkipPermissions: () => Promise<boolean>
-    getWorktreeBase: () => Promise<'local' | 'origin-default'>
+    getWorktreeBase: () => Promise<WorktreeBase>
   },
-  fallback: Pick<SessionDialogDefaults, 'tool' | 'skipPermissions'>
+  kind: SessionDialogKind
 ): Promise<SessionDialogDefaults> {
+  // Only the new-session dialog branches a worktree, so only it needs the base.
   const [tool, skipPermissions, worktreeBase] = await Promise.all([
-    api.getDefaultTool().catch(() => fallback.tool),
-    api.getDefaultSkipPermissions().catch(() => fallback.skipPermissions),
-    api.getWorktreeBase().catch(() => 'local' as const),
+    api.getDefaultTool().catch(() => FALLBACK_TOOL),
+    api.getDefaultSkipPermissions().catch(() => false),
+    kind === 'session' ? api.getWorktreeBase().catch(() => 'local' as const) : 'local',
   ])
   return { tool, skipPermissions, baseFromOrigin: worktreeBase === 'origin-default' }
 }
@@ -94,7 +97,7 @@ function formatOpenAllSummary(result: OpenSessionsSummary, noun: SpecNoun): stri
 // the repository choice.
 function useRepoChoices(path: string, hostId: string | null, enabled: boolean) {
   const [choices, setChoices] = useState<RepoChoices | null>(null)
-  const [selected, setSelected] = useState('')
+  const [picked, setPicked] = useState<string | null>(null)
   const [ready, setReady] = useState(!enabled)
 
   useEffect(() => {
@@ -106,7 +109,6 @@ function useRepoChoices(path: string, hostId: string | null, enabled: boolean) {
         if (cancelled) return
         if (typeof result !== 'string') {
           setChoices(result)
-          setSelected(result.current)
         }
       })
       .catch(() => {})
@@ -118,10 +120,11 @@ function useRepoChoices(path: string, hostId: string | null, enabled: boolean) {
     }
   }, [path, hostId, enabled])
 
+  const selected = picked ?? choices?.current ?? ''
   // Only an explicit non-origin pick (the fork's upstream) is an override;
   // undefined means the default origin behavior.
-  const override = choices && selected && selected !== choices.current ? selected : undefined
-  return { choices, selected, setSelected, override, ready }
+  const override = choices && selected !== choices.current ? selected : undefined
+  return { choices, selected, setSelected: setPicked, override, ready }
 }
 
 function RepoPicker({
@@ -155,20 +158,20 @@ function RepoPicker({
 
 function DialogActions({
   primaryLabel,
-  disabled,
-  busy = false,
+  busy,
+  blocked = false,
   onPrimary,
   onCancel,
 }: {
   primaryLabel: string
-  disabled: boolean
-  busy?: boolean
+  busy: boolean
+  blocked?: boolean
   onPrimary: () => void
   onCancel: () => void
 }) {
   return (
     <div className="create-actions">
-      <button type="button" className="create-btn" onClick={onPrimary} disabled={disabled}>
+      <button type="button" className="create-btn" onClick={onPrimary} disabled={busy || blocked}>
         {primaryLabel}
       </button>
       <button type="button" className="create-btn cancel" onClick={onCancel} disabled={busy}>
@@ -180,11 +183,11 @@ function DialogActions({
 
 function useBusy(onBusyChange: (busy: boolean) => void) {
   const [busy, setBusy] = useState(false)
-  useEffect(() => {
-    onBusyChange(busy)
-    return () => onBusyChange(false)
-  }, [busy, onBusyChange])
-  return [busy, setBusy] as const
+  const update = (next: boolean) => {
+    setBusy(next)
+    onBusyChange(next)
+  }
+  return [busy, update] as const
 }
 
 function NewSessionDialog({ path, hostId, defaults, onClose, onBusyChange }: DialogProps) {
@@ -246,7 +249,6 @@ function NewSessionDialog({ path, hostId, defaults, onClose, onBusyChange }: Dia
       <DialogActions
         primaryLabel={creating ? 'Creating…' : 'Create'}
         busy={creating}
-        disabled={creating}
         onPrimary={() => void submit()}
         onCancel={onClose}
       />
@@ -374,7 +376,7 @@ function NumberedSessionDialog({
       <DialogActions
         primaryLabel={submitLabel}
         busy={creating}
-        disabled={creating || !repo.ready}
+        blocked={!repo.ready}
         onPrimary={() => void submit()}
         onCancel={onClose}
       />
@@ -398,7 +400,7 @@ function OpenAllPrsDialog({ path, hostId, defaults, onClose, onToast, onBusyChan
     try {
       const result = await window.api.openSessionsForOpenPrs(path, hostId, {
         ...options.toCreateOptions(),
-        ...(repo.override ? { repo: repo.override } : {}),
+        repo: repo.override,
       })
       onToast(typeof result === 'string' ? result : formatOpenAllSummary(result, 'PR'))
     } catch (err) {
@@ -419,7 +421,7 @@ function OpenAllPrsDialog({ path, hostId, defaults, onClose, onToast, onBusyChan
       <DialogActions
         primaryLabel={creating ? 'Opening…' : 'Open all open PRs'}
         busy={creating}
-        disabled={creating || !repo.ready}
+        blocked={!repo.ready}
         onPrimary={() => void submit()}
         onCancel={onClose}
       />
@@ -488,7 +490,7 @@ function OpenAllIssuesDialog({
     try {
       const result = await window.api.openSessionsForOpenIssues(path, hostId, label || null, {
         ...options.toCreateOptions(),
-        ...(repo.override ? { repo: repo.override } : {}),
+        repo: repo.override,
       })
       onToast(typeof result === 'string' ? result : formatOpenAllSummary(result, 'issue'))
       onClose()
@@ -542,7 +544,6 @@ function OpenAllIssuesDialog({
         <DialogActions
           primaryLabel={creating ? 'Opening…' : `Open ${confirmCount}`}
           busy={creating}
-          disabled={creating}
           onPrimary={() => void openAll()}
           onCancel={onClose}
         />
@@ -559,7 +560,6 @@ function OpenAllIssuesDialog({
         onChange={(value) => {
           repo.setSelected(value)
           setLabel('')
-          setConfirmCount(null)
         }}
       />
       <div className="session-name-label">Label filter:</div>
@@ -586,7 +586,7 @@ function OpenAllIssuesDialog({
       <DialogActions
         primaryLabel={creating ? 'Working…' : 'Open sessions'}
         busy={creating}
-        disabled={creating || labels === null || !repo.ready}
+        blocked={labels === null || !repo.ready}
         onPrimary={() => void submit()}
         onCancel={onClose}
       />

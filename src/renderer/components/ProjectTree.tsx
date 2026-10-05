@@ -156,13 +156,26 @@ function useProjectTreeElement({ onOpenSession }: TreeProps) {
   ) => {
     if (creating) return
     const token = (dialogRequestRef.current += 1)
-    const defaults = await resolveSessionDialogDefaults(window.api, {
-      tool: 'claude',
-      skipPermissions: false,
-    })
+    const defaults = await resolveSessionDialogDefaults(window.api, kind)
     if (dialogRequestRef.current !== token) return
     setUi({ dialog: { id: token, kind, path: projectPath, hostId, defaults } })
   }
+
+  const dialogMenuItems = (projectPath: string, hostId: string | null): MenuItem[] => [
+    { label: 'New session…', onClick: () => void openDialog('session', projectPath, hostId) },
+    { label: 'New PR session…', onClick: () => void openDialog('pr', projectPath, hostId) },
+    { label: 'New issue session…', onClick: () => void openDialog('issue', projectPath, hostId) },
+    {
+      label: 'Open sessions for all open PRs',
+      disabled: creating,
+      onClick: () => void openDialog('open-all-prs', projectPath, hostId),
+    },
+    {
+      label: 'Open sessions for all open issues…',
+      disabled: creating,
+      onClick: () => void openDialog('open-all-issues', projectPath, hostId),
+    },
+  ]
 
   const getMenuItems = (
     projectPath: string,
@@ -172,34 +185,7 @@ function useProjectTreeElement({ onOpenSession }: TreeProps) {
     const items: MenuItem[] = []
 
     if (hostId !== null) {
-      items.push({
-        label: 'New session…',
-        onClick: async () => {
-          await openDialog('session', projectPath, hostId)
-        },
-      })
-      items.push({
-        label: 'New PR session…',
-        onClick: () => {
-          void openDialog('pr', projectPath, hostId)
-        },
-      })
-      items.push({
-        label: 'New issue session…',
-        onClick: () => {
-          void openDialog('issue', projectPath, hostId)
-        },
-      })
-      items.push({
-        label: 'Open sessions for all open PRs',
-        disabled: creating,
-        onClick: () => void openDialog('open-all-prs', projectPath, hostId),
-      })
-      items.push({
-        label: 'Open sessions for all open issues…',
-        disabled: creating,
-        onClick: () => void openDialog('open-all-issues', projectPath, hostId),
-      })
+      items.push(...dialogMenuItems(projectPath, hostId))
       const remoteWts = remoteWorktreesCache[remoteWorktreeKey(hostId, projectPath)] ?? []
       const remoteUnmirrored = remoteWts.filter(
         (wt) =>
@@ -258,34 +244,7 @@ function useProjectTreeElement({ onOpenSession }: TreeProps) {
         },
       })
     } else {
-      items.push({
-        label: 'New session…',
-        onClick: async () => {
-          await openDialog('session', projectPath, null)
-        },
-      })
-      items.push({
-        label: 'New PR session…',
-        onClick: () => {
-          void openDialog('pr', projectPath, null)
-        },
-      })
-      items.push({
-        label: 'New issue session…',
-        onClick: () => {
-          void openDialog('issue', projectPath, null)
-        },
-      })
-      items.push({
-        label: 'Open sessions for all open PRs',
-        disabled: creating,
-        onClick: () => void openDialog('open-all-prs', projectPath, null),
-      })
-      items.push({
-        label: 'Open sessions for all open issues…',
-        disabled: creating,
-        onClick: () => void openDialog('open-all-issues', projectPath, null),
-      })
+      items.push(...dialogMenuItems(projectPath, hostId))
 
       const project = projects.find((p) => p.path === projectPath)
       const unmirroredCount =

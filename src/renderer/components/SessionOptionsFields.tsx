@@ -7,7 +7,7 @@ const TOOL_OPTIONS = [
   ['omp', 'oh-my-pi'],
 ] as const
 
-export interface SessionOptions {
+interface SessionOptions {
   tool: AgentTool
   skipPermissions: boolean
   setTool: (tool: AgentTool) => void
