@@ -191,6 +191,7 @@ function useBusy(onBusyChange: (busy: boolean) => void) {
 }
 
 function NewSessionDialog({ path, hostId, defaults, onClose, onBusyChange }: DialogProps) {
+  const inputId = useId()
   const inputRef = useRef<HTMLInputElement>(null)
   const options = useSessionOptions(defaults.tool, defaults.skipPermissions)
   const [name, setName] = useState('')
@@ -220,8 +221,11 @@ function NewSessionDialog({ path, hostId, defaults, onClose, onBusyChange }: Dia
 
   return (
     <div className="session-name-dialog">
-      <div className="session-name-label">Session name (optional):</div>
+      <label className="session-name-label" htmlFor={inputId}>
+        Session name (optional):
+      </label>
       <input
+        id={inputId}
         ref={inputRef}
         type="text"
         className="create-input"
@@ -429,6 +433,81 @@ function OpenAllPrsDialog({ path, hostId, defaults, onClose, onToast, onBusyChan
   )
 }
 
+// Labels are keyed by the repo they were fetched for, so a pick of a different
+// repo reads as "loading" until its own response lands.
+function useIssueLabels(path: string, hostId: string | null, repoKey: string) {
+  const [result, setResult] = useState<{
+    repo: string
+    labels: string[]
+    error: string | null
+  } | null>(null)
+
+  useEffect(() => {
+    let cancelled = false
+    window.api
+      .listRepoLabels(path, hostId, repoKey || null)
+      .then((labels) => {
+        if (cancelled) return
+        setResult(
+          typeof labels === 'string'
+            ? { repo: repoKey, labels: [], error: labels }
+            : { repo: repoKey, labels, error: null }
+        )
+      })
+      .catch((err) => {
+        if (!cancelled) setResult({ repo: repoKey, labels: [], error: String(err) })
+      })
+    return () => {
+      cancelled = true
+    }
+  }, [path, hostId, repoKey])
+
+  const current = result?.repo === repoKey ? result : null
+  return { labels: current?.labels ?? null, error: current?.error ?? null }
+}
+
+function LabelFilter({
+  labels,
+  error,
+  value,
+  disabled,
+  onChange,
+}: {
+  labels: string[] | null
+  error: string | null
+  value: string
+  disabled: boolean
+  onChange: (label: string) => void
+}) {
+  const selectId = useId()
+  return (
+    <>
+      <label className="session-name-label" htmlFor={selectId}>
+        Label filter:
+      </label>
+      {labels === null ? (
+        <div className="session-name-label">Loading labels…</div>
+      ) : (
+        <select
+          id={selectId}
+          className="create-input"
+          value={value}
+          disabled={disabled}
+          onChange={(e) => onChange(e.target.value)}
+        >
+          <option value="">All open issues</option>
+          {labels.map((name) => (
+            <option key={name} value={name}>
+              {name}
+            </option>
+          ))}
+        </select>
+      )}
+      {error && <div className="pr-error">Could not load labels: {error}</div>}
+    </>
+  )
+}
+
 function OpenAllIssuesDialog({
   path,
   hostId,
@@ -440,41 +519,14 @@ function OpenAllIssuesDialog({
 }: DialogProps) {
   const options = useSessionOptions(defaults.tool, defaults.skipPermissions)
   const repo = useRepoChoices(path, hostId, true)
-  const [labelsResult, setLabelsResult] = useState<{
-    repo: string
-    labels: string[]
-    error: string | null
-  } | null>(null)
   const [label, setLabel] = useState('')
   const [confirmCount, setConfirmCount] = useState<number | null>(null)
   const [error, setError] = useState<string | null>(null)
   const [creating, setCreating] = useBusy(onBusyChange)
-  // Bumped on every label reload and on unmount so an in-flight label fetch or
-  // count that resolves after a repo change or cancel is discarded instead of
-  // opening sessions for a dismissed dialog.
+  const { labels, error: labelsError } = useIssueLabels(path, hostId, repo.override ?? '')
+  // Bumped on unmount so a count that resolves after the dialog was cancelled
+  // is discarded instead of opening sessions for a dismissed dialog.
   const requestRef = useRef(0)
-
-  const repoKey = repo.override ?? ''
-  const labels = labelsResult?.repo === repoKey ? labelsResult.labels : null
-  const labelsError = labelsResult?.repo === repoKey ? labelsResult.error : null
-
-  useEffect(() => {
-    const token = (requestRef.current += 1)
-    window.api
-      .listRepoLabels(path, hostId, repoKey || null)
-      .then((result) => {
-        if (requestRef.current !== token) return
-        setLabelsResult(
-          typeof result === 'string'
-            ? { repo: repoKey, labels: [], error: result }
-            : { repo: repoKey, labels: result, error: null }
-        )
-      })
-      .catch((err) => {
-        if (requestRef.current !== token) return
-        setLabelsResult({ repo: repoKey, labels: [], error: String(err) })
-      })
-  }, [path, hostId, repoKey])
 
   useEffect(
     () => () => {
@@ -562,25 +614,13 @@ function OpenAllIssuesDialog({
           setLabel('')
         }}
       />
-      <div className="session-name-label">Label filter:</div>
-      {labels === null ? (
-        <div className="session-name-label">Loading labels…</div>
-      ) : (
-        <select
-          className="create-input"
-          value={label}
-          disabled={creating}
-          onChange={(e) => setLabel(e.target.value)}
-        >
-          <option value="">All open issues</option>
-          {labels.map((name) => (
-            <option key={name} value={name}>
-              {name}
-            </option>
-          ))}
-        </select>
-      )}
-      {labelsError && <div className="pr-error">Could not load labels: {labelsError}</div>}
+      <LabelFilter
+        labels={labels}
+        error={labelsError}
+        value={label}
+        disabled={creating}
+        onChange={setLabel}
+      />
       <SessionOptionsFields options={options} />
       {error && <div className="pr-error">{error}</div>}
       <DialogActions
