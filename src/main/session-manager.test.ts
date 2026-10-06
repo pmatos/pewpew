@@ -3050,6 +3050,7 @@ describe('createPrSession fork handling', () => {
     const runGit = vi.fn(async (argv: string[]) => {
       const key = argv.join(' ')
       if (key === 'fetch origin feat-y') return { stdout: '' }
+      if (key === 'rev-parse --verify --quiet refs/heads/feat-y') return { stdout: '' }
       if (key === 'worktree add /proj/.claude/worktrees/pr-7 feat-y') return { stdout: '' }
       throw new Error(`unexpected git ${key}`)
     })

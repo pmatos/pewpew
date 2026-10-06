@@ -59,6 +59,7 @@ export function describePrLookupFailure(prNumber: number, detail: string): strin
 }
 
 export interface PrWorktreePlan {
+  prNumber: number
   // Directory name (and IPC-visible worktree name) for the PR: always `pr-<n>`.
   worktreeName: string
   // The PR's real head branch name, as reported by gh. Used for user-facing
@@ -119,6 +120,7 @@ export function planPrWorktree(
   return {
     ok: true,
     plan: {
+      prNumber,
       worktreeName,
       branch,
       localBranch,

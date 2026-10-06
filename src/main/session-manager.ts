@@ -63,10 +63,10 @@ import { planRelocation } from './relocation-plan'
 import {
   PR_VIEW_FIELDS,
   describePrLookupFailure,
-  forkPullRefUnavailableMessage,
   planPrWorktree,
   type PrViewInfo,
 } from './pr-worktree-planner'
+import { checkoutPrWorktree } from './pr-worktree-checkout'
 import { exec as execRemote, runtimeStateFor, type HostConnectionState } from './host-connection'
 import { remoteHostRuntime } from './remote-host-runtime'
 import { createPrLookup, parseOwnerFromRemoteUrl } from './github'
@@ -779,7 +779,7 @@ async function createRemotePrSession(
 
     const planResult = planPrWorktree(prNumber, prInfo, externalRepo)
     if (!planResult.ok) return planResult.message
-    const { branch, localBranch, isFork, forkFields, fetchRemote, fetchRefspec } = planResult.plan
+    const { branch, forkFields } = planResult.plan
 
     const effectiveTool: AgentTool = options.tool ?? getConfig().defaultTool
 
@@ -791,58 +791,16 @@ async function createRemotePrSession(
 
     const id = randomUUID().slice(0, 8)
 
-    // Fetch the PR head into the local branch we'll check out; planPrWorktree
-    // picked the remote (origin, or the overridden repo's URL when a fork clone
-    // opens an upstream PR) and the refspec (a head-elsewhere PR head is
-    // force-fetched from refs/pull/<n>/head into its pewpew-namespaced branch, a
-    // same-repo head from origin/<branch>). A failure is tolerated — the branch
-    // may already be present locally, and a head-elsewhere PR that genuinely
-    // couldn't fetch is caught by the probe below.
-    const fetchResult = await execRemote(host, [
-      'git',
-      '-C',
-      projectPath,
-      'fetch',
-      fetchRemote,
-      fetchRefspec,
-    ]).catch(() => undefined)
-    // Keep the fetch's stderr: an override fetch runs over the upstream repo's
-    // URL (not origin), so an auth/transport failure surfaces here and would
-    // otherwise be lost behind the generic "could not fetch" message.
-    const fetchError =
-      fetchResult && fetchResult.code !== 0
-        ? fetchResult.stderr.trim() || `git fetch exited ${fetchResult.code}`
-        : undefined
-
-    // Pick the worktree-add form by probing for the local branch first instead
-    // of try-then-fallback. The fallback masked real failures (e.g. branch
-    // already checked out in a stale worktree) by surfacing the second
-    // attempt's misleading "branch already exists" error.
-    const branchExistsLocally = await remoteBranchExists(host, projectPath, localBranch)
-    if (isFork && !branchExistsLocally) {
-      // The pull-ref fetch should have created the pewpew/ branch; if it didn't
-      // there's no valid origin fallback for a head-elsewhere PR (origin/<branch>
-      // isn't the PR head).
-      return forkPullRefUnavailableMessage(branch, prNumber, fetchError)
-    }
-    const addArgv = branchExistsLocally
-      ? ['git', '-C', projectPath, 'worktree', 'add', worktreePath, localBranch]
-      : [
-          'git',
-          '-C',
-          projectPath,
-          'worktree',
-          'add',
-          worktreePath,
-          '-b',
-          localBranch,
-          `origin/${branch}`,
-        ]
-    try {
-      await expectRemoteOk(host, addArgv, 'Failed to create remote worktree')
-    } catch (err) {
-      return `Failed to create worktree for branch "${branch}": ${(err as Error).message}`
-    }
+    const checkout = await checkoutPrWorktree(planResult.plan, worktreePath, async (argv) => {
+      const result = await execRemote(host, ['git', '-C', projectPath, ...argv])
+      if (result.timedOut || result.code !== 0) {
+        const detail = result.stderr.trim() || result.stdout.trim() || `exit ${result.code}`
+        const prefix = argv[0] === 'worktree' ? 'Failed to create remote worktree: ' : ''
+        throw new Error(`${prefix}${detail}`)
+      }
+      return { stdout: result.stdout }
+    })
+    if (!checkout.ok) return checkout.message
 
     const { branch: resolvedBranch, sandboxed } = await spawnRemoteAgent({
       id,
@@ -1537,8 +1495,7 @@ export async function createPrSession(
 
   const planResult = planPrWorktree(prNumber, prInfo, options.repo)
   if (!planResult.ok) return planResult.message
-  const { worktreeName, branch, localBranch, isFork, forkFields, fetchRemote, fetchRefspec } =
-    planResult.plan
+  const { worktreeName, branch, isFork, forkFields } = planResult.plan
 
   // Reuse an existing session for this PR. First match by PR number (the only
   // globally-unique key), then — for a same-repo PR whose head branch name
@@ -1566,46 +1523,8 @@ export async function createPrSession(
 
   const worktreePath = join(projectPath, '.claude', 'worktrees', worktreeName)
 
-  // Fetch the PR head into the local branch we'll check out; planPrWorktree
-  // picked the remote (origin, or the overridden repo's URL when a fork clone
-  // opens an upstream PR) and the refspec (a head-elsewhere PR head is
-  // force-fetched from refs/pull/<n>/head into its pewpew-namespaced branch, a
-  // same-repo head from origin/<branch>).
-  // Keep the fetch error: an override fetch runs over the upstream repo's URL
-  // (not origin), so an auth/transport failure surfaces here and would otherwise
-  // be lost behind the generic "could not fetch" message.
-  let fetchError: string | undefined
-  try {
-    await runGit(['fetch', fetchRemote, fetchRefspec])
-  } catch (err) {
-    // Offline, or the branch is already present locally.
-    fetchError = describeGhError(err)
-  }
-  // The pull ref must have produced the local branch. If the fetch failed and it
-  // doesn't exist, do NOT run `git worktree add <path> <localBranch>`: with no
-  // local branch, git DWIMs the name to a remote-tracking origin/<localBranch>
-  // (if one exists) and silently checks out the wrong commits. Fail explicitly
-  // instead, mirroring the remote path.
-  if (isFork && !(await branchRefExists(runGit, localBranch, { quiet: true }))) {
-    return forkPullRefUnavailableMessage(branch, prNumber, fetchError)
-  }
-
-  // Create worktree from the PR branch
-  try {
-    await runGit(['worktree', 'add', worktreePath, localBranch])
-  } catch (err) {
-    // A head-elsewhere PR has no valid origin fallback — origin/<branch> is not
-    // its head.
-    if (isFork) {
-      return `Failed to create worktree for branch "${branch}": ${(err as Error).message}`
-    }
-    // Same-repo branch may not exist locally yet — create it tracking origin.
-    try {
-      await runGit(['worktree', 'add', worktreePath, '-b', localBranch, `origin/${branch}`])
-    } catch (fallbackErr) {
-      return `Failed to create worktree for branch "${branch}": ${(fallbackErr as Error).message}`
-    }
-  }
+  const checkout = await checkoutPrWorktree(planResult.plan, worktreePath, runGit)
+  if (!checkout.ok) return checkout.message
 
   const session = await adopt(
     projectPath,
