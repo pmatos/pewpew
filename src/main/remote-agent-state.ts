@@ -1,5 +1,3 @@
-import { OMP_ENCODE_SHELL_SCRIPT } from './agent-state-paths'
-
 // The agent's writable state directory ON a remote host, computed by running
 // buildRemoteAgentStateScript over SSH and passing its result to
 // parseRemoteAgentState. codex and omp only — claude is never sandboxed (see
@@ -11,14 +9,12 @@ export interface RemoteAgentState {
 // Builds the POSIX-shell script that resolves and mkdir's the writable state
 // dir for `tool` on a remote host, then prints it for parseRemoteAgentState.
 //
-// codex has no per-worktree dir convention — its resume is keyed on
-// agentSessionId, not a filesystem path — so the whole ~/.codex dir is the
-// writable exception (matching the local agentStateDir for codex).
+// Both tools get their whole home dir (~/.codex, ~/.omp) as the writable
+// exception, matching the local agentStateDir: omp writes databases, logs and
+// daemon state outside any per-worktree subdirectory.
 export function buildRemoteAgentStateScript(tool: 'codex' | 'omp'): string {
-  if (tool === 'codex') {
-    return 'd="$HOME/.codex"; mkdir -p "$d" && printf "%s" "$d"'
-  }
-  return `${OMP_ENCODE_SHELL_SCRIPT}; d="$HOME/.omp/agent/sessions/$enc"; mkdir -p "$d" && printf "%s" "$d"`
+  const dir = tool === 'codex' ? '.codex' : '.omp'
+  return `d="$HOME/${dir}"; mkdir -p "$d" && printf "%s" "$d"`
 }
 
 // Parses the script's raw exec result into the writable paths to bind, or

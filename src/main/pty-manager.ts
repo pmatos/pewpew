@@ -22,7 +22,7 @@ import {
   ensureCodexProjectConfigDir,
   ensureRemoteCodexProjectConfigDir,
 } from './hook-installer'
-import { encodeClaudeSessionDirName, encodeOmpSessionDirName } from './agent-state-paths'
+import { encodeClaudeSessionDirName } from './agent-state-paths'
 import {
   buildRemoteAgentStateScript,
   parseRemoteAgentState,
@@ -344,34 +344,26 @@ export function isSandboxAvailable(): boolean {
 // every sandboxed session would fail on its very first state write.
 //
 // For codex and omp, the path returned here IS the sandbox's writable
-// exception — narrowed to each tool's own per-worktree subdirectory, not the
-// rest of $HOME, so a sandboxed write can't reach global config that every
-// future session across every project loads.
+// exception: the tool's whole home dir (~/.codex, ~/.omp). Neither tool keeps
+// its writes inside a per-worktree subdirectory — omp also writes databases,
+// logs, caches and daemon state under ~/.omp — so a narrower grant makes the
+// agent die at startup with EROFS.
 //
 // claude is never sandboxed (see buildAgentArgs / buildLocalSandboxPrefix —
 // it runs under --permission-mode=auto, or skips permissions when the
 // session opted in, instead), so this function is only
 // called for claude to locate — and mkdir ahead of first run — the
-// per-worktree resume-history marker dir that hasClaudeConversationHistory
-// (session-manager.ts) checks.
-//
-// claude and omp key their per-worktree directory off an encoded path; the
-// encoders are imported from agent-state-paths.ts rather than reimplemented
-// so a mismatch can't leave this marker directory (or, for omp, the sandbox
-// binding itself) pointed at a different directory than resume-probing
-// checks.
-//
-// codex has no per-worktree directory convention in this codebase — its
-// resume is keyed on `agentSessionId` from the hook payload, not a
-// filesystem path — so its writable exception stays the whole ~/.codex dir
-// for now; narrowing it would mean guessing at codex's own on-disk layout.
+// per-worktree dir that hasClaudeConversationHistory (session-manager.ts)
+// reads. The encoder is imported from agent-state-paths.ts rather than
+// reimplemented so a mismatch can't point this at a different directory than
+// resume-probing checks.
 function agentStateDir(
   tool: AgentTool | undefined,
   worktreePath: string,
   homeDir: string = homedir()
 ): string {
   if (tool === 'omp') {
-    return join(homeDir, '.omp', 'agent', 'sessions', encodeOmpSessionDirName(worktreePath))
+    return join(homeDir, '.omp')
   }
   if (tool === 'codex') {
     return join(homeDir, '.codex')
@@ -469,10 +461,9 @@ function buildLocalSandboxPrefix(
 ): string[] {
   if (!projectPath) return []
   if (tool === 'codex') ensureCodexProjectConfigDir(projectPath)
-  // This directory doubles as session-manager.ts's resume-history marker
-  // (hasClaudeConversationHistory/hasOmpConversationHistory check it via
-  // existsSync) — created unconditionally, before the agent has ever run,
-  // regardless of whether this tool ends up sandboxed below.
+  // Created unconditionally, before the agent has ever run, regardless of
+  // whether this tool ends up sandboxed below: it is the sandbox's writable
+  // bind source for codex/omp.
   const stateDir = agentStateDir(tool, cwd)
   mkdirSync(stateDir, { recursive: true })
   // claude relies on its own permission mode (see buildAgentArgs) instead of

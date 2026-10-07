@@ -22,7 +22,7 @@ const state = {
   // disabled, since a missing state bind would make the agent's first write
   // hit EROFS under --ro-bind / /). Only codex/omp ever call it — claude is
   // never sandboxed.
-  remoteStateDir: '/home/dev/.omp/agent/sessions/encoded-wt1' as string | undefined,
+  remoteStateDir: '/home/dev/.omp' as string | undefined,
   // Every fakePty ever handed to production code, in spawn order, so a test can
   // drive the handlers pty-manager registered on it.
   ptys: [] as FakePty[],
@@ -136,7 +136,7 @@ vi.mock('./host-connection', () => ({
     // state.remoteStateDir to undefined.
     if (argv[0] === 'sh' && typeof argv[2] === 'string') {
       const script = argv[2]
-      if (script.includes('.codex') || script.includes('.omp/agent/sessions')) {
+      if (script.includes('.codex') || script.includes('.omp')) {
         const dir = state.remoteStateDir
         return {
           stdout: dir ?? '',
@@ -187,7 +187,7 @@ import {
 import type { PtyPlacement } from './pty-manager'
 import { buildSandboxArgs } from './agent-sandbox'
 import { OMP_HOOK_SCRIPT } from './hook-installer'
-import { canonicalPath, encodeOmpSessionDirName } from './agent-state-paths'
+import { canonicalPath } from './agent-state-paths'
 import type { Host } from '../shared/types'
 
 const PROJECT = '/home/dev/project'
@@ -451,18 +451,10 @@ describe('createPty', () => {
     expect(state.mkdirCalls).toContain(claudeStateDir)
   })
 
-  it('creates the tool-specific per-worktree state dir and opens only that as an extra writable path (omp)', () => {
+  it('creates ~/.omp and opens it whole as an extra writable path (omp)', () => {
     createPty('s1', WORKTREE, { tool: 'omp', projectPath: PROJECT })
-    const ompStateDir = join(
-      homedir(),
-      '.omp',
-      'agent',
-      'sessions',
-      encodeOmpSessionDirName(WORKTREE)
-    )
+    const ompStateDir = join(homedir(), '.omp')
     expect(state.mkdirCalls).toContain(ompStateDir)
-    // Not the whole ~/.omp dir — only this worktree's own session subdirectory.
-    expect(state.mkdirCalls).not.toContain(join(homedir(), '.omp'))
     // omp doesn't touch ~/.claude at all — that's claude-specific bookkeeping.
     expect(state.mkdirCalls).not.toContain(join(homedir(), '.claude'))
     const argv = agentArgsFromCall(newSessionCall())
@@ -495,7 +487,7 @@ describe('createPty', () => {
 
 describe('createRemotePty', () => {
   const host = { hostId: 'h1', alias: 'dev', label: 'Dev' } as Host
-  const OMP_STATE_DIR = '/home/dev/.omp/agent/sessions/encoded-wt1'
+  const OMP_STATE_DIR = '/home/dev/.omp'
   const REMOTE_SOCKET_DIR = '/tmp/pewpew-remote'
   const REMOTE_SOCKET = `${REMOTE_SOCKET_DIR}/hook.sock`
 
