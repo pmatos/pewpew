@@ -47,9 +47,9 @@ export interface LocalResumeProbes {
 }
 
 // Contents, not mere existence: pty-manager.ts pre-creates this exact directory
-// (as a bwrap bind-source) before the agent ever runs, so a bare existence test
-// would wrongly resume a worktree's very first session if the app restarted
-// before the agent wrote anything.
+// before the agent ever runs, so a bare existence test would wrongly resume a
+// worktree's very first session if the app restarted before the agent wrote
+// anything.
 export function hasClaudeConversationHistory(worktreePath: string): boolean {
   const dir = join(homedir(), '.claude', 'projects', encodeClaudeSessionDirName(worktreePath))
   try {
@@ -60,8 +60,7 @@ export function hasClaudeConversationHistory(worktreePath: string): boolean {
 }
 
 // Contents, not mere existence — same reasoning as hasClaudeConversationHistory:
-// createRemotePty's resolveRemoteAgentStateDir pre-creates this directory before
-// omp ever runs.
+// a session dir that exists but is empty must not count as prior history.
 export function hasOmpConversationHistory(worktreePath: string): boolean {
   const dir = join(homedir(), '.omp', 'agent', 'sessions', encodeOmpSessionDirName(worktreePath))
   try {

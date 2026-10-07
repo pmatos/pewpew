@@ -1,5 +1,4 @@
 import { describe, expect, it } from 'vitest'
-import { OMP_ENCODE_SHELL_SCRIPT } from './agent-state-paths'
 import { buildRemoteAgentStateScript, parseRemoteAgentState } from './remote-agent-state'
 
 // Expected bytes are the exact literals that sat inline in pty-manager before
@@ -11,12 +10,10 @@ describe('buildRemoteAgentStateScript', () => {
     )
   })
 
-  it('builds the omp script through the shared encoder seam, keyed on the encoded worktree', () => {
-    const script = buildRemoteAgentStateScript('omp')
-    expect(script.startsWith(`${OMP_ENCODE_SHELL_SCRIPT}; `)).toBe(true)
-    expect(
-      script.endsWith('d="$HOME/.omp/agent/sessions/$enc"; mkdir -p "$d" && printf "%s" "$d"')
-    ).toBe(true)
+  it('builds the omp script that mkdirs and prints the whole ~/.omp dir', () => {
+    expect(buildRemoteAgentStateScript('omp')).toBe(
+      'd="$HOME/.omp"; mkdir -p "$d" && printf "%s" "$d"'
+    )
   })
 })
 
@@ -29,12 +26,12 @@ describe('parseRemoteAgentState', () => {
 
   it('filters stdout to lines that look like absolute paths, dropping shell noise', () => {
     const withNoise = {
-      stdout: 'mkdir: cannot stat X\n/home/dev/.omp/agent/sessions/enc',
+      stdout: 'mkdir: cannot stat X\n/home/dev/.omp',
       code: 0,
       timedOut: false,
     }
     expect(parseRemoteAgentState(withNoise)).toEqual({
-      writablePaths: ['/home/dev/.omp/agent/sessions/enc'],
+      writablePaths: ['/home/dev/.omp'],
     })
   })
 
