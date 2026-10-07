@@ -22,7 +22,7 @@ import {
   ensureCodexProjectConfigDir,
   ensureRemoteCodexProjectConfigDir,
 } from './hook-installer'
-import { encodeClaudeSessionDirName } from './agent-state-paths'
+import { AGENT_HOME_DIR, encodeClaudeSessionDirName } from './agent-state-paths'
 import {
   buildRemoteAgentStateScript,
   parseRemoteAgentState,
@@ -351,8 +351,7 @@ export function isSandboxAvailable(): boolean {
 //
 // claude is never sandboxed (see buildAgentArgs / buildLocalSandboxPrefix —
 // it runs under --permission-mode=auto, or skips permissions when the
-// session opted in, instead), so this function is only
-// called for claude to locate — and mkdir ahead of first run — the
+// session opted in, instead), so for claude this only locates the
 // per-worktree dir that hasClaudeConversationHistory (session-manager.ts)
 // reads. The encoder is imported from agent-state-paths.ts rather than
 // reimplemented so a mismatch can't point this at a different directory than
@@ -362,11 +361,8 @@ function agentStateDir(
   worktreePath: string,
   homeDir: string = homedir()
 ): string {
-  if (tool === 'omp') {
-    return join(homeDir, '.omp')
-  }
-  if (tool === 'codex') {
-    return join(homeDir, '.codex')
+  if (tool === 'omp' || tool === 'codex') {
+    return join(homeDir, AGENT_HOME_DIR[tool])
   }
   return join(homeDir, '.claude', 'projects', encodeClaudeSessionDirName(worktreePath))
 }

@@ -47,9 +47,9 @@ export interface LocalResumeProbes {
 }
 
 // Contents, not mere existence: pty-manager.ts pre-creates this exact directory
-// (as a bwrap bind-source) before the agent ever runs, so a bare existence test
-// would wrongly resume a worktree's very first session if the app restarted
-// before the agent wrote anything.
+// before the agent ever runs, so a bare existence test would wrongly resume a
+// worktree's very first session if the app restarted before the agent wrote
+// anything.
 export function hasClaudeConversationHistory(worktreePath: string): boolean {
   const dir = join(homedir(), '.claude', 'projects', encodeClaudeSessionDirName(worktreePath))
   try {

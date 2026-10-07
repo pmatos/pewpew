@@ -1,3 +1,5 @@
+import { AGENT_HOME_DIR } from './agent-state-paths'
+
 // The agent's writable state directory ON a remote host, computed by running
 // buildRemoteAgentStateScript over SSH and passing its result to
 // parseRemoteAgentState. codex and omp only — claude is never sandboxed (see
@@ -13,8 +15,7 @@ export interface RemoteAgentState {
 // exception, matching the local agentStateDir: omp writes databases, logs and
 // daemon state outside any per-worktree subdirectory.
 export function buildRemoteAgentStateScript(tool: 'codex' | 'omp'): string {
-  const dir = tool === 'codex' ? '.codex' : '.omp'
-  return `d="$HOME/${dir}"; mkdir -p "$d" && printf "%s" "$d"`
+  return `d="$HOME/${AGENT_HOME_DIR[tool]}"; mkdir -p "$d" && printf "%s" "$d"`
 }
 
 // Parses the script's raw exec result into the writable paths to bind, or

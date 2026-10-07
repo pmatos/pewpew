@@ -6,6 +6,11 @@ import { realpathSync } from 'fs'
 import { homedir, tmpdir } from 'os'
 import { relative, isAbsolute } from 'path'
 
+// Home-relative directory each sandboxed tool is granted writable, shared by
+// the local bwrap grant (pty-manager.ts) and the remote one
+// (remote-agent-state.ts) so the two cannot drift.
+export const AGENT_HOME_DIR = { codex: '.codex', omp: '.omp' } as const
+
 export function canonicalPath(p: string): string {
   try {
     return realpathSync(p)
