@@ -415,20 +415,19 @@ async function resolveRemoteGitDir(host: Host, projectPath: string): Promise<str
 // mkdir's it in the same SSH round trip. This must run on the remote, not via
 // the local agentStateDir(): the local helper uses local
 // realpathSync/homedir/tmpdir and platform-local path.join, all of which
-// compute the wrong path for a remote session (wrong symlinks, wrong $HOME,
-// wrong tmpdir, wrong omp encoding). Codex and omp only — claude is never
+// compute the wrong path for a remote session (wrong symlinks, wrong $HOME).
+// Codex and omp only — claude is never
 // sandboxed (see buildAgentArgs), so it never needs this. The script bytes
 // and the parse of their output are the contract of ./remote-agent-state;
 // this is only the IO seam that runs one against the other and degrades to
 // unsandboxed on any SSH failure.
 async function resolveRemoteAgentStateDir(
   host: Host,
-  tool: 'codex' | 'omp',
-  worktreePath: string
+  tool: 'codex' | 'omp'
 ): Promise<RemoteAgentState | undefined> {
   const script = buildRemoteAgentStateScript(tool)
   try {
-    const result = await execRemote(host, ['sh', '-c', script, '_', worktreePath], {
+    const result = await execRemote(host, ['sh', '-c', script], {
       timeoutMs: 8000,
     })
     return parseRemoteAgentState(result)
@@ -637,8 +636,8 @@ export async function createRemotePty(
       const tool = options.tool
       // Remote sandbox wiring mirrors createPty's local path: resolve the real
       // .git dir (gitfile roots) and the agent state dir ON the remote host
-      // (computing it locally would use the wrong $HOME, symlinks, and omp
-      // encoding). resolveRemoteAgentStateDir also mkdir's the dir in the same
+      // (computing it locally would use the wrong $HOME and symlinks).
+      // resolveRemoteAgentStateDir also mkdir's the dir in the same
       // SSH round trip so bwrap's bind-source exists before the tmux spawn.
       //
       // Both resolutions must succeed to enable sandboxing: a missing
@@ -658,7 +657,7 @@ export async function createRemotePty(
       const canSandboxHost = sandboxEnabled && options?.sandboxAvailable === true
       const [gitDir, remoteState] = await Promise.all([
         resolveRemoteGitDir(host, options.projectPath),
-        canSandboxHost ? resolveRemoteAgentStateDir(host, tool, cwd) : Promise.resolve(undefined),
+        canSandboxHost ? resolveRemoteAgentStateDir(host, tool) : Promise.resolve(undefined),
       ])
       const canSandbox = canSandboxHost && !!remoteState
       sandboxPrefix = buildSandboxArgs(options.projectPath, cwd, {

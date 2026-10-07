@@ -60,8 +60,7 @@ export function hasClaudeConversationHistory(worktreePath: string): boolean {
 }
 
 // Contents, not mere existence — same reasoning as hasClaudeConversationHistory:
-// createRemotePty's resolveRemoteAgentStateDir pre-creates this directory before
-// omp ever runs.
+// a session dir that exists but is empty must not count as prior history.
 export function hasOmpConversationHistory(worktreePath: string): boolean {
   const dir = join(homedir(), '.omp', 'agent', 'sessions', encodeOmpSessionDirName(worktreePath))
   try {

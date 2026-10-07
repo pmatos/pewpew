@@ -136,7 +136,7 @@ vi.mock('./host-connection', () => ({
     // state.remoteStateDir to undefined.
     if (argv[0] === 'sh' && typeof argv[2] === 'string') {
       const script = argv[2]
-      if (script.includes('.codex') || script.includes('.omp')) {
+      if (script.includes('$HOME/.codex') || script.includes('$HOME/.omp')) {
         const dir = state.remoteStateDir
         return {
           stdout: dir ?? '',
