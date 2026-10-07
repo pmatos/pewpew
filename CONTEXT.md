@@ -40,6 +40,13 @@ not a remembered line of code, decides whether one is taken.
 
 ## Session creation
 
+**PR worktree checkout** — the Git sequence that fetches a PR head, verifies
+the chosen local branch, and adds its worktree before a Session is created.
+`planPrWorktree` chooses the head and branch from PR metadata;
+`checkoutPrWorktree` executes that plan for either a local or remote Git runner.
+A fork or repository override must have its PR-scoped local branch before
+checkout; it never falls back to an `origin/<head branch>` with unrelated commits.
+
 **Adoption gate** — the process-local owner of “one Session and one agent tool
 per worktree” while an existing worktree is adopted. It reuses a compatible
 Session, coalesces concurrent same-tool adoption, and rejects mixed-tool

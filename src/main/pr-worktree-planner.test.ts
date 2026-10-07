@@ -1,4 +1,4 @@
-import { describe, expect, it } from 'vitest'
+import { describe, expect, it, vi } from 'vitest'
 import {
   describePrLookupFailure,
   forkFieldsFromPr,
@@ -7,6 +7,7 @@ import {
   prHeadFetchRemote,
   type PrViewInfo,
 } from './pr-worktree-planner'
+import { checkoutPrWorktree } from './pr-worktree-checkout'
 
 // A same-repo (non-fork) PR: gh reports isCrossRepository=false and the head
 // branch lives on origin, so the real branch name is safe to check out directly.
@@ -33,6 +34,75 @@ function forkPr(overrides: Partial<PrViewInfo> = {}): PrViewInfo {
     ...overrides,
   }
 }
+
+describe('checkoutPrWorktree', () => {
+  it('uses an existing same-repo branch without masking a failed worktree add', async () => {
+    const planned = planPrWorktree(7, sameRepoPr())
+    if (!planned.ok) throw new Error(planned.message)
+    const runGit = vi.fn(async (argv: string[]) => {
+      if (argv[0] === 'worktree') throw new Error('branch is already checked out')
+      return { stdout: '' }
+    })
+
+    expect(await checkoutPrWorktree(planned.plan, '/worktrees/pr-7', runGit)).toEqual({
+      ok: false,
+      message: 'Failed to create worktree for branch "feat-y": branch is already checked out',
+    })
+    expect(runGit).toHaveBeenCalledWith(['rev-parse', '--verify', '--quiet', 'refs/heads/feat-y'])
+    expect(runGit).toHaveBeenCalledWith(['worktree', 'add', '/worktrees/pr-7', 'feat-y'])
+    expect(runGit.mock.calls.filter(([argv]) => argv[0] === 'worktree')).toHaveLength(1)
+  })
+
+  it('creates a missing same-repo branch from origin', async () => {
+    const planned = planPrWorktree(7, sameRepoPr())
+    if (!planned.ok) throw new Error(planned.message)
+    const runGit = vi.fn(async (argv: string[]) => {
+      if (argv[0] === 'rev-parse') throw new Error('branch absent')
+      return { stdout: '' }
+    })
+
+    expect(await checkoutPrWorktree(planned.plan, '/worktrees/pr-7', runGit)).toEqual({ ok: true })
+    expect(runGit).toHaveBeenCalledWith([
+      'worktree',
+      'add',
+      '/worktrees/pr-7',
+      '-b',
+      'feat-y',
+      'origin/feat-y',
+    ])
+  })
+
+  it('refuses a missing fork pull ref without allowing git to select another branch', async () => {
+    const planned = planPrWorktree(335, forkPr())
+    if (!planned.ok) throw new Error(planned.message)
+    const runGit = vi.fn(async (argv: string[]) => {
+      if (argv[0] === 'fetch') throw new Error('network down')
+      if (argv[0] === 'rev-parse') throw new Error('branch absent')
+      return { stdout: '' }
+    })
+
+    expect(await checkoutPrWorktree(planned.plan, '/worktrees/pr-335', runGit)).toEqual({
+      ok: false,
+      message:
+        'Failed to create worktree for branch "codex/fix-x": could not fetch refs/pull/335/head — network down',
+    })
+    expect(runGit.mock.calls.some(([argv]) => argv[0] === 'worktree')).toBe(false)
+  })
+
+  it('uses a previously fetched fork branch when fetching is temporarily unavailable', async () => {
+    const planned = planPrWorktree(335, forkPr())
+    if (!planned.ok) throw new Error(planned.message)
+    const runGit = vi.fn(async (argv: string[]) => {
+      if (argv[0] === 'fetch') throw new Error('offline')
+      return { stdout: '' }
+    })
+
+    expect(await checkoutPrWorktree(planned.plan, '/worktrees/pr-335', runGit)).toEqual({
+      ok: true,
+    })
+    expect(runGit).toHaveBeenCalledWith(['worktree', 'add', '/worktrees/pr-335', 'pewpew/pr-335'])
+  })
+})
 
 describe('forkFieldsFromPr', () => {
   it('returns empty fields for a same-repo PR', () => {
@@ -139,6 +209,7 @@ describe('planPrWorktree', () => {
     expect(result.ok).toBe(true)
     if (!result.ok) throw new Error(result.message)
     expect(result.plan).toEqual({
+      prNumber: 7,
       worktreeName: 'pr-7',
       branch: 'feat-y',
       localBranch: 'feat-y',
@@ -155,6 +226,7 @@ describe('planPrWorktree', () => {
     expect(result.ok).toBe(true)
     if (!result.ok) throw new Error(result.message)
     expect(result.plan).toEqual({
+      prNumber: 335,
       worktreeName: 'pr-335',
       branch: 'codex/fix-x',
       localBranch: 'pewpew/pr-335',
@@ -173,6 +245,7 @@ describe('planPrWorktree', () => {
     const result = planPrWorktree(42, sameRepoPr({ headRefName: 'feature-x' }), 'up/stream')
     if (!result.ok) throw new Error(result.message)
     expect(result.plan).toEqual({
+      prNumber: 42,
       worktreeName: 'pr-42',
       branch: 'feature-x',
       localBranch: 'pewpew/pr-42',
