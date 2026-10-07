@@ -73,6 +73,7 @@ import {
   setOnHostConnectionStopped,
 } from './host-connection'
 import { invalidateBootstrap } from './host-bootstrap'
+import { registerSessionActionHandlers } from './session-action-handlers'
 import { clearSshLog } from './ssh-log-buffer'
 import { stopHookServerForHost } from './hook-server'
 import {
@@ -529,93 +530,16 @@ app.whenReady().then(async () => {
     return getSessions()
   })
 
-  // Single-session handlers log and re-throw so the renderer can react (e.g.
-  // DetailPane.handleRevive clears its "Reviving..." state on rejection).
-  // Batch handlers below swallow per-session errors so one failure doesn't
-  // abort a multi-select operation.
-  ipcMain.handle('sessions:kill', async (_event, id: string) => {
-    try {
-      await killSession(id)
-    } catch (err) {
-      console.error(`Failed to kill session ${id}:`, err)
-      throw err
-    }
-  })
-
-  ipcMain.handle('sessions:revive', async (_event, id: string) => {
-    try {
-      await reviveSession(id)
-    } catch (err) {
-      console.error(`Failed to revive session ${id}:`, err)
-      throw err
-    }
-  })
-
-  ipcMain.handle('sessions:reconnect', async (_event, id: string) => {
-    try {
-      await reconnectRemoteSession(id)
-    } catch (err) {
-      console.error(`Failed to reconnect session ${id}:`, err)
-      throw err
-    }
-  })
-
-  ipcMain.handle('sessions:attach', async (_event, id: string) => {
-    try {
-      await attachLocalSession(id)
-    } catch (err) {
-      console.error(`Failed to attach session ${id}:`, err)
-      throw err
-    }
+  registerSessionActionHandlers(ipcMain, {
+    kill: killSession,
+    revive: reviveSession,
+    reconnect: reconnectRemoteSession,
+    attach: attachLocalSession,
+    remove: removeSession,
   })
 
   ipcMain.handle('sessions:remove-worktree', async (_event, id: string) => {
     await removeWorktree(id)
-  })
-
-  ipcMain.handle('sessions:remove', async (_event, id: string) => {
-    try {
-      await removeSession(id)
-    } catch (err) {
-      console.error(`Failed to remove session ${id}:`, err)
-      throw err
-    }
-  })
-
-  ipcMain.handle('sessions:kill-batch', async (_event, ids: string[]) => {
-    await Promise.all(
-      ids.map(async (id) => {
-        try {
-          await killSession(id)
-        } catch (err) {
-          console.error(`Failed to kill session ${id}:`, err)
-        }
-      })
-    )
-  })
-
-  ipcMain.handle('sessions:revive-batch', async (_event, ids: string[]) => {
-    await Promise.all(
-      ids.map(async (id) => {
-        try {
-          await reviveSession(id)
-        } catch (err) {
-          console.error(`Failed to revive session ${id}:`, err)
-        }
-      })
-    )
-  })
-
-  ipcMain.handle('sessions:remove-batch', async (_event, ids: string[]) => {
-    await Promise.all(
-      ids.map(async (id) => {
-        try {
-          await removeSession(id)
-        } catch (err) {
-          console.error(`Failed to remove session ${id}:`, err)
-        }
-      })
-    )
   })
 
   ipcMain.handle('pty:write', (_event, sessionId: string, data: string) => {
