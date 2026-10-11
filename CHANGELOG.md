@@ -1,3 +1,10 @@
+## [0.12.1](https://github.com/pmatos/pewpew/compare/v0.12.0...v0.12.1) (2026-10-11)
+
+
+### Bug Fixes
+
+* grant omp sandbox write access to ~/.omp ([#355](https://github.com/pmatos/pewpew/issues/355)) ([a021931](https://github.com/pmatos/pewpew/commit/a0219318975490687d78036a0a22db2a2362678b))
+
 # [0.12.0](https://github.com/pmatos/pewpew/compare/v0.11.1...v0.12.0) (2026-10-04)
 
 
