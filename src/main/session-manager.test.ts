@@ -946,6 +946,67 @@ describe('createSession origin-default base', () => {
   })
 })
 
+describe.each(['session', 'issue'] as const)('remote %s checkout failures', (kind) => {
+  it('preserves the SSH origin failure details and does not spawn an agent', async () => {
+    state.remoteProjects = [{ hostId: 'h1', path: '/remote/proj', name: 'proj' }]
+    state.execRemoteResults.set('git -C /remote/proj fetch origin --quiet', {
+      stdout: '',
+      stderr: 'network down',
+      code: 128,
+      timedOut: false,
+    })
+    const sm = await loadSessionManager()
+    const attempt =
+      kind === 'session'
+        ? sm.createSession('/remote/proj', 'feat', 'h1', { baseRef: 'origin-default' })
+        : sm.createIssueSession('/remote/proj', 42, 'h1')
+
+    if (kind === 'session') {
+      await expect(attempt).rejects.toThrow('Failed to fetch origin: git failed: network down')
+    } else {
+      await expect(attempt).resolves.toBe(
+        'Failed to resolve origin default: Failed to fetch origin: git failed: network down'
+      )
+    }
+    expect(state.createRemotePtyCalls).toEqual([])
+    expect(state.execRemoteCalls.some(({ argv }) => argv.includes('worktree'))).toBe(false)
+  })
+
+  it('preserves the SSH checkout failure details and does not spawn an agent', async () => {
+    state.remoteProjects = [{ hostId: 'h1', path: '/remote/proj', name: 'proj' }]
+    const branch = kind === 'session' ? 'proj/feat' : 'issue-42'
+    const name = kind === 'session' ? 'feat' : 'issue-42'
+    state.execRemoteResults.set(
+      'git -C /remote/proj symbolic-ref --short refs/remotes/origin/HEAD',
+      { stdout: 'origin/main\n', stderr: '', code: 0, timedOut: false }
+    )
+    state.execRemoteResults.set(
+      `git -C /remote/proj worktree add /remote/proj/.claude/worktrees/${name} --no-track -b ${branch} refs/remotes/origin/main`,
+      { stdout: '', stderr: 'disk full', code: 128, timedOut: false }
+    )
+    state.execRemoteResults.set(`git -C /remote/proj rev-parse --verify refs/heads/${branch}`, {
+      stdout: '',
+      stderr: 'missing',
+      code: 128,
+      timedOut: false,
+    })
+    const sm = await loadSessionManager()
+    const attempt =
+      kind === 'session'
+        ? sm.createSession('/remote/proj', 'feat', 'h1', { baseRef: 'origin-default' })
+        : sm.createIssueSession('/remote/proj', 42, 'h1')
+
+    if (kind === 'session') {
+      await expect(attempt).rejects.toThrow('Failed to create remote worktree: disk full')
+    } else {
+      await expect(attempt).resolves.toBe(
+        `Failed to create worktree for branch "${branch}": Failed to create remote worktree: disk full`
+      )
+    }
+    expect(state.createRemotePtyCalls).toEqual([])
+  })
+})
+
 describe('restoreSessions — remote lazy materialization', () => {
   it('materializes remote sessions in pending state and opens no SSH', async () => {
     writeSessionsJson([baseRemoteSession({ id: 'r1', status: 'idle' })])
@@ -2640,6 +2701,73 @@ describe('createIssueSession', () => {
 
     const result = await sm.createIssueSession('/proj', 99, null, {}, { runGit })
     expect(result).toBe("Could not determine origin's default branch.")
+  })
+
+  it('returns the missing-origin message before attempting adoption', async () => {
+    const sm = await loadSessionManager()
+    const runGit = vi.fn().mockRejectedValue(new Error('no remote'))
+    const createSessionForWorktree = vi.fn()
+
+    const result = await sm.createIssueSession(
+      '/proj',
+      42,
+      null,
+      {},
+      { runGit, createSessionForWorktree }
+    )
+
+    expect(result).toBe('This project has no origin remote.')
+    expect(runGit).toHaveBeenCalledExactlyOnceWith(['remote', 'get-url', 'origin'])
+    expect(createSessionForWorktree).not.toHaveBeenCalled()
+  })
+
+  it('reports a failed checkout without starting a Session', async () => {
+    const sm = await loadSessionManager()
+    const runGit = vi.fn(async (argv: string[]) => {
+      if (argv[0] === 'worktree') throw new Error('disk full')
+      if (argv[0] === 'symbolic-ref') return { stdout: 'origin/main\n' }
+      return { stdout: '' }
+    })
+    const branchExists = vi.fn().mockResolvedValue(false)
+    const createSessionForWorktree = vi.fn()
+
+    const result = await sm.createIssueSession(
+      '/proj',
+      42,
+      null,
+      {},
+      { runGit, branchExists, createSessionForWorktree }
+    )
+
+    expect(result).toBe('Failed to create worktree for branch "issue-42": disk full')
+    expect(branchExists).toHaveBeenCalledExactlyOnceWith('/proj', 'issue-42')
+    expect(createSessionForWorktree).not.toHaveBeenCalled()
+  })
+
+  it('propagates a rejecting injected branch probe without starting a Session', async () => {
+    const sm = await loadSessionManager()
+    const probeError = new Error('probe unavailable')
+    const runGit = vi.fn(async (argv: string[]) => {
+      if (argv[0] === 'worktree') throw new Error('branch already exists')
+      if (argv[0] === 'symbolic-ref') return { stdout: 'origin/main\n' }
+      return { stdout: '' }
+    })
+    const createSessionForWorktree = vi.fn()
+
+    await expect(
+      sm.createIssueSession(
+        '/proj',
+        42,
+        null,
+        {},
+        {
+          runGit,
+          branchExists: vi.fn().mockRejectedValue(probeError),
+          createSessionForWorktree,
+        }
+      )
+    ).rejects.toBe(probeError)
+    expect(createSessionForWorktree).not.toHaveBeenCalled()
   })
 })
 

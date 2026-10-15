@@ -40,6 +40,14 @@ not a remembered line of code, decides whether one is taken.
 
 ## Session creation
 
+**Named worktree checkout** — the Git sequence shared by origin-default Session
+creation and issue Session creation. It resolves the fetched origin default,
+creates the requested branch without upstream tracking, and, on creation failure,
+adopts that exact local branch if it exists. `checkoutNamedWorktree` throws the
+original failure; `tryCheckoutNamedWorktree` returns the existing display error.
+Local Git and SSH Git are adapters behind this interface in
+`src/main/worktree-adoption.ts`. Legacy local-base creation stays separate.
+
 **PR worktree checkout** — the Git sequence that fetches a PR head, verifies
 the chosen local branch, and adds its worktree before a Session is created.
 `planPrWorktree` chooses the head and branch from PR metadata;

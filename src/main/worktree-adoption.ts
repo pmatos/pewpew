@@ -1,42 +1,81 @@
-// Shared two-phase fallback for `git worktree add`, used by both the local and
-// remote issue- and session-creation paths so those four sites can't drift.
-//
-// The protocol: try to add a worktree that also creates a fresh branch. Git
-// fails that DWIM when the branch already exists, so on failure we probe for the
-// branch and, if it's there, retry adding a worktree that adopts it. The outcome
-// is a discriminated result carrying the *original* error object as `cause`,
-// letting each caller surface failure its own way — issue paths wrap `cause`
-// into a user-facing string via `worktreeCreationError`, session paths re-throw
-// it — without this module owning either policy. `branchExists` is deliberately
-// left outside the try/catch: a probe failure (e.g. a dropped SSH connection) is
-// not proof the branch is absent, so it propagates rather than being treated as
-// "does not exist".
+import { branchRefExists } from './branch-ref'
+import { resolveOriginDefaultBase, type GitRunner } from './origin-base'
 
-export interface WorktreeAdoptionSteps {
-  addNewBranch: () => Promise<void>
-  branchExists: () => Promise<boolean>
-  adoptExistingBranch: () => Promise<void>
+interface NamedWorktreeRequest {
+  worktreePath: string
+  branch: string
 }
 
-export type WorktreeAdoptionResult = { ok: true } | { ok: false; cause: unknown }
+export interface NamedWorktreeGit {
+  runGit: GitRunner
+  runWorktreeGit?: GitRunner
+  branchExists?: (branch: string) => Promise<boolean>
+}
 
-export async function createOrAdoptWorktree(
-  steps: WorktreeAdoptionSteps
-): Promise<WorktreeAdoptionResult> {
+type CheckoutResult = { ok: true } | { ok: false; stage: 'origin' | 'worktree'; cause: unknown }
+
+export type NamedWorktreeAttempt = { ok: true } | { ok: false; message: string }
+
+async function checkout(
+  { worktreePath, branch }: NamedWorktreeRequest,
+  git: NamedWorktreeGit
+): Promise<CheckoutResult> {
+  let originRef: string
   try {
-    await steps.addNewBranch()
+    originRef = await resolveOriginDefaultBase(git.runGit)
+  } catch (cause) {
+    return { ok: false, stage: 'origin', cause }
+  }
+
+  const runWorktreeGit = git.runWorktreeGit ?? git.runGit
+  try {
+    await runWorktreeGit(['worktree', 'add', worktreePath, '--no-track', '-b', branch, originRef])
     return { ok: true }
   } catch (creationError) {
-    if (!(await steps.branchExists())) {
-      return { ok: false, cause: creationError }
-    }
+    // An injected probe may reject; keep it outside the adoption catch so a
+    // transport failure is never converted into a checkout diagnostic.
+    const exists = git.branchExists
+      ? await git.branchExists(branch)
+      : await branchRefExists(git.runGit, branch)
+    if (!exists) return { ok: false, stage: 'worktree', cause: creationError }
+
     try {
-      await steps.adoptExistingBranch()
+      await runWorktreeGit(['worktree', 'add', worktreePath, branch])
       return { ok: true }
-    } catch (adoptionError) {
-      return { ok: false, cause: adoptionError }
+    } catch (cause) {
+      return { ok: false, stage: 'worktree', cause }
     }
   }
+}
+
+// Ordinary Sessions throw the original cause; issue Sessions return a display
+// error. Both intents share the same origin-default checkout protocol.
+export async function checkoutNamedWorktree(
+  request: NamedWorktreeRequest,
+  git: NamedWorktreeGit
+): Promise<void> {
+  const result = await checkout(request, git)
+  if (!result.ok) throw result.cause
+}
+
+export async function tryCheckoutNamedWorktree(
+  request: NamedWorktreeRequest,
+  git: NamedWorktreeGit
+): Promise<NamedWorktreeAttempt> {
+  const result = await checkout(request, git)
+  if (result.ok) return result
+  if (result.stage === 'worktree') {
+    return { ok: false, message: worktreeCreationError(request.branch, result.cause) }
+  }
+
+  const detail = (result.cause as Error).message
+  const message =
+    detail === 'no-origin-remote'
+      ? 'This project has no origin remote.'
+      : detail === 'no-origin-default-branch'
+        ? "Could not determine origin's default branch."
+        : `Failed to resolve origin default: ${detail}`
+  return { ok: false, message }
 }
 
 export function worktreeCreationError(branch: string, cause: unknown): string {
