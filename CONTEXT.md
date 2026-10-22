@@ -65,6 +65,14 @@ Expressed as `SessionAdoptionGate` in `src/main/session-adoption-gate.ts`.
 
 ## Agent integration
 
+**Existing Session terminal startup** — the attach-or-spawn sequence used by
+local and remote Session revival and deferred local attach. The terminal starter
+owns tmux probing, resume eligibility, worktree-safe hook refresh, spawn options,
+and fresh-spawn sandbox state; remote startup keeps the prepared host available
+through the whole sequence. Revival requires successful hook refresh when the worktree
+exists; deferred local attach logs a hook failure and still spawns. The Session
+manager retains eligibility gates, status changes, and persistence notifications.
+
 **Agent hook lifecycle** — the per-tool preparation performed before a fresh
 agent process starts. Claude installs worktree-scoped notify hooks;
 Codex stages its hooks, enables the host-wide feature flag, and restores the
