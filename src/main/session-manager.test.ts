@@ -2264,6 +2264,32 @@ describe('reviveSession — remote resume fallback', () => {
 })
 
 describe('reviveSession — reinstalls hooks on fresh spawn', () => {
+  it.each(['local', 'remote'] as const)(
+    '%s: hook failure aborts revival before spawn',
+    async (placement) => {
+      const session =
+        placement === 'local'
+          ? baseLocalSession({ status: 'dead' })
+          : baseRemoteSession({ status: 'dead' })
+      if (placement === 'local') mkdirSync(session.worktreePath, { recursive: true })
+      writeSessionsJson([session])
+      const sm = await loadSessionManager()
+      sm.restoreSessions()
+      const error = new Error('hook preparation failed')
+      state.hookInstallFailure = error
+
+      await expect(sm.reviveSession(session.id)).rejects.toBe(error)
+
+      expect(state.createPtyCalls).toEqual([])
+      expect(state.createRemotePtyCalls).toEqual([])
+      expect(sm.getSessions()[0].status).toBe('dead')
+      expect(sm.getSessions()[0].connectionState).toBe(
+        placement === 'remote' ? 'offline' : undefined
+      )
+      expect(state.runtimeRefs.size).toBe(0)
+    }
+  )
+
   // Regression: hooks (notify.sh) are only installed into
   // a worktree's settings.local.json at session creation time. A session
   // revived long after creation — possibly before a hook fix even existed —

@@ -7,6 +7,7 @@ import { randomUUID } from 'crypto'
 import { dialog, shell } from 'electron'
 import { canonicalPath } from './agent-state-paths'
 import { canResumeLocal, canResumeRemote } from './agent-resumability'
+import { createExistingSessionTerminalStarter } from './existing-session-terminal'
 import { broadcastToAll, getMainWindow } from './window-registry'
 import {
   CONFIG_DIR,
@@ -109,6 +110,26 @@ import { isRestartable } from '../shared/session-status'
 
 const execFileAsync = promisify(execFile)
 const localAgentHooks = createLocalAgentHookLifecycle()
+const existingSessionTerminals = createExistingSessionTerminalStarter({
+  local: {
+    hasPty,
+    hasTmuxSession,
+    reattachPty,
+    canResume: canResumeLocal,
+    worktreeExists: existsSync,
+    hooks: localAgentHooks,
+    createPty,
+  },
+  remote: {
+    runtime: remoteHostRuntime,
+    hasTmuxSession: hasRemoteTmuxSession,
+    reattachPty: reattachRemotePty,
+    canResume: (session, host) => canResumeRemote(session, host, execRemote),
+    exec: execRemote,
+    hooks: createRemoteAgentHookLifecycle,
+    createPty: createRemotePty,
+  },
+})
 const SESSIONS_PATH = join(CONFIG_DIR, 'sessions.json')
 
 // Read the actual branch checked out in a worktree. Falls back to the
@@ -986,55 +1007,7 @@ export async function reviveSession(id: string): Promise<void> {
     session.connectionState = 'connecting'
     onSessionsChanged()
     try {
-      await remoteHostRuntime.withPreparedHost(
-        host,
-        async ({
-          agentPaths,
-          notifyScriptPath,
-          ompHookScriptPath,
-          remoteSocketPath,
-          sandboxAvailable,
-        }) => {
-          if (await hasRemoteTmuxSession(id, host)) {
-            await reattachRemotePty(id, host)
-          } else {
-            const agentPath = agentPaths[session.tool]
-            if (!agentPath) {
-              throw new Error(
-                `${session.tool} is not installed on host ${host.label || host.alias}`
-              )
-            }
-            const canResume = await canResumeRemote(session, host, execRemote)
-            if (!canResume) {
-              console.warn(
-                `Session ${id} (${session.tool}) has no prior conversation on host ${host.alias}; spawning fresh instead of resuming`
-              )
-            }
-            // Reinstall hooks before spawning so a long-since-created remote
-            // worktree picks up hook fixes. Keep the existence probe outside
-            // the lifecycle: an installer may create directories, which would
-            // otherwise resurrect a deleted worktree as an empty directory.
-            const hooks = createRemoteAgentHookLifecycle({
-              host,
-              notifyScriptPath,
-            })
-            if (await hasRemoteWorktree(host, session.worktreePath)) {
-              await hooks.installBeforeSpawn(session.tool, session.worktreePath)
-            }
-            session.sandboxed = await createRemotePty(id, session.worktreePath, host, {
-              continueSession: canResume,
-              tool: session.tool,
-              skipPermissions: session.skipPermissions,
-              agentSessionId: session.agentSessionId,
-              agentPath,
-              projectPath: session.projectPath,
-              notifyHookPath: ompHookScriptPath,
-              remoteSocketPath,
-              sandboxAvailable,
-            })
-          }
-        }
-      )
+      await existingSessionTerminals.startRemote(session, host)
     } catch (err) {
       session.connectionState = 'offline'
       onSessionsChanged()
@@ -1045,42 +1018,7 @@ export async function reviveSession(id: string): Promise<void> {
     return
   }
 
-  // Clear any lazy-restore `pending` flag BEFORE we (re)create the pty —
-  // otherwise a concurrent renderer mount effect could see pending+live pty
-  // and fire attachLocalSession, whose reattachPty would replace the
-  // just-created node-pty and leak the original exit handler.
-  session.connectionState = undefined
-  if (hasPty(id)) {
-    // A kept session whose tmux survived is still attached; a second attach
-    // would replace the live node-pty and leak its exit handler.
-    updateSession(id, 'idle')
-    return
-  }
-  if (hasTmuxSession(id)) {
-    reattachPty(id)
-  } else {
-    const canResume = canResumeLocal(session)
-    if (!canResume) {
-      console.warn(
-        `Session ${id} (${session.tool}) has no prior conversation; spawning fresh instead of resuming`
-      )
-    }
-    // Reinstall hooks before spawning: the agent process reads its hook
-    // config at process start (see the relocateProject comment above), and a
-    // session revived here may have been created long before its worktree's
-    // hook configuration was last refreshed — any fix that landed since
-    // then would otherwise never reach this worktree until relocation.
-    if (existsSync(session.worktreePath)) {
-      await localAgentHooks.installBeforeSpawn(session.tool, session.worktreePath)
-    }
-    session.sandboxed = createPty(id, session.worktreePath, {
-      continueSession: canResume,
-      tool: session.tool,
-      skipPermissions: session.skipPermissions,
-      agentSessionId: session.agentSessionId,
-      projectPath: session.projectPath,
-    })
-  }
+  await existingSessionTerminals.startLocal(session, 'revive')
   updateSession(id, 'idle')
 }
 
@@ -1101,31 +1039,7 @@ export async function attachLocalSession(id: string): Promise<void> {
   }
 
   try {
-    if (hasTmuxSession(id)) {
-      reattachPty(id)
-    } else {
-      const canResume = canResumeLocal(session)
-      if (!canResume) {
-        console.warn(
-          `Session ${id} (${session.tool}) has no prior conversation; spawning fresh instead of resuming`
-        )
-      }
-      // See reviveSession's local branch: refresh hooks before spawning.
-      // Best effort: pending attach historically spawned regardless of hook
-      // file state, so a stale-hooks spawn is better than no spawn.
-      try {
-        await localAgentHooks.installBeforeSpawn(session.tool, session.worktreePath)
-      } catch (err) {
-        console.error(`Session ${id}: failed to reinstall hooks before attach`, err)
-      }
-      session.sandboxed = createPty(id, session.worktreePath, {
-        continueSession: canResume,
-        tool: session.tool,
-        skipPermissions: session.skipPermissions,
-        agentSessionId: session.agentSessionId,
-        projectPath: session.projectPath,
-      })
-    }
+    await existingSessionTerminals.startLocal(session, 'pending-attach')
     session.connectionState = undefined
     onSessionsChanged()
   } catch (err) {
@@ -1756,33 +1670,6 @@ export async function relocateProject(
   onSessionsChanged()
 
   return { migratedCount: plan.length }
-}
-
-// Guards reviveSession's remote fresh-spawn branch against a deleted remote
-// worktree, mirroring the local branch's plain existsSync check — deliberately
-// a bare directory-existence test rather than the stricter `git rev-parse
-// --is-inside-work-tree` used by createRemoteSessionForWorktree, so a worktree
-// with a valid directory but transiently broken git metadata still spawns
-// exactly as it did before this reinstall-hooks change.
-//
-// `execRemote` never rejects — SSH-level failures resolve as a nonzero `code`
-// (255 for a connection failure, 127 if the local `ssh` binary is missing),
-// same as a genuinely failed `test -d`. Only a clean `code === 1` means the
-// worktree doesn't exist; a timeout or any other code is a transport/exec
-// failure, not proof of absence, and must throw so it reaches reviveSession's
-// outer try/catch (which marks the session offline) instead of being treated
-// the same as a missing worktree — which would silently skip the hook
-// reinstall while still letting the spawn below proceed once the connection
-// recovers, defeating the point of this reinstall-on-revive change.
-async function hasRemoteWorktree(host: Host, worktreePath: string): Promise<boolean> {
-  const result = await execRemote(host, ['test', '-d', worktreePath], { timeoutMs: 10000 })
-  if (result.timedOut) {
-    throw new Error(`Timed out checking whether ${worktreePath} exists on host ${host.alias}`)
-  }
-  if (result.code === 0) return true
-  if (result.code === 1) return false
-  const detail = result.stderr.trim() || result.stdout.trim() || `exit ${result.code}`
-  throw new Error(`Failed to check whether ${worktreePath} exists on host ${host.alias}: ${detail}`)
 }
 
 // Backfill / reconcile fields added in later versions. The reconciliation rules
