@@ -57,7 +57,11 @@ import { deriveRestoredState } from './restore-planner'
 import { createSessionStore } from './session-store'
 import { createRemoteReconnectCoordinator } from './remote-reconnect'
 import { planIssueWorktree } from './worktree-plan'
-import { createOrAdoptWorktree, worktreeCreationError } from './worktree-adoption'
+import {
+  checkoutNamedWorktree,
+  tryCheckoutNamedWorktree,
+  type NamedWorktreeGit,
+} from './worktree-adoption'
 import { createSessionAdoptionGate } from './session-adoption-gate'
 import { planRelocation } from './relocation-plan'
 import {
@@ -71,7 +75,7 @@ import { exec as execRemote, runtimeStateFor, type HostConnectionState } from '.
 import { remoteHostRuntime } from './remote-host-runtime'
 import { createPrLookup, parseOwnerFromRemoteUrl } from './github'
 import { parseIssueNumber, worktreeBranchName } from './branch-naming'
-import { resolveOriginDefaultBase, type GitRunner } from './origin-base'
+import type { GitRunner } from './origin-base'
 import { branchRefExists } from './branch-ref'
 import { deriveSessionFields } from './session-fields'
 import { buildSession } from './session-record'
@@ -191,18 +195,30 @@ async function branchExists(projectPath: string, branchName: string): Promise<bo
   )
 }
 
-async function remoteBranchExists(
-  host: Host,
-  projectPath: string,
-  branchName: string
-): Promise<boolean> {
-  return branchRefExists(
-    (argv) =>
-      expectRemoteOk(host, ['git', '-C', projectPath, ...argv], 'git failed').then((stdout) => ({
-        stdout,
-      })),
-    branchName
-  )
+function localNamedWorktreeGit(projectPath: string): NamedWorktreeGit {
+  return {
+    runGit: async (argv) => {
+      const { stdout } = await execFileAsync('git', ['-C', projectPath, ...argv], {
+        timeout: 30000,
+      })
+      return { stdout: String(stdout) }
+    },
+    runWorktreeGit: async (argv) => {
+      const { stdout } = await execFileAsync('git', ['-C', projectPath, ...argv])
+      return { stdout: String(stdout) }
+    },
+    branchExists: (branch) => branchExists(projectPath, branch),
+  }
+}
+
+function remoteNamedWorktreeGit(host: Host, projectPath: string): NamedWorktreeGit {
+  const run = async (argv: string[], message: string) => ({
+    stdout: await expectRemoteOk(host, ['git', '-C', projectPath, ...argv], message),
+  })
+  return {
+    runGit: (argv) => run(argv, 'git failed'),
+    runWorktreeGit: (argv) => run(argv, 'Failed to create remote worktree'),
+  }
 }
 
 // Resolve a branch to its open PR number via `gh`, with origin-owner
@@ -633,42 +649,10 @@ async function createRemoteSession(
       }
 
       if (baseRef === 'origin-default') {
-        const originRef = await resolveOriginDefaultBase((argv) =>
-          expectRemoteOk(host, ['git', '-C', projectPath, ...argv], 'git failed').then(
-            (stdout) => ({
-              stdout,
-            })
-          )
+        await checkoutNamedWorktree(
+          { worktreePath, branch: branchName },
+          remoteNamedWorktreeGit(host, projectPath)
         )
-        const adoption = await createOrAdoptWorktree({
-          addNewBranch: async () => {
-            await expectRemoteOk(
-              host,
-              [
-                'git',
-                '-C',
-                projectPath,
-                'worktree',
-                'add',
-                worktreePath,
-                '--no-track',
-                '-b',
-                branchName,
-                originRef,
-              ],
-              'Failed to create remote worktree'
-            )
-          },
-          branchExists: () => remoteBranchExists(host, projectPath, branchName),
-          adoptExistingBranch: async () => {
-            await expectRemoteOk(
-              host,
-              ['git', '-C', projectPath, 'worktree', 'add', worktreePath, branchName],
-              'Failed to create remote worktree'
-            )
-          },
-        })
-        if (!adoption.ok) throw adoption.cause
       } else {
         const addWithBranch = await execRemote(host, [
           'git',
@@ -853,32 +837,10 @@ export async function createSession(
   const baseRef = effectiveWorktreeBase(options)
 
   if (baseRef === 'origin-default') {
-    const originRef = await resolveOriginDefaultBase(async (argv) => {
-      const { stdout } = await execFileAsync('git', ['-C', projectPath, ...argv], {
-        timeout: 30000,
-      })
-      return { stdout: String(stdout) }
-    })
-    const adoption = await createOrAdoptWorktree({
-      addNewBranch: async () => {
-        await execFileAsync('git', [
-          '-C',
-          projectPath,
-          'worktree',
-          'add',
-          worktreePath,
-          '--no-track',
-          '-b',
-          branchName,
-          originRef,
-        ])
-      },
-      branchExists: () => branchExists(projectPath, branchName),
-      adoptExistingBranch: async () => {
-        await execFileAsync('git', ['-C', projectPath, 'worktree', 'add', worktreePath, branchName])
-      },
-    })
-    if (!adoption.ok) throw adoption.cause
+    await checkoutNamedWorktree(
+      { worktreePath, branch: branchName },
+      localNamedWorktreeGit(projectPath)
+    )
   } else {
     try {
       await execFileAsync('git', [
@@ -1600,38 +1562,17 @@ export async function createIssueSession(
   const existing = findSessionOnWorktree(allSessions(), null, worktreePath)
   if (existing) return existing
 
-  const runGit =
-    deps.runGit ??
-    (async (argv: string[]) => {
-      const { stdout } = await execFileAsync('git', ['-C', projectPath, ...argv], {
-        timeout: 30000,
-      })
-      return { stdout: String(stdout) }
-    })
-  const hasBranch =
-    deps.branchExists ?? ((root: string, branchName: string) => branchExists(root, branchName))
+  const git = localNamedWorktreeGit(projectPath)
+  const hasBranch = deps.branchExists
   const adopt = deps.createSessionForWorktree ?? createSessionForWorktree
-
-  let originRef: string
-  try {
-    originRef = await resolveOriginDefaultBase(runGit)
-  } catch (err) {
-    const msg = (err as Error).message
-    if (msg === 'no-origin-remote') return 'This project has no origin remote.'
-    if (msg === 'no-origin-default-branch') return "Could not determine origin's default branch."
-    return `Failed to resolve origin default: ${msg}`
-  }
-
-  const adoption = await createOrAdoptWorktree({
-    addNewBranch: async () => {
-      await runGit(['worktree', 'add', worktreePath, '--no-track', '-b', branch, originRef])
-    },
-    branchExists: () => hasBranch(projectPath, branch),
-    adoptExistingBranch: async () => {
-      await runGit(['worktree', 'add', worktreePath, branch])
-    },
-  })
-  if (!adoption.ok) return worktreeCreationError(branch, adoption.cause)
+  const checkout = await tryCheckoutNamedWorktree(
+    { worktreePath, branch },
+    {
+      runGit: deps.runGit ?? git.runGit,
+      branchExists: hasBranch ? (name) => hasBranch(projectPath, name) : git.branchExists,
+    }
+  )
+  if (!checkout.ok) return checkout.message
 
   const session = await adopt(
     projectPath,
@@ -1669,49 +1610,11 @@ async function createRemoteIssueSession(
     }
 
     const id = randomUUID().slice(0, 8)
-    let originRef: string
-    try {
-      originRef = await resolveOriginDefaultBase((argv) =>
-        expectRemoteOk(host, ['git', '-C', projectPath, ...argv], 'git failed').then((stdout) => ({
-          stdout,
-        }))
-      )
-    } catch (err) {
-      const msg = (err as Error).message
-      if (msg === 'no-origin-remote') return 'This project has no origin remote.'
-      if (msg === 'no-origin-default-branch') return "Could not determine origin's default branch."
-      return `Failed to resolve origin default: ${msg}`
-    }
-
-    const adoption = await createOrAdoptWorktree({
-      addNewBranch: async () => {
-        await expectRemoteOk(
-          host,
-          [
-            'git',
-            '-C',
-            projectPath,
-            'worktree',
-            'add',
-            worktreePath,
-            '--no-track',
-            '-b',
-            branch,
-            originRef,
-          ],
-          'Failed to create remote worktree'
-        )
-      },
-      branchExists: () => remoteBranchExists(host, projectPath, branch),
-      adoptExistingBranch: async () => {
-        await expectRemoteOk(
-          host,
-          ['git', '-C', projectPath, 'worktree', 'add', worktreePath, branch],
-          'Failed to create remote worktree'
-        )
-      },
-    })
-    if (!adoption.ok) return worktreeCreationError(branch, adoption.cause)
+    const checkout = await tryCheckoutNamedWorktree(
+      { worktreePath, branch },
+      remoteNamedWorktreeGit(host, projectPath)
+    )
+    if (!checkout.ok) return checkout.message
 
     const { branch: resolvedBranch, sandboxed } = await spawnRemoteAgent({
       id,
