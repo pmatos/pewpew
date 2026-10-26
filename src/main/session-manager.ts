@@ -49,7 +49,6 @@ import {
   listOpenPrs,
   listOpenIssues,
   probeRemoteGh,
-  type NumberedGhItem,
   type ListNumberedItems,
 } from './github-items'
 import { applyHookEvent, type SideEffectIntent } from './session-state-machine'
@@ -1398,6 +1397,20 @@ async function createSessionsForNumbers(
   return summarizeCreations(results, preexistingIds, toSkip)
 }
 
+async function listItemNumbers(
+  listItems: ListNumberedItems,
+  projectPath: string,
+  hostId: string | null,
+  options: CreateSessionOptions
+): Promise<number[] | string> {
+  try {
+    const items = await listItems(projectPath, hostId, options.repo ?? null)
+    return typeof items === 'string' ? items : items.map((i) => i.number)
+  } catch (err) {
+    return describeGhError(err)
+  }
+}
+
 async function openSessionsForNumberedItems(
   projectPath: string,
   hostId: string | null,
@@ -1406,22 +1419,10 @@ async function openSessionsForNumberedItems(
   createSession: CreateNumberedSession,
   options: CreateSessionOptions = {}
 ): Promise<OpenSessionsSummary | string> {
-  let items: NumberedGhItem[] | string
-  try {
-    items = await listItems(projectPath, hostId, options.repo ?? null)
-  } catch (err) {
-    return describeGhError(err)
-  }
-  if (typeof items === 'string') return items
+  const numbers = await listItemNumbers(listItems, projectPath, hostId, options)
+  if (typeof numbers === 'string') return numbers
 
-  return createSessionsForNumbers(
-    projectPath,
-    hostId,
-    field,
-    items.map((i) => i.number),
-    createSession,
-    options
-  )
+  return createSessionsForNumbers(projectPath, hostId, field, numbers, createSession, options)
 }
 
 export async function createPrSession(
@@ -1523,14 +1524,9 @@ async function filterToOpenNumbers(
   listItems: ListNumberedItems
 ): Promise<number[] | string> {
   if (numbers.length <= 1) return numbers
-  let open: NumberedGhItem[] | string
-  try {
-    open = await listItems(projectPath, hostId, options.repo ?? null)
-  } catch (err) {
-    return describeGhError(err)
-  }
+  const open = await listItemNumbers(listItems, projectPath, hostId, options)
   if (typeof open === 'string') return open
-  const openNumbers = new Set(open.map((i) => i.number))
+  const openNumbers = new Set(open)
   const filtered = numbers.filter((n) => openNumbers.has(n))
   return filtered.length === 0 ? `None of the requested ${nounPlural} are open.` : filtered
 }
