@@ -50,7 +50,6 @@ import {
   listOpenPrs,
   listOpenIssues,
   probeRemoteGh,
-  type NumberedGhItem,
   type ListNumberedItems,
 } from './github-items'
 import { applyHookEvent, type SideEffectIntent } from './session-state-machine'
@@ -1312,6 +1311,20 @@ async function createSessionsForNumbers(
   return summarizeCreations(results, preexistingIds, toSkip)
 }
 
+async function listItemNumbers(
+  listItems: ListNumberedItems,
+  projectPath: string,
+  hostId: string | null,
+  options: CreateSessionOptions
+): Promise<number[] | string> {
+  try {
+    const items = await listItems(projectPath, hostId, options.repo ?? null)
+    return typeof items === 'string' ? items : items.map((i) => i.number)
+  } catch (err) {
+    return describeGhError(err)
+  }
+}
+
 async function openSessionsForNumberedItems(
   projectPath: string,
   hostId: string | null,
@@ -1320,22 +1333,10 @@ async function openSessionsForNumberedItems(
   createSession: CreateNumberedSession,
   options: CreateSessionOptions = {}
 ): Promise<OpenSessionsSummary | string> {
-  let items: NumberedGhItem[] | string
-  try {
-    items = await listItems(projectPath, hostId, options.repo ?? null)
-  } catch (err) {
-    return describeGhError(err)
-  }
-  if (typeof items === 'string') return items
+  const numbers = await listItemNumbers(listItems, projectPath, hostId, options)
+  if (typeof numbers === 'string') return numbers
 
-  return createSessionsForNumbers(
-    projectPath,
-    hostId,
-    field,
-    items.map((i) => i.number),
-    createSession,
-    options
-  )
+  return createSessionsForNumbers(projectPath, hostId, field, numbers, createSession, options)
 }
 
 export async function createPrSession(
@@ -1426,18 +1427,45 @@ function uniqueSorted(numbers: number[]): number[] {
   return Array.from(new Set(numbers)).sort((a, b) => a - b)
 }
 
+// A multi-number request (range or list) is narrowed to the items that are
+// still open; a single explicit number is honoured as typed.
+async function filterToOpenNumbers(
+  numbers: number[],
+  nounPlural: 'PRs' | 'issues',
+  projectPath: string,
+  hostId: string | null,
+  options: CreateSessionOptions,
+  listItems: ListNumberedItems
+): Promise<number[] | string> {
+  if (numbers.length <= 1) return numbers
+  const open = await listItemNumbers(listItems, projectPath, hostId, options)
+  if (typeof open === 'string') return open
+  const openNumbers = new Set(open)
+  const filtered = numbers.filter((n) => openNumbers.has(n))
+  return filtered.length === 0 ? `None of the requested ${nounPlural} are open.` : filtered
+}
+
 export async function createPrSessions(
   projectPath: string,
   prNumbers: number[],
   hostId: string | null = null,
   options: CreateSessionOptions = {},
-  deps: { createPrSession?: CreateNumberedSession } = {}
+  deps: { createPrSession?: CreateNumberedSession; listPrs?: ListNumberedItems } = {}
 ): Promise<OpenSessionsSummary | string> {
+  const numbers = await filterToOpenNumbers(
+    uniqueSorted(prNumbers),
+    'PRs',
+    projectPath,
+    hostId,
+    options,
+    deps.listPrs ?? listOpenPrs
+  )
+  if (typeof numbers === 'string') return numbers
   return createSessionsForNumbers(
     projectPath,
     hostId,
     'prNumber',
-    uniqueSorted(prNumbers),
+    numbers,
     deps.createPrSession ?? createPrSession,
     options
   )
@@ -1448,13 +1476,22 @@ export async function createIssueSessions(
   issueNumbers: number[],
   hostId: string | null = null,
   options: CreateSessionOptions = {},
-  deps: { createIssueSession?: CreateNumberedSession } = {}
+  deps: { createIssueSession?: CreateNumberedSession; listIssues?: ListNumberedItems } = {}
 ): Promise<OpenSessionsSummary | string> {
+  const numbers = await filterToOpenNumbers(
+    uniqueSorted(issueNumbers),
+    'issues',
+    projectPath,
+    hostId,
+    options,
+    deps.listIssues ?? ((p, h, r) => listOpenIssues(p, h, undefined, r))
+  )
+  if (typeof numbers === 'string') return numbers
   return createSessionsForNumbers(
     projectPath,
     hostId,
     'issueNumber',
-    uniqueSorted(issueNumbers),
+    numbers,
     deps.createIssueSession ?? createIssueSession,
     options
   )

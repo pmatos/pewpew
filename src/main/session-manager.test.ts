@@ -3711,7 +3711,7 @@ describe('createIssueSessions', () => {
       [3, 2, 3, 4],
       null,
       { tool: 'codex' },
-      { createIssueSession }
+      { createIssueSession, listIssues: async () => [{ number: 2 }, { number: 3 }, { number: 4 }] }
     )
     if (typeof result === 'string') throw new Error(result)
 
@@ -3729,14 +3729,115 @@ describe('createIssueSessions', () => {
         (issueNumber === 5 ? 'boom' : baseLocalSession({ id: `s-${issueNumber}`, issueNumber })) as
           Session | string
     )
-    const result = await sm.createIssueSessions('/proj', [4, 5], null, {}, { createIssueSession })
+    const listIssues = async () => [{ number: 4 }, { number: 5 }]
+    const result = await sm.createIssueSessions(
+      '/proj',
+      [4, 5],
+      null,
+      {},
+      { createIssueSession, listIssues }
+    )
     if (typeof result === 'string') throw new Error(result)
     expect(result.created.map((s) => s.issueNumber)).toEqual([4])
     expect(result.failed).toEqual([{ number: 5, error: 'boom' }])
   })
+
+  it('only opens sessions for open issues in a multi-number request', async () => {
+    const sm = await loadSessionManager()
+    const createIssueSession = vi.fn(
+      async (_projectPath: string, issueNumber: number) =>
+        baseLocalSession({ id: `s-${issueNumber}`, issueNumber }) as Session | string
+    )
+    const listIssues = vi.fn(async () => [{ number: 11 }, { number: 13 }, { number: 99 }])
+    const result = await sm.createIssueSessions(
+      '/proj',
+      [10, 11, 12, 13],
+      null,
+      { repo: 'up/stream' },
+      { createIssueSession, listIssues }
+    )
+    if (typeof result === 'string') throw new Error(result)
+    expect(listIssues).toHaveBeenCalledWith('/proj', null, 'up/stream')
+    expect(result.created.map((s) => s.issueNumber).sort()).toEqual([11, 13])
+    expect(createIssueSession).toHaveBeenCalledTimes(2)
+  })
+
+  it('returns a message when no requested issue is open', async () => {
+    const sm = await loadSessionManager()
+    const createIssueSession = vi.fn()
+    const result = await sm.createIssueSessions(
+      '/proj',
+      [1, 2],
+      null,
+      {},
+      { createIssueSession, listIssues: async () => [{ number: 50 }] }
+    )
+    expect(result).toBe('None of the requested issues are open.')
+    expect(createIssueSession).not.toHaveBeenCalled()
+  })
+
+  it('surfaces a listing failure instead of opening everything', async () => {
+    const sm = await loadSessionManager()
+    const createIssueSession = vi.fn()
+    const result = await sm.createIssueSessions(
+      '/proj',
+      [1, 2],
+      null,
+      {},
+      { createIssueSession, listIssues: async () => 'gh down' }
+    )
+    expect(result).toBe('gh down')
+    expect(createIssueSession).not.toHaveBeenCalled()
+  })
 })
 
 describe('createPrSessions', () => {
+  const openAll = async () => Array.from({ length: 20 }, (_, i) => ({ number: i + 1 }))
+
+  it('only opens sessions for open PRs in a multi-number request', async () => {
+    const sm = await loadSessionManager()
+    const createPrSession = vi.fn(
+      async (_projectPath: string, prNumber: number) =>
+        baseLocalSession({ id: `s-${prNumber}`, prNumber }) as Session | string
+    )
+    const listPrs = vi.fn(async () => [{ number: 11 }, { number: 13 }])
+    const result = await sm.createPrSessions(
+      '/proj',
+      [10, 11, 12, 13],
+      null,
+      { repo: 'up/stream' },
+      { createPrSession, listPrs }
+    )
+    if (typeof result === 'string') throw new Error(result)
+    expect(listPrs).toHaveBeenCalledWith('/proj', null, 'up/stream')
+    expect(result.created.map((s) => s.prNumber).sort()).toEqual([11, 13])
+    expect(createPrSession).toHaveBeenCalledTimes(2)
+  })
+
+  it('returns a message when no requested PR is open or listing fails', async () => {
+    const sm = await loadSessionManager()
+    const createPrSession = vi.fn()
+    expect(
+      await sm.createPrSessions(
+        '/proj',
+        [1, 2],
+        null,
+        {},
+        { createPrSession, listPrs: async () => [] }
+      )
+    ).toBe('None of the requested PRs are open.')
+    expect(
+      await sm.createPrSessions(
+        '/proj',
+        [1, 2],
+        null,
+        {},
+        { createPrSession, listPrs: async () => 'gh down' }
+      )
+    ).toBe('gh down')
+    expect(createPrSession).not.toHaveBeenCalled()
+  })
+
   it('skips numbers that already have a session and creates the rest', async () => {
     const sm = await loadSessionManager()
     writeSessionsJson([baseLocalSession({ id: 's-existing', prNumber: 7, projectPath: '/proj' })])
@@ -3747,7 +3848,13 @@ describe('createPrSessions', () => {
         baseLocalSession({ id: `s-${prNumber}`, prNumber }) as Session | string
     )
 
-    const result = await sm.createPrSessions('/proj', [7, 8, 9], null, {}, { createPrSession })
+    const result = await sm.createPrSessions(
+      '/proj',
+      [7, 8, 9],
+      null,
+      {},
+      { createPrSession, listPrs: openAll }
+    )
     expect(typeof result).not.toBe('string')
     if (typeof result === 'string') throw new Error(result)
 
@@ -3765,7 +3872,13 @@ describe('createPrSessions', () => {
       async (_projectPath: string, prNumber: number) =>
         baseLocalSession({ id: `s-${prNumber}`, prNumber }) as Session | string
     )
-    await sm.createPrSessions('/proj', [8, 9], null, { repo: 'up/stream' }, { createPrSession })
+    await sm.createPrSessions(
+      '/proj',
+      [8, 9],
+      null,
+      { repo: 'up/stream' },
+      { createPrSession, listPrs: openAll }
+    )
     expect(createPrSession).toHaveBeenCalledWith('/proj', 8, null, { repo: 'up/stream' })
     expect(createPrSession).toHaveBeenCalledWith('/proj', 9, null, { repo: 'up/stream' })
   })
@@ -3778,7 +3891,13 @@ describe('createPrSessions', () => {
           ? `PR #${prNumber} not found.`
           : (baseLocalSession({ id: `s-${prNumber}`, prNumber }) as Session)
     )
-    const result = await sm.createPrSessions('/proj', [4, 5, 6], null, {}, { createPrSession })
+    const result = await sm.createPrSessions(
+      '/proj',
+      [4, 5, 6],
+      null,
+      {},
+      { createPrSession, listPrs: openAll }
+    )
     if (typeof result === 'string') throw new Error(result)
     expect(result.created.map((s) => s.prNumber).sort()).toEqual([4, 6])
     expect(result.failed).toEqual([{ number: 5, error: 'PR #5 not found.' }])
@@ -3791,7 +3910,13 @@ describe('createPrSessions', () => {
       async (_projectPath: string, prNumber: number, _hostId: string | null) =>
         baseLocalSession({ id: `s-${prNumber}`, prNumber }) as Session | string
     )
-    const result = await sm.createPrSessions('/proj', [3, 3, 3], null, {}, { createPrSession })
+    const result = await sm.createPrSessions(
+      '/proj',
+      [3, 3, 3],
+      null,
+      {},
+      { createPrSession, listPrs: openAll }
+    )
     if (typeof result === 'string') throw new Error(result)
     expect(createPrSession).toHaveBeenCalledTimes(1)
     expect(createPrSession).toHaveBeenCalledWith('/proj', 3, null, {})
@@ -3809,7 +3934,13 @@ describe('createPrSessions', () => {
       async (_projectPath: string, prNumber: number, _hostId: string | null) =>
         baseLocalSession({ id: `s-${prNumber}`, prNumber }) as Session | string
     )
-    const result = await sm.createPrSessions('/proj', [5], null, {}, { createPrSession })
+    const result = await sm.createPrSessions(
+      '/proj',
+      [5],
+      null,
+      {},
+      { createPrSession, listPrs: openAll }
+    )
     if (typeof result === 'string') throw new Error(result)
     expect(result.skipped).toEqual([])
     expect(result.created.map((s) => s.prNumber)).toEqual([5])
@@ -3819,7 +3950,13 @@ describe('createPrSessions', () => {
   it('returns an empty summary for an empty number list', async () => {
     const sm = await loadSessionManager()
     const createPrSession = vi.fn()
-    const result = await sm.createPrSessions('/proj', [], null, {}, { createPrSession })
+    const result = await sm.createPrSessions(
+      '/proj',
+      [],
+      null,
+      {},
+      { createPrSession, listPrs: openAll }
+    )
     if (typeof result === 'string') throw new Error(result)
     expect(result).toEqual({ created: [], reused: [], skipped: [], failed: [] })
     expect(createPrSession).not.toHaveBeenCalled()
@@ -3843,7 +3980,13 @@ describe('createPrSessions', () => {
         ({ ...existing, prNumber }) as Session | string
     )
 
-    const result = await sm.createPrSessions('/proj', [545], null, {}, { createPrSession })
+    const result = await sm.createPrSessions(
+      '/proj',
+      [545],
+      null,
+      {},
+      { createPrSession, listPrs: openAll }
+    )
     if (typeof result === 'string') throw new Error(result)
 
     expect(result.created).toEqual([])
@@ -3858,7 +4001,13 @@ describe('createPrSessions', () => {
       async (_projectPath: string, prNumber: number, _hostId: string | null) =>
         baseLocalSession({ id: `s-${prNumber}`, prNumber }) as Session | string
     )
-    await sm.createPrSessions('/proj', [11], null, { tool: 'codex' }, { createPrSession })
+    await sm.createPrSessions(
+      '/proj',
+      [11],
+      null,
+      { tool: 'codex' },
+      { createPrSession, listPrs: openAll }
+    )
     expect(createPrSession).toHaveBeenCalledWith('/proj', 11, null, { tool: 'codex' })
   })
 
@@ -3882,9 +4031,9 @@ describe('createPrSessions', () => {
       [8, 9],
       'h1',
       { tool: 'codex' },
-      { createPrSession }
+      { createPrSession, listPrs: openAll }
     )
-    await Promise.resolve()
+    await new Promise((resolve) => setImmediate(resolve))
     expect(started).toEqual([8])
 
     releaseFirst()
