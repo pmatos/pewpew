@@ -1,7 +1,7 @@
 import { branchRefExists } from './branch-ref'
 import { forkPullRefUnavailableMessage, type PrWorktreePlan } from './pr-worktree-planner'
 import { worktreeCreationError } from './worktree-adoption'
-import type { GitRunner } from './origin-base'
+import { serializeFetch, type GitRunner } from './origin-base'
 
 export type PrWorktreeCheckoutResult = { ok: true } | { ok: false; message: string }
 
@@ -18,11 +18,12 @@ function fetchFailureDetail(err: unknown): string {
 export async function checkoutPrWorktree(
   plan: PrWorktreePlan,
   worktreePath: string,
-  runGit: GitRunner
+  runGit: GitRunner,
+  fetchKey?: string
 ): Promise<PrWorktreeCheckoutResult> {
   let fetchError: string | undefined
   try {
-    await runGit(['fetch', plan.fetchRemote, plan.fetchRefspec])
+    await serializeFetch(fetchKey, () => runGit(['fetch', plan.fetchRemote, plan.fetchRefspec]))
   } catch (err) {
     fetchError = fetchFailureDetail(err)
   }

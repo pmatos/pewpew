@@ -1,5 +1,10 @@
 import { describe, expect, it } from 'vitest'
-import { parseOriginHeadSymref, remoteTrackingRef, resolveOriginDefaultBase } from './origin-base'
+import {
+  parseOriginHeadSymref,
+  remoteTrackingRef,
+  resolveOriginDefaultBase,
+  serializeFetch,
+} from './origin-base'
 
 // A GitRunner whose behaviour is fully scripted by argv. Any command not in the
 // script throws, which surfaces unexpected calls as test failures.
@@ -186,5 +191,98 @@ describe('resolveOriginDefaultBase', () => {
         })
       )
     ).resolves.toBe('refs/remotes/origin/master')
+  })
+})
+
+describe('resolveOriginDefaultBase fetch coalescing', () => {
+  function countingRunner(counter: { fetches: number }) {
+    return async (argv: string[]) => {
+      const key = argv.join(' ')
+      if (key === 'fetch origin --quiet') {
+        counter.fetches++
+        await new Promise((resolve) => setTimeout(resolve, 10))
+        return { stdout: '' }
+      }
+      if (key === 'remote get-url origin') return { stdout: 'git@example.com:o/r.git\n' }
+      if (key === 'ls-remote --symref origin HEAD') {
+        return { stdout: 'ref: refs/heads/main\tHEAD\n' }
+      }
+      if (key === 'rev-parse --verify refs/remotes/origin/main') return { stdout: 'abc\n' }
+      throw new Error(`unexpected git ${key}`)
+    }
+  }
+
+  it('shares one fetch between concurrent callers with the same key', async () => {
+    const counter = { fetches: 0 }
+    const results = await Promise.all(
+      [1, 2, 3].map(() => resolveOriginDefaultBase(countingRunner(counter), 'repo-a'))
+    )
+    expect(results).toEqual(Array(3).fill('refs/remotes/origin/main'))
+    expect(counter.fetches).toBe(1)
+  })
+
+  it('fetches separately for different keys and for sequential calls', async () => {
+    const counter = { fetches: 0 }
+    await Promise.all([
+      resolveOriginDefaultBase(countingRunner(counter), 'repo-a'),
+      resolveOriginDefaultBase(countingRunner(counter), 'repo-b'),
+    ])
+    await resolveOriginDefaultBase(countingRunner(counter), 'repo-a')
+    expect(counter.fetches).toBe(3)
+  })
+
+  it('propagates a shared fetch failure to every caller and clears the in-flight entry', async () => {
+    const failing = async (argv: string[]) => {
+      if (argv[0] === 'remote') return { stdout: 'url\n' }
+      throw new Error('cannot lock ref')
+    }
+    const settled = await Promise.allSettled([
+      resolveOriginDefaultBase(failing, 'repo-c'),
+      resolveOriginDefaultBase(failing, 'repo-c'),
+    ])
+    for (const r of settled) {
+      expect(r.status).toBe('rejected')
+    }
+    const counter = { fetches: 0 }
+    await resolveOriginDefaultBase(countingRunner(counter), 'repo-c')
+    expect(counter.fetches).toBe(1)
+  })
+})
+
+describe('serializeFetch', () => {
+  it('runs tasks with the same key one at a time, in order, even after a failure', async () => {
+    const order: string[] = []
+    const task =
+      (name: string, fail = false) =>
+      async () => {
+        order.push(`start ${name}`)
+        await new Promise((resolve) => setTimeout(resolve, 5))
+        order.push(`end ${name}`)
+        if (fail) throw new Error(name)
+      }
+
+    const results = await Promise.allSettled([
+      serializeFetch('k', task('a', true)),
+      serializeFetch('k', task('b')),
+    ])
+    expect(results.map((r) => r.status)).toEqual(['rejected', 'fulfilled'])
+    expect(order).toEqual(['start a', 'end a', 'start b', 'end b'])
+  })
+
+  it('does not serialize different keys or unkeyed tasks', async () => {
+    let active = 0
+    let maxActive = 0
+    const task = async () => {
+      active++
+      maxActive = Math.max(maxActive, active)
+      await new Promise((resolve) => setTimeout(resolve, 5))
+      active--
+    }
+    await Promise.all([
+      serializeFetch('x', task),
+      serializeFetch('y', task),
+      serializeFetch(undefined, task),
+    ])
+    expect(maxActive).toBe(3)
   })
 })

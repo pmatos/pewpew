@@ -215,8 +215,13 @@ async function branchExists(projectPath: string, branchName: string): Promise<bo
   )
 }
 
+function fetchKeyFor(hostId: string | null, projectPath: string): string {
+  return `${hostId ?? 'local'}:${projectPath}`
+}
+
 function localNamedWorktreeGit(projectPath: string): NamedWorktreeGit {
   return {
+    fetchKey: fetchKeyFor(null, projectPath),
     runGit: async (argv) => {
       const { stdout } = await execFileAsync('git', ['-C', projectPath, ...argv], {
         timeout: 30000,
@@ -236,6 +241,7 @@ function remoteNamedWorktreeGit(host: Host, projectPath: string): NamedWorktreeG
     stdout: await expectRemoteOk(host, ['git', '-C', projectPath, ...argv], message),
   })
   return {
+    fetchKey: fetchKeyFor(host.hostId, projectPath),
     runGit: (argv) => run(argv, 'git failed'),
     runWorktreeGit: (argv) => run(argv, 'Failed to create remote worktree'),
   }
@@ -795,15 +801,20 @@ async function createRemotePrSession(
 
     const id = randomUUID().slice(0, 8)
 
-    const checkout = await checkoutPrWorktree(planResult.plan, worktreePath, async (argv) => {
-      const result = await execRemote(host, ['git', '-C', projectPath, ...argv])
-      if (result.timedOut || result.code !== 0) {
-        const detail = result.stderr.trim() || result.stdout.trim() || `exit ${result.code}`
-        const prefix = argv[0] === 'worktree' ? 'Failed to create remote worktree: ' : ''
-        throw new Error(`${prefix}${detail}`)
-      }
-      return { stdout: result.stdout }
-    })
+    const checkout = await checkoutPrWorktree(
+      planResult.plan,
+      worktreePath,
+      async (argv) => {
+        const result = await execRemote(host, ['git', '-C', projectPath, ...argv])
+        if (result.timedOut || result.code !== 0) {
+          const detail = result.stderr.trim() || result.stdout.trim() || `exit ${result.code}`
+          const prefix = argv[0] === 'worktree' ? 'Failed to create remote worktree: ' : ''
+          throw new Error(`${prefix}${detail}`)
+        }
+        return { stdout: result.stdout }
+      },
+      fetchKeyFor(host.hostId, projectPath)
+    )
     if (!checkout.ok) return checkout.message
 
     const { branch: resolvedBranch, sandboxed } = await spawnRemoteAgent({
@@ -1400,7 +1411,12 @@ export async function createPrSession(
 
   const worktreePath = join(projectPath, '.claude', 'worktrees', worktreeName)
 
-  const checkout = await checkoutPrWorktree(planResult.plan, worktreePath, runGit)
+  const checkout = await checkoutPrWorktree(
+    planResult.plan,
+    worktreePath,
+    runGit,
+    fetchKeyFor(hostId, projectPath)
+  )
   if (!checkout.ok) return checkout.message
 
   const session = await adopt(

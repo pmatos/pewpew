@@ -9,6 +9,8 @@ interface NamedWorktreeRequest {
 export interface NamedWorktreeGit {
   runGit: GitRunner
   runWorktreeGit?: GitRunner
+  // Identifies the repository so concurrent checkouts share one origin fetch.
+  fetchKey?: string
   branchExists?: (branch: string) => Promise<boolean>
 }
 
@@ -22,7 +24,7 @@ async function checkout(
 ): Promise<CheckoutResult> {
   let originRef: string
   try {
-    originRef = await resolveOriginDefaultBase(git.runGit)
+    originRef = await resolveOriginDefaultBase(git.runGit, git.fetchKey)
   } catch (cause) {
     return { ok: false, stage: 'origin', cause }
   }
