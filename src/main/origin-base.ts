@@ -26,23 +26,61 @@ export function parseOriginHeadSymref(stdout: string): string | undefined {
   return undefined
 }
 
+const fetchQueues = new Map<string, Promise<void>>()
+const inFlightFetches = new Map<string, Promise<void>>()
+
+// Concurrent fetches in one repo (opening many issue or PR sessions at once)
+// race on the same refs and git fails with "cannot lock ref". Fetches that
+// share a key run one at a time; an unkeyed fetch runs immediately.
+export function serializeFetch<T>(
+  fetchKey: string | undefined,
+  task: () => Promise<T>
+): Promise<T> {
+  if (fetchKey === undefined) return task()
+  const result = (fetchQueues.get(fetchKey) ?? Promise.resolve()).then(task)
+  const tail = result.then(
+    () => undefined,
+    () => undefined
+  )
+  fetchQueues.set(fetchKey, tail)
+  void tail.then(() => {
+    if (fetchQueues.get(fetchKey) === tail) fetchQueues.delete(fetchKey)
+  })
+  return result
+}
+
+async function fetchOnce(run: GitRunner, fetchKey: string | undefined): Promise<void> {
+  try {
+    await serializeFetch(fetchKey, () => run(['fetch', 'origin', '--quiet']))
+  } catch (err) {
+    const detail = err instanceof Error ? err.message : String(err)
+    throw new Error(`Failed to fetch origin: ${detail}`, { cause: err })
+  }
+}
+
+// Concurrent origin-default resolutions for one repo want the same refs, so
+// they share a single in-flight fetch rather than queueing identical ones.
+function fetchOrigin(run: GitRunner, fetchKey: string | undefined): Promise<void> {
+  if (fetchKey === undefined) return fetchOnce(run, fetchKey)
+  const pending = inFlightFetches.get(fetchKey)
+  if (pending) return pending
+  const shared = fetchOnce(run, fetchKey).finally(() => inFlightFetches.delete(fetchKey))
+  inFlightFetches.set(fetchKey, shared)
+  return shared
+}
+
 // Resolve the ref to branch new "origin-default" worktrees from. Fetches origin,
 // then tries, in order: the remote's advertised HEAD (ls-remote --symref), the
 // locally-recorded origin/HEAD, and the conventional main/master names —
 // returning the first candidate that `rev-parse --verify` confirms exists.
-export async function resolveOriginDefaultBase(run: GitRunner): Promise<string> {
+export async function resolveOriginDefaultBase(run: GitRunner, fetchKey?: string): Promise<string> {
   try {
     await run(['remote', 'get-url', 'origin'])
   } catch {
     throw new Error('no-origin-remote')
   }
 
-  try {
-    await run(['fetch', 'origin', '--quiet'])
-  } catch (err) {
-    const detail = err instanceof Error ? err.message : String(err)
-    throw new Error(`Failed to fetch origin: ${detail}`, { cause: err })
-  }
+  await fetchOrigin(run, fetchKey)
 
   const candidates: string[] = []
   const seen = new Set<string>()

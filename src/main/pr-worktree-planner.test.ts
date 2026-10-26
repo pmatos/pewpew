@@ -72,6 +72,27 @@ describe('checkoutPrWorktree', () => {
     ])
   })
 
+  it('never overlaps fetches for the same repository key', async () => {
+    const planned = planPrWorktree(7, sameRepoPr())
+    if (!planned.ok) throw new Error(planned.message)
+    let active = 0
+    let maxActive = 0
+    const runGit = async (argv: string[]) => {
+      if (argv[0] === 'fetch') {
+        active++
+        maxActive = Math.max(maxActive, active)
+        await new Promise((resolve) => setTimeout(resolve, 5))
+        active--
+      }
+      return { stdout: '' }
+    }
+
+    await Promise.all(
+      [1, 2, 3].map((n) => checkoutPrWorktree(planned.plan, `/worktrees/pr-${n}`, runGit, 'repo'))
+    )
+    expect(maxActive).toBe(1)
+  })
+
   it('refuses a missing fork pull ref without allowing git to select another branch', async () => {
     const planned = planPrWorktree(335, forkPr())
     if (!planned.ok) throw new Error(planned.message)
