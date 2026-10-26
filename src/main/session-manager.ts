@@ -1512,18 +1512,50 @@ function uniqueSorted(numbers: number[]): number[] {
   return Array.from(new Set(numbers)).sort((a, b) => a - b)
 }
 
+// A multi-number request (range or list) is narrowed to the items that are
+// still open; a single explicit number is honoured as typed.
+async function filterToOpenNumbers(
+  numbers: number[],
+  nounPlural: 'PRs' | 'issues',
+  projectPath: string,
+  hostId: string | null,
+  options: CreateSessionOptions,
+  listItems: ListNumberedItems
+): Promise<number[] | string> {
+  if (numbers.length <= 1) return numbers
+  let open: NumberedGhItem[] | string
+  try {
+    open = await listItems(projectPath, hostId, options.repo ?? null)
+  } catch (err) {
+    return describeGhError(err)
+  }
+  if (typeof open === 'string') return open
+  const openNumbers = new Set(open.map((i) => i.number))
+  const filtered = numbers.filter((n) => openNumbers.has(n))
+  return filtered.length === 0 ? `None of the requested ${nounPlural} are open.` : filtered
+}
+
 export async function createPrSessions(
   projectPath: string,
   prNumbers: number[],
   hostId: string | null = null,
   options: CreateSessionOptions = {},
-  deps: { createPrSession?: CreateNumberedSession } = {}
+  deps: { createPrSession?: CreateNumberedSession; listPrs?: ListNumberedItems } = {}
 ): Promise<OpenSessionsSummary | string> {
+  const numbers = await filterToOpenNumbers(
+    uniqueSorted(prNumbers),
+    'PRs',
+    projectPath,
+    hostId,
+    options,
+    deps.listPrs ?? listOpenPrs
+  )
+  if (typeof numbers === 'string') return numbers
   return createSessionsForNumbers(
     projectPath,
     hostId,
     'prNumber',
-    uniqueSorted(prNumbers),
+    numbers,
     deps.createPrSession ?? createPrSession,
     options
   )
@@ -1534,13 +1566,22 @@ export async function createIssueSessions(
   issueNumbers: number[],
   hostId: string | null = null,
   options: CreateSessionOptions = {},
-  deps: { createIssueSession?: CreateNumberedSession } = {}
+  deps: { createIssueSession?: CreateNumberedSession; listIssues?: ListNumberedItems } = {}
 ): Promise<OpenSessionsSummary | string> {
+  const numbers = await filterToOpenNumbers(
+    uniqueSorted(issueNumbers),
+    'issues',
+    projectPath,
+    hostId,
+    options,
+    deps.listIssues ?? ((p, h, r) => listOpenIssues(p, h, undefined, r))
+  )
+  if (typeof numbers === 'string') return numbers
   return createSessionsForNumbers(
     projectPath,
     hostId,
     'issueNumber',
-    uniqueSorted(issueNumbers),
+    numbers,
     deps.createIssueSession ?? createIssueSession,
     options
   )
