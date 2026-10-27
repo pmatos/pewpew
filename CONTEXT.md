@@ -40,6 +40,14 @@ not a remembered line of code, decides whether one is taken.
 
 ## Session creation
 
+**Numbered Session batch opening** — opening Sessions for explicit PR or issue
+numbers, or for all open items. `openNumberedSessions` owns number selection,
+listing failures, one post-listing registry snapshot for skip/reuse decisions,
+creation scheduling, and the summary. Multiple explicit numbers are restricted
+to open items; a single unique number is honored directly. Remote Codex creation
+is serial within the batch. Existing local and SSH listing/creation functions are
+adapters behind this interface in `src/main/numbered-session-plan.ts`.
+
 **Named worktree checkout** — the Git sequence shared by origin-default Session
 creation and issue Session creation. It resolves the fetched origin default,
 creates the requested branch without upstream tracking, and, on creation failure,
