@@ -1,3 +1,11 @@
+## [0.12.2](https://github.com/pmatos/pewpew/compare/v0.12.1...v0.12.2) (2026-11-01)
+
+
+### Bug Fixes
+
+* open sessions only for open issues/PRs in ranges ([#379](https://github.com/pmatos/pewpew/issues/379)) ([1bfab03](https://github.com/pmatos/pewpew/commit/1bfab03a4a8810b7dbf1513ad7c87d4d62612711))
+* serialize origin fetches per repo when opening many sessions ([#380](https://github.com/pmatos/pewpew/issues/380)) ([d8c7244](https://github.com/pmatos/pewpew/commit/d8c72446aea970afc3c85c156192164ef07980c2))
+
 ## [0.12.1](https://github.com/pmatos/pewpew/compare/v0.12.0...v0.12.1) (2026-10-11)
 
 
