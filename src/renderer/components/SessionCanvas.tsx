@@ -89,6 +89,13 @@ interface CanvasViewState {
   viewportSize: { width: number; height: number }
 }
 
+// The viewport div only exists once persisted state has loaded and at least one
+// session is present; before that the canvas renders null or the empty
+// placeholder, so effects that observe the viewport must key off this.
+export function isViewportMounted(loaded: boolean, sessionCount: number): boolean {
+  return loaded && sessionCount > 0
+}
+
 function canvasViewReducer(
   state: CanvasViewState,
   update: Partial<CanvasViewState>
@@ -259,8 +266,9 @@ function useSessionCanvasElement({ onOpenSession, onZoomOpen, morphActive }: Can
     setPanToCluster(panToClusterFn)
   }, [resolvedClusterPositions, setPanToCluster])
 
-  // Track viewport size. Depends on `loaded` because pre-load renders null (ref
-  // is unattached); effect must re-run once the DOM mounts.
+  const viewportMounted = isViewportMounted(loaded, sessions.length)
+
+  // Track viewport size. Effect must re-run once the viewport div mounts.
   useEffect(() => {
     const viewport = viewportRef.current
     if (!viewport) return
@@ -272,7 +280,7 @@ function useSessionCanvasElement({ onOpenSession, onZoomOpen, morphActive }: Can
     const observer = new ResizeObserver(updateSize)
     observer.observe(viewport)
     return () => observer.disconnect()
-  }, [loaded])
+  }, [viewportMounted])
 
   // Persist canvas with debounce. Clamp zoom to RESTING_MAX_ZOOM so a
   // mid-gesture extreme zoom is never restored on next launch. When clamping,
@@ -344,7 +352,7 @@ function useSessionCanvasElement({ onOpenSession, onZoomOpen, morphActive }: Can
     })
     observer.observe(viewport)
     return () => observer.disconnect()
-  }, [])
+  }, [viewportMounted])
 
   // Keyboard shortcuts
   useEffect(() => {
