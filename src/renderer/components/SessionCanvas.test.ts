@@ -1,5 +1,6 @@
 import { readFileSync } from 'node:fs'
 import { fileURLToPath } from 'node:url'
+import ts from 'typescript'
 import { describe, expect, it } from 'vitest'
 import { isViewportMounted } from './SessionCanvas'
 
@@ -21,26 +22,67 @@ describe('isViewportMounted', () => {
 // The viewport div is not mounted while the canvas is empty, so an observer
 // effect that runs once (or only on `loaded`) finds a null ref, never attaches,
 // and leaves the viewport size at 0x0. That hides the off-screen edge
-// indicators when the first sessions are created in an empty app. jsdom is not
-// available here, so the effect dependency lists are checked at the source seam.
+// indicators when the first sessions are created in an empty app. Resizing the
+// grid canvas also clears its bitmap, so the grid must redraw on size changes.
+// jsdom is not available here, so the effect dependency lists are checked by
+// parsing the component source.
 const sourcePath = fileURLToPath(new URL('./SessionCanvas.tsx', import.meta.url))
-const source = readFileSync(sourcePath, 'utf8')
+const sourceFile = ts.createSourceFile(
+  sourcePath,
+  readFileSync(sourcePath, 'utf8'),
+  ts.ScriptTarget.Latest,
+  true,
+  ts.ScriptKind.TSX
+)
 
-function effectDeps(body: string): string[] {
-  const effects = [...source.matchAll(/useEffect\(\(\) => \{([\s\S]*?)\n {2}\}, (\[[^\]]*\])\)/g)]
-  return effects.filter(([, code]) => code.includes(body)).map(([, , deps]) => deps)
+interface EffectInfo {
+  body: string
+  deps: string[]
 }
 
-describe('viewport observers', () => {
-  it('re-run when the viewport mounts, not only on first render or load', () => {
-    const observerEffects = effectDeps('new ResizeObserver')
-    expect(observerEffects).toHaveLength(2)
-    for (const deps of observerEffects) {
-      expect(deps).toBe('[viewportMounted]')
+function collectEffects(): EffectInfo[] {
+  const effects: EffectInfo[] = []
+  const visit = (node: ts.Node): void => {
+    if (
+      ts.isCallExpression(node) &&
+      ts.isIdentifier(node.expression) &&
+      node.expression.text === 'useEffect'
+    ) {
+      const [callback, deps] = node.arguments
+      effects.push({
+        body: callback ? callback.getText(sourceFile) : '',
+        deps:
+          deps && ts.isArrayLiteralExpression(deps)
+            ? deps.elements.map((el) => el.getText(sourceFile))
+            : [],
+      })
     }
+    ts.forEachChild(node, visit)
+  }
+  visit(sourceFile)
+  return effects
+}
+
+describe('viewport effects', () => {
+  const effects = collectEffects()
+
+  it('attaches a single resize observer that re-runs when the viewport mounts', () => {
+    const observers = effects.filter((e) => e.body.includes('new ResizeObserver'))
+    expect(observers).toHaveLength(1)
+    expect(observers[0]?.deps).toEqual(['viewportMounted'])
+  })
+
+  it('redraws the dot grid whenever the viewport size changes', () => {
+    const grid = effects.filter((e) => e.body.includes('getContext'))
+    expect(grid).toHaveLength(1)
+    expect(grid[0]?.deps).toEqual(
+      expect.arrayContaining(['viewportSize.width', 'viewportSize.height'])
+    )
   })
 
   it('derives viewportMounted from isViewportMounted', () => {
-    expect(source).toContain('const viewportMounted = isViewportMounted(loaded, sessions.length)')
+    expect(sourceFile.text).toContain(
+      'const viewportMounted = isViewportMounted(loaded, sessions.length)'
+    )
   })
 })

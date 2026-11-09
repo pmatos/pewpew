@@ -336,23 +336,9 @@ function useSessionCanvasElement({ onOpenSession, onZoomOpen, morphActive }: Can
       }
     }
     // theme is intentionally in the dep array so the dot grid repaints when
-    // the user switches between dark and light mode.
-  }, [zoom, panX, panY, sessions.length, theme])
-
-  // Resize observer
-  useEffect(() => {
-    const viewport = viewportRef.current
-    if (!viewport) return
-    const observer = new ResizeObserver(() => {
-      const canvas = gridRef.current
-      if (!canvas) return
-      const rect = viewport.getBoundingClientRect()
-      canvas.width = rect.width
-      canvas.height = rect.height
-    })
-    observer.observe(viewport)
-    return () => observer.disconnect()
-  }, [viewportMounted])
+    // the user switches between dark and light mode. The viewport size is too:
+    // resizing the canvas element clears its bitmap, so it must be redrawn.
+  }, [zoom, panX, panY, sessions.length, theme, viewportSize.width, viewportSize.height])
 
   // Keyboard shortcuts
   useEffect(() => {
@@ -515,9 +501,8 @@ function useSessionCanvasElement({ onOpenSession, onZoomOpen, morphActive }: Can
     window.api.saveClusterPositions(clusterPositionsRef.current)
   }, [])
 
-  if (!loaded) return null
-
-  if (sessions.length === 0) {
+  if (!viewportMounted) {
+    if (!loaded) return null
     return (
       <div className="canvas-empty">
         <span className="canvas-placeholder">No sessions</span>
