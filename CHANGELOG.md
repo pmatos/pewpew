@@ -1,3 +1,10 @@
+## [0.12.3](https://github.com/pmatos/pewpew/compare/v0.12.2...v0.12.3) (2026-11-15)
+
+
+### Bug Fixes
+
+* attach canvas resize observers when the viewport mounts ([#393](https://github.com/pmatos/pewpew/issues/393)) ([6113303](https://github.com/pmatos/pewpew/commit/6113303c66ae39993b06436573d758ae29ef68f2))
+
 ## [0.12.2](https://github.com/pmatos/pewpew/compare/v0.12.1...v0.12.2) (2026-11-01)
 
 
