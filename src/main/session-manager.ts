@@ -80,11 +80,9 @@ import { branchRefExists } from './branch-ref'
 import { deriveSessionFields } from './session-fields'
 import { buildSession } from './session-record'
 import {
-  numbersInUse,
+  openNumberedSessions,
   selectNumbersToOpen,
-  shouldCreateSerially,
-  summarizeCreations,
-  type CreateOutcome,
+  type CreateNumberedSession,
 } from './numbered-session-plan'
 import {
   assertNoConflictingToolOnWorktree,
@@ -178,6 +176,12 @@ const store = createSessionStore({
 // Live view of the session set for the pure lookups in session-queries.
 function allSessions(): Iterable<Session> {
   return store.values()
+}
+
+const numberedSessionRuntime = {
+  sessions: () => store.all(),
+  defaultTool: () => getConfig().defaultTool,
+  describeError: describeGhError,
 }
 
 const sessionAdoptionGate = createSessionAdoptionGate({
@@ -1234,13 +1238,6 @@ async function promptCleanup(id: string): Promise<void> {
 
 export { selectNumbersToOpen }
 
-type CreateNumberedSession = (
-  projectPath: string,
-  number: number,
-  hostId: string | null,
-  options?: CreateSessionOptions
-) => Promise<Session | string>
-
 interface OpenSessionsDeps {
   listPrs?: ListNumberedItems
   listIssues?: ListNumberedItems
@@ -1270,84 +1267,6 @@ interface CreatePrSessionDeps {
     tool?: AgentTool,
     skipPermissions?: boolean
   ) => Promise<Session>
-}
-
-async function createSessionsForNumbers(
-  projectPath: string,
-  hostId: string | null,
-  field: 'prNumber' | 'issueNumber',
-  numbers: number[],
-  createSession: CreateNumberedSession,
-  options: CreateSessionOptions = {}
-): Promise<OpenSessionsSummary> {
-  // Snapshot the session registry once: which numbers are already taken, and
-  // which ids exist before the batch runs (so a reused session — one createSession
-  // hands back when its branch is already checked out — is told apart from a
-  // freshly-created one).
-  const currentSessions = store.all()
-  const existing = numbersInUse(currentSessions, projectPath, hostId, field)
-  const preexistingIds = new Set(currentSessions.map((s) => s.id))
-
-  const { toCreate, toSkip } = selectNumbersToOpen(
-    numbers.map((n) => ({ number: n })),
-    existing
-  )
-  const createOne = async (item: { number: number }): Promise<CreateOutcome> => {
-    try {
-      const result = await createSession(projectPath, item.number, hostId, options)
-      if (typeof result === 'string') {
-        return { number: item.number, error: result }
-      }
-      return { session: result }
-    } catch (err) {
-      return { number: item.number, error: describeGhError(err) }
-    }
-  }
-
-  const effectiveTool = options.tool ?? getConfig().defaultTool
-  const createSerially = async (
-    index: number,
-    results: CreateOutcome[]
-  ): Promise<CreateOutcome[]> => {
-    const item = toCreate[index]
-    if (!item) return results
-    results.push(await createOne(item))
-    return createSerially(index + 1, results)
-  }
-
-  const results: CreateOutcome[] = shouldCreateSerially(hostId, effectiveTool)
-    ? await createSerially(0, [])
-    : await Promise.all(toCreate.map((item) => createOne(item)))
-
-  return summarizeCreations(results, preexistingIds, toSkip)
-}
-
-async function listItemNumbers(
-  listItems: ListNumberedItems,
-  projectPath: string,
-  hostId: string | null,
-  options: CreateSessionOptions
-): Promise<number[] | string> {
-  try {
-    const items = await listItems(projectPath, hostId, options.repo ?? null)
-    return typeof items === 'string' ? items : items.map((i) => i.number)
-  } catch (err) {
-    return describeGhError(err)
-  }
-}
-
-async function openSessionsForNumberedItems(
-  projectPath: string,
-  hostId: string | null,
-  field: 'prNumber' | 'issueNumber',
-  listItems: ListNumberedItems,
-  createSession: CreateNumberedSession,
-  options: CreateSessionOptions = {}
-): Promise<OpenSessionsSummary | string> {
-  const numbers = await listItemNumbers(listItems, projectPath, hostId, options)
-  if (typeof numbers === 'string') return numbers
-
-  return createSessionsForNumbers(projectPath, hostId, field, numbers, createSession, options)
 }
 
 export async function createPrSession(
@@ -1439,28 +1358,6 @@ export async function createPrSession(
   return session
 }
 
-function uniqueSorted(numbers: number[]): number[] {
-  return Array.from(new Set(numbers)).sort((a, b) => a - b)
-}
-
-// A multi-number request (range or list) is narrowed to the items that are
-// still open; a single explicit number is honoured as typed.
-async function filterToOpenNumbers(
-  numbers: number[],
-  nounPlural: 'PRs' | 'issues',
-  projectPath: string,
-  hostId: string | null,
-  options: CreateSessionOptions,
-  listItems: ListNumberedItems
-): Promise<number[] | string> {
-  if (numbers.length <= 1) return numbers
-  const open = await listItemNumbers(listItems, projectPath, hostId, options)
-  if (typeof open === 'string') return open
-  const openNumbers = new Set(open)
-  const filtered = numbers.filter((n) => openNumbers.has(n))
-  return filtered.length === 0 ? `None of the requested ${nounPlural} are open.` : filtered
-}
-
 export async function createPrSessions(
   projectPath: string,
   prNumbers: number[],
@@ -1468,22 +1365,13 @@ export async function createPrSessions(
   options: CreateSessionOptions = {},
   deps: { createPrSession?: CreateNumberedSession; listPrs?: ListNumberedItems } = {}
 ): Promise<OpenSessionsSummary | string> {
-  const numbers = await filterToOpenNumbers(
-    uniqueSorted(prNumbers),
-    'PRs',
-    projectPath,
-    hostId,
-    options,
-    deps.listPrs ?? listOpenPrs
-  )
-  if (typeof numbers === 'string') return numbers
-  return createSessionsForNumbers(
-    projectPath,
-    hostId,
-    'prNumber',
-    numbers,
-    deps.createPrSession ?? createPrSession,
-    options
+  return openNumberedSessions(
+    { kind: 'pr', projectPath, hostId, numbers: prNumbers, options },
+    {
+      ...numberedSessionRuntime,
+      list: deps.listPrs ?? listOpenPrs,
+      create: deps.createPrSession ?? createPrSession,
+    }
   )
 }
 
@@ -1494,22 +1382,13 @@ export async function createIssueSessions(
   options: CreateSessionOptions = {},
   deps: { createIssueSession?: CreateNumberedSession; listIssues?: ListNumberedItems } = {}
 ): Promise<OpenSessionsSummary | string> {
-  const numbers = await filterToOpenNumbers(
-    uniqueSorted(issueNumbers),
-    'issues',
-    projectPath,
-    hostId,
-    options,
-    deps.listIssues ?? ((p, h, r) => listOpenIssues(p, h, undefined, r))
-  )
-  if (typeof numbers === 'string') return numbers
-  return createSessionsForNumbers(
-    projectPath,
-    hostId,
-    'issueNumber',
-    numbers,
-    deps.createIssueSession ?? createIssueSession,
-    options
+  return openNumberedSessions(
+    { kind: 'issue', projectPath, hostId, numbers: issueNumbers, options },
+    {
+      ...numberedSessionRuntime,
+      list: deps.listIssues ?? ((p, h, r) => listOpenIssues(p, h, undefined, r)),
+      create: deps.createIssueSession ?? createIssueSession,
+    }
   )
 }
 
@@ -1623,13 +1502,13 @@ export async function openSessionsForOpenPrs(
   options: CreateSessionOptions = {},
   deps: OpenSessionsDeps = {}
 ): Promise<OpenSessionsSummary | string> {
-  return openSessionsForNumberedItems(
-    projectPath,
-    hostId,
-    'prNumber',
-    deps.listPrs ?? listOpenPrs,
-    deps.createPrSession ?? createPrSession,
-    options
+  return openNumberedSessions(
+    { kind: 'pr', projectPath, hostId, options },
+    {
+      ...numberedSessionRuntime,
+      list: deps.listPrs ?? listOpenPrs,
+      create: deps.createPrSession ?? createPrSession,
+    }
   )
 }
 
@@ -1640,13 +1519,13 @@ export async function openSessionsForOpenIssues(
   options: CreateSessionOptions = {},
   deps: OpenSessionsDeps = {}
 ): Promise<OpenSessionsSummary | string> {
-  return openSessionsForNumberedItems(
-    projectPath,
-    hostId,
-    'issueNumber',
-    deps.listIssues ?? ((p, h, r) => listOpenIssues(p, h, label, r)),
-    deps.createIssueSession ?? createIssueSession,
-    options
+  return openNumberedSessions(
+    { kind: 'issue', projectPath, hostId, options },
+    {
+      ...numberedSessionRuntime,
+      list: deps.listIssues ?? ((p, h, r) => listOpenIssues(p, h, label, r)),
+      create: deps.createIssueSession ?? createIssueSession,
+    }
   )
 }
 

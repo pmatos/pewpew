@@ -3794,6 +3794,59 @@ describe('createIssueSessions', () => {
 describe('createPrSessions', () => {
   const openAll = async () => Array.from({ length: 20 }, (_, i) => ({ number: i + 1 }))
 
+  it('honors one unique explicit number without listing open PRs', async () => {
+    const sm = await loadSessionManager()
+    const listPrs = vi.fn(async () => 'listing must not run')
+    const createPrSession = vi.fn(async () => baseLocalSession({ id: 's-9', prNumber: 9 }))
+
+    const result = await sm.createPrSessions(
+      '/proj',
+      [9, 9],
+      null,
+      {},
+      { listPrs, createPrSession }
+    )
+
+    expect(listPrs).not.toHaveBeenCalled()
+    expect(createPrSession).toHaveBeenCalledTimes(1)
+    expect(result).toMatchObject({ skipped: [], failed: [] })
+  })
+
+  it('reads the default tool after listing and serializes remote Codex creation', async () => {
+    const sm = await loadSessionManager()
+    let releaseFirst!: () => void
+    const firstGate = new Promise<void>((resolve) => {
+      releaseFirst = resolve
+    })
+    const started: number[] = []
+    const resultPromise = sm.createPrSessions(
+      '/proj',
+      [8, 9],
+      'h1',
+      {},
+      {
+        listPrs: async () => {
+          state.defaultTool = 'codex'
+          return [{ number: 8 }, { number: 9 }]
+        },
+        createPrSession: async (_projectPath, number) => {
+          started.push(number)
+          if (number === 8) await firstGate
+          return baseRemoteSession({ id: `s-${number}`, prNumber: number })
+        },
+      }
+    )
+    await new Promise((resolve) => setImmediate(resolve))
+    try {
+      expect(started).toEqual([8])
+    } finally {
+      releaseFirst()
+    }
+    const result = await resultPromise
+    expect(started).toEqual([8, 9])
+    expect(result).toMatchObject({ failed: [] })
+  })
+
   it('only opens sessions for open PRs in a multi-number request', async () => {
     const sm = await loadSessionManager()
     const createPrSession = vi.fn(
